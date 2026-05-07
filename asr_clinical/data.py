@@ -76,8 +76,18 @@ def load_examples(
     task: str,
     text_mode: str,
     min_text_chars: int = 1,
+    filter_questions: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     asr = read_asr_file(asr_file)
+    if filter_questions:
+        keep_questions = {q.strip().upper() for q in filter_questions if q.strip()}
+        asr = asr[asr["question_id"].isin(keep_questions)].copy()
+        if asr.empty:
+            raise ValueError(
+                "No ASR rows remained after --filter-questions. "
+                f"Requested questions: {sorted(keep_questions)}"
+            )
+
     demo = pd.read_csv(demo_file)
     if "speaker_id" not in demo.columns:
         raise ValueError("demo CSV must contain a speaker_id column")
@@ -88,7 +98,9 @@ def load_examples(
     merged = merged[merged["text"].fillna("").str.len() >= min_text_chars].copy()
     merged = merged[merged[target_column].notna()].copy()
 
-    metadata: dict = {}
+    metadata: dict = {
+        "filter_questions": sorted(keep_questions) if filter_questions else "all"
+    }
     if task == "classification":
         labels = sorted(merged[target_column].astype(str).unique().tolist())
         label2id = {label: idx for idx, label in enumerate(labels)}

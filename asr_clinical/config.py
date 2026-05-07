@@ -31,6 +31,7 @@ class TrainConfig:
     focal_gamma: float = 2.0
     folds_file: str | None = None
     splits_folder: str | None = None
+    filter_questions: list[str] | None = None
     question_importance: bool = False
     min_text_chars: int = 1
 
@@ -74,6 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Folder containing foldN_train.csv, foldN_val.csv, and optionally "
             "foldN_test.csv files with speaker_id columns."
         ),
+    )
+    parser.add_argument(
+        "--filter-questions",
+        nargs="+",
+        default=None,
+        help="Optional question IDs to keep, for example: --filter-questions Q1 Q2 Q8",
     )
     parser.add_argument("--question-importance", action="store_true")
     parser.add_argument("--min-text-chars", type=int, default=1)

@@ -302,6 +302,7 @@ def main():
         cfg.task,
         cfg.text_mode,
         cfg.min_text_chars,
+        cfg.filter_questions,
     )
     metadata["n_examples"] = len(df)
     metadata["n_speakers"] = int(df["speaker_id"].nunique())

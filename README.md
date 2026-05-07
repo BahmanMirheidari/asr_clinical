@@ -59,6 +59,7 @@ python -m asr_clinical.train \
 --loss focal                   # classification only: ce or focal
 --class-weights balanced       # classification only: none or balanced
 --splits-folder splits         # use existing foldN_train/val/test speaker CSVs
+--filter-questions Q1 Q2 Q8    # keep only selected questions
 --question-importance
 ```
 
