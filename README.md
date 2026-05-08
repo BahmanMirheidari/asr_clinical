@@ -156,3 +156,25 @@ results = predict_answers(
     model_path="outputs/class1",
 )
 ```
+
+## Per-Question Embedding Ensemble
+
+Train one fine-tuned model per question, save embeddings, rank question embeddings,
+and train a final speaker-level meta-model:
+
+```bash
+python -m asr_clinical.question_ensemble \
+  --asr-file data/asr.txt \
+  --demo-file data/demographic_info.csv \
+  --target-column class1 \
+  --task classification \
+  --model-name distilroberta-base \
+  --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 \
+  --top-k 5 \
+  --output-dir outputs/question_ensemble_class1
+```
+
+For regression, change `--task regression` and use a score column. The output
+folder contains `question_models/Q*/model`, per-question embedding CSVs,
+`question_embedding_importance.csv`, `selected_questions.csv`,
+`meta_model.joblib`, and final meta-test predictions/metrics.

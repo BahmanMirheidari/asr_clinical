@@ -5,3 +5,4 @@ torch>=2.1
 transformers>=4.38
 tqdm>=4.66
 shap>=0.44
+joblib>=1.3
