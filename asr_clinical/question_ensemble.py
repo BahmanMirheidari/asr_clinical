@@ -14,6 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
     balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
     f1_score,
     mean_absolute_error,
     mean_squared_error,
@@ -56,6 +58,12 @@ def build_parser():
         help="Questions to train separately. Default: Q1 Q2 ... Q13",
     )
     parser.add_argument("--top-k", type=int, default=0, help="0 means use all questions.")
+    parser.add_argument(
+        "--evaluate-all-top-k",
+        action="store_true",
+        default=True,
+        help="Evaluate top-k question subsets from k=1 to all questions.",
+    )
     parser.add_argument("--test-size", type=float, default=0.1)
     parser.add_argument("--final-dev-size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -303,7 +311,12 @@ def score_meta_model(model, x, y, task):
     if task == "classification":
         return {
             "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
+            "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
             "balanced_accuracy": balanced_accuracy_score(y, pred),
+            "classification_report": classification_report(
+                y, pred, output_dict=True, zero_division=0
+            ),
+            "confusion_matrix": confusion_matrix(y, pred).tolist(),
         }
     return {
         "mae": mean_absolute_error(y, pred),
@@ -356,13 +369,6 @@ def permutation_question_importance(model, val_df, feature_cols, args):
 
 
 def train_meta_model(trainval_features, test_features, feature_cols, args, out_dir: Path):
-    meta_model_path = out_dir / "meta_model.joblib"
-    meta_metrics_path = out_dir / "meta_test_metrics.json"
-    meta_predictions_path = out_dir / "meta_test_predictions.csv"
-    if meta_model_path.exists() and meta_metrics_path.exists() and meta_predictions_path.exists():
-        print("skipping existing meta_model")
-        return json.loads(meta_metrics_path.read_text(encoding="utf-8"))
-
     speaker_df = trainval_features[["speaker_id", "y_true"]].copy()
     train_idx, dev_idx = make_final_test_split(
         speaker_df, args.task, args.final_dev_size, args.seed + 9999
@@ -376,45 +382,119 @@ def train_meta_model(trainval_features, test_features, feature_cols, args, out_d
     importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
 
     questions_ranked = importance_df["question_id"].tolist()
-    if args.top_k and args.top_k > 0:
-        selected_questions = questions_ranked[: args.top_k]
+    if not questions_ranked:
+        raise ValueError("No ranked questions available for meta-model training.")
+
+    requested_ks = list(range(1, len(questions_ranked) + 1))
+    if args.top_k and args.top_k > 0 and args.top_k not in requested_ks:
+        requested_ks.append(min(args.top_k, len(questions_ranked)))
+    requested_ks = sorted(set(requested_ks))
+
+    topk_dir = out_dir / "topk_meta_models"
+    topk_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    all_metrics = {}
+
+    for k in requested_ks:
+        selected_questions = questions_ranked[:k]
+        selected_feature_cols = [
+            col for col in feature_cols if col.split("__", 1)[0] in set(selected_questions)
+        ]
+        run_name = f"top_{k}"
+        model_path = topk_dir / f"{run_name}_meta_model.joblib"
+        metrics_path = topk_dir / f"{run_name}_metrics.json"
+        predictions_path = topk_dir / f"{run_name}_predictions.csv"
+        features_path = topk_dir / f"{run_name}_features.csv"
+        questions_path = topk_dir / f"{run_name}_questions.csv"
+
+        if model_path.exists() and metrics_path.exists() and predictions_path.exists():
+            print(f"skipping existing {run_name} meta-model")
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        else:
+            final_model = make_meta_model(args)
+            final_model.fit(
+                trainval_features[selected_feature_cols].to_numpy(),
+                trainval_features["y_true"].to_numpy(),
+            )
+            metrics = score_meta_model(
+                final_model,
+                test_features[selected_feature_cols].to_numpy(),
+                test_features["y_true"].to_numpy(),
+                args.task,
+            )
+            predictions = test_features[["speaker_id", "y_true"]].copy()
+            x_test = test_features[selected_feature_cols].to_numpy()
+            predictions["y_pred"] = final_model.predict(x_test)
+            if args.task == "classification" and hasattr(final_model, "predict_proba"):
+                probs = final_model.predict_proba(x_test)
+                classes = list(final_model.classes_) if hasattr(final_model, "classes_") else []
+                if not classes and hasattr(final_model, "named_steps"):
+                    classes = list(final_model.named_steps["model"].classes_)
+                for class_idx, class_id in enumerate(classes):
+                    predictions[f"prob_{class_id}"] = probs[:, class_idx]
+
+            joblib.dump(final_model, model_path)
+            predictions.to_csv(predictions_path, index=False)
+            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            pd.DataFrame({"feature": selected_feature_cols}).to_csv(features_path, index=False)
+            pd.DataFrame({"question_id": selected_questions}).to_csv(questions_path, index=False)
+
+        summary_metric = metrics["macro_f1"] if args.task == "classification" else metrics["mae"]
+        rows.append(
+            {
+                "top_k": k,
+                "questions": ",".join(selected_questions),
+                "n_features": len(selected_feature_cols),
+                "primary_metric": summary_metric,
+                **{
+                    key: value
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float, str))
+                },
+            }
+        )
+        all_metrics[run_name] = metrics
+
+    summary_df = pd.DataFrame(rows)
+    if args.task == "classification":
+        best_idx = summary_df["macro_f1"].idxmax()
+        all_idx = summary_df["top_k"].idxmax()
+        all_score = summary_df.loc[all_idx, "macro_f1"]
+        summary_df["matches_or_beats_all_questions"] = summary_df["macro_f1"] >= all_score
     else:
-        selected_questions = questions_ranked
-    selected_feature_cols = [
-        col for col in feature_cols if col.split("__", 1)[0] in set(selected_questions)
-    ]
-    pd.DataFrame({"feature": selected_feature_cols}).to_csv(
-        out_dir / "selected_embedding_features.csv", index=False
-    )
-    pd.DataFrame({"question_id": selected_questions}).to_csv(
-        out_dir / "selected_questions.csv", index=False
+        best_idx = summary_df["mae"].idxmin()
+        all_idx = summary_df["top_k"].idxmax()
+        all_score = summary_df.loc[all_idx, "mae"]
+        summary_df["matches_or_beats_all_questions"] = summary_df["mae"] <= all_score
+
+    best_row = summary_df.loc[best_idx].to_dict()
+    all_row = summary_df.loc[all_idx].to_dict()
+    summary_df.to_csv(out_dir / "topk_meta_metrics.csv", index=False)
+    (out_dir / "topk_meta_metrics.json").write_text(
+        json.dumps(all_metrics, indent=2), encoding="utf-8"
     )
 
-    final_model = make_meta_model(args)
-    final_model.fit(
-        trainval_features[selected_feature_cols].to_numpy(),
-        trainval_features["y_true"].to_numpy(),
-    )
-    metrics = score_meta_model(
-        final_model,
-        test_features[selected_feature_cols].to_numpy(),
-        test_features["y_true"].to_numpy(),
-        args.task,
-    )
-    predictions = test_features[["speaker_id", "y_true"]].copy()
-    predictions["y_pred"] = final_model.predict(test_features[selected_feature_cols].to_numpy())
-    if args.task == "classification" and hasattr(final_model, "predict_proba"):
-        probs = final_model.predict_proba(test_features[selected_feature_cols].to_numpy())
-        classes = list(final_model.classes_) if hasattr(final_model, "classes_") else []
-        if not classes and hasattr(final_model, "named_steps"):
-            classes = list(final_model.named_steps["model"].classes_)
-        for class_idx, class_id in enumerate(classes):
-            predictions[f"prob_{class_id}"] = probs[:, class_idx]
+    best_k = int(best_row["top_k"])
+    best_prefix = topk_dir / f"top_{best_k}"
+    for source, target in [
+        (Path(str(best_prefix) + "_meta_model.joblib"), out_dir / "meta_model.joblib"),
+        (Path(str(best_prefix) + "_predictions.csv"), out_dir / "meta_test_predictions.csv"),
+        (Path(str(best_prefix) + "_metrics.json"), out_dir / "meta_test_metrics.json"),
+        (Path(str(best_prefix) + "_features.csv"), out_dir / "selected_embedding_features.csv"),
+        (Path(str(best_prefix) + "_questions.csv"), out_dir / "selected_questions.csv"),
+    ]:
+        if source.exists():
+            target.write_bytes(source.read_bytes())
 
-    joblib.dump(final_model, meta_model_path)
-    predictions.to_csv(meta_predictions_path, index=False)
-    meta_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    return metrics
+    best_summary = {
+        "best_top_k": best_k,
+        "best": best_row,
+        "all_questions": all_row,
+    }
+    (out_dir / "best_topk_summary.json").write_text(
+        json.dumps(best_summary, indent=2), encoding="utf-8"
+    )
+    return best_summary
 
 
 def main():

@@ -178,3 +178,22 @@ For regression, change `--task regression` and use a score column. The output
 folder contains `question_models/Q*/model`, per-question embedding CSVs,
 `question_embedding_importance.csv`, `selected_questions.csv`,
 `meta_model.joblib`, and final meta-test predictions/metrics.
+
+The script evaluates every top-k question subset from `k=1` to all available
+questions using the question-importance ranking. Results are saved to:
+
+```text
+topk_meta_metrics.csv
+topk_meta_metrics.json
+topk_meta_models/top_1_predictions.csv
+topk_meta_models/top_1_metrics.json
+topk_meta_models/top_2_predictions.csv
+...
+best_topk_summary.json
+```
+
+For classification, `topk_meta_metrics.csv` includes `macro_f1`, `weighted_f1`,
+`balanced_accuracy`, and a `matches_or_beats_all_questions` column. For
+regression, it includes `mae`, `rmse`, and `r2`. The best top-k model is also
+copied to `meta_model.joblib`, `meta_test_predictions.csv`, and
+`meta_test_metrics.json`.
