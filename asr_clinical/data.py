@@ -69,6 +69,44 @@ def read_asr_file(path: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _target_available_speakers(demo: pd.DataFrame, target_column: str, task: str) -> set[str]:
+    target = demo[target_column]
+    if task == "regression":
+        target = pd.to_numeric(target, errors="coerce")
+    mask = target.notna()
+    return set(demo.loc[mask, "speaker_id"].astype(str))
+
+
+def _speaker_status(
+    speakers: set[str],
+    asr_all_speakers: set[str],
+    asr_question_speakers: set[str],
+    asr_text_speakers: set[str],
+    demo_speakers: set[str],
+    target_speakers: set[str],
+    final_speakers: set[str],
+    filter_questions: list[str] | None,
+) -> dict[str, str]:
+    statuses = {}
+    for speaker_id in sorted(speakers):
+        if speaker_id in final_speakers:
+            status = "included"
+        elif speaker_id not in asr_all_speakers:
+            status = "no_asr_rows"
+        elif filter_questions and speaker_id not in asr_question_speakers:
+            status = "no_selected_questions"
+        elif speaker_id not in asr_text_speakers:
+            status = "no_text_after_min_text"
+        elif speaker_id not in demo_speakers:
+            status = "not_in_demo_csv"
+        elif speaker_id not in target_speakers:
+            status = "missing_or_invalid_target"
+        else:
+            status = "excluded_after_processing"
+        statuses[speaker_id] = status
+    return statuses
+
+
 def load_examples(
     asr_file: str,
     demo_file: str,
@@ -79,6 +117,10 @@ def load_examples(
     filter_questions: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     asr = read_asr_file(asr_file)
+    asr["speaker_id"] = asr["speaker_id"].astype(str).str.strip()
+    asr_all_speakers = set(asr["speaker_id"].astype(str).unique())
+
+    keep_questions = None
     if filter_questions:
         keep_questions = {q.strip().upper() for q in filter_questions if q.strip()}
         asr = asr[asr["question_id"].isin(keep_questions)].copy()
@@ -87,15 +129,20 @@ def load_examples(
                 "No ASR rows remained after --filter-questions. "
                 f"Requested questions: {sorted(keep_questions)}"
             )
+    asr_question_speakers = set(asr["speaker_id"].astype(str).unique())
 
     demo = pd.read_csv(demo_file)
     if "speaker_id" not in demo.columns:
         raise ValueError("demo CSV must contain a speaker_id column")
     if target_column not in demo.columns:
         raise ValueError(f"demo CSV does not contain target column: {target_column}")
+    demo["speaker_id"] = demo["speaker_id"].astype(str).str.strip()
+    demo_speakers = set(demo["speaker_id"].astype(str).unique())
+    target_speakers = _target_available_speakers(demo, target_column, task)
 
     merged = asr.merge(demo[["speaker_id", target_column]], on="speaker_id", how="left")
     merged = merged[merged["text"].fillna("").str.len() >= min_text_chars].copy()
+    asr_text_speakers = set(merged["speaker_id"].astype(str).unique())
     merged = merged[merged[target_column].notna()].copy()
 
     metadata: dict = {
@@ -118,6 +165,18 @@ def load_examples(
     merged = merged.reset_index(drop=True)
     if merged.empty:
         raise ValueError("No usable examples after merging ASR and demographics.")
+    final_speakers = set(merged["speaker_id"].astype(str).unique())
+    all_known_speakers = asr_all_speakers | demo_speakers
+    metadata["speaker_status"] = _speaker_status(
+        all_known_speakers,
+        asr_all_speakers,
+        asr_question_speakers,
+        asr_text_speakers,
+        demo_speakers,
+        target_speakers,
+        final_speakers,
+        sorted(keep_questions) if keep_questions else None,
+    )
     return merged, metadata
 
 

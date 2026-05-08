@@ -228,6 +228,8 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
     folds = read_splits_folder(cfg.splits_folder, df)
     split_metrics = []
     split_predictions = []
+    missing_records = []
+    speaker_status = metadata.get("speaker_status", {})
 
     for fold in folds:
         fold_idx = fold["fold"]
@@ -250,6 +252,17 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
                     f"fold {fold_idx}: warning: ignored {len(missing)} {split_name} "
                     f"speaker(s) not found after ASR/demo merge: {missing[:10]}"
                 )
+                for speaker_id in missing:
+                    missing_records.append(
+                        {
+                            "fold": fold_idx,
+                            "split": split_name,
+                            "speaker_id": speaker_id,
+                            "reason": speaker_status.get(
+                                str(speaker_id), "not_in_asr_or_demo_or_id_mismatch"
+                            ),
+                        }
+                    )
         if removed:
             print(
                 f"fold {fold_idx}: removed {len(removed)} leaked speaker(s) "
@@ -290,6 +303,10 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
     pd.DataFrame(split_metrics).to_json(
         out_dir / "split_metrics.json", orient="records", indent=2
     )
+    if missing_records:
+        pd.DataFrame(missing_records).to_csv(
+            out_dir / "external_split_missing_speakers.csv", index=False
+        )
     all_preds = pd.concat(split_predictions, ignore_index=True)
     all_preds.to_csv(out_dir / "cv_predictions.csv", index=False)
     if cfg.question_importance and cfg.text_mode == "question":
@@ -320,6 +337,13 @@ def main():
     metadata["n_examples"] = len(df)
     metadata["n_speakers"] = int(df["speaker_id"].nunique())
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    if "speaker_status" in metadata:
+        pd.DataFrame(
+            [
+                {"speaker_id": speaker_id, "status": status}
+                for speaker_id, status in metadata["speaker_status"].items()
+            ]
+        ).to_csv(out_dir / "speaker_diagnostics.csv", index=False)
 
     if cfg.splits_folder:
         if cfg.folds_file:
