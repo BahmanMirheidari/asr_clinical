@@ -238,11 +238,18 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
         eval_name = "test" if fold["test_idx"] is not None else "val"
         eval_df = df.iloc[eval_idx].reset_index(drop=True)
         removed = fold.get("removed_from_train") or []
+        missing_speakers = fold.get("missing_speakers") or {}
 
         print(
             f"fold {fold_idx}: train={len(train_df)} val={len(val_df)} "
             f"{eval_name}={len(eval_df)}"
         )
+        for split_name, missing in missing_speakers.items():
+            if missing:
+                print(
+                    f"fold {fold_idx}: warning: ignored {len(missing)} {split_name} "
+                    f"speaker(s) not found after ASR/demo merge: {missing[:10]}"
+                )
         if removed:
             print(
                 f"fold {fold_idx}: removed {len(removed)} leaked speaker(s) "

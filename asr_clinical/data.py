@@ -197,12 +197,15 @@ def read_fold_file(path: str | Path, df: pd.DataFrame):
 def _speaker_indices(df: pd.DataFrame, speakers: set[str], split_name: str):
     known = set(df["speaker_id"].astype(str).unique())
     missing = sorted(speakers - known)
-    if missing:
+    usable_speakers = speakers & known
+    mask = df["speaker_id"].astype(str).isin(usable_speakers)
+    indices = np.flatnonzero(mask.to_numpy())
+    if len(indices) == 0:
         raise ValueError(
-            f"{split_name} contains speakers not found after ASR/demo merge: {missing[:10]}"
+            f"{split_name} has no usable speakers after ASR/demo merge. "
+            f"Missing examples: {missing[:10]}"
         )
-    mask = df["speaker_id"].astype(str).isin(speakers)
-    return np.flatnonzero(mask.to_numpy())
+    return indices, missing
 
 
 def _read_split_speakers(path: Path) -> set[str]:
@@ -270,12 +273,24 @@ def read_splits_folder(path: str | Path, df: pd.DataFrame):
 
         fold = {
             "fold": fold_idx,
-            "train_idx": _speaker_indices(df, speakers["train"], f"fold{fold_idx}_train"),
-            "val_idx": _speaker_indices(df, speakers["val"], f"fold{fold_idx}_val"),
             "test_idx": None,
             "removed_from_train": sorted(removed_from_train),
+            "missing_speakers": {},
         }
+
+        fold["train_idx"], train_missing = _speaker_indices(
+            df, speakers["train"], f"fold{fold_idx}_train"
+        )
+        fold["val_idx"], val_missing = _speaker_indices(
+            df, speakers["val"], f"fold{fold_idx}_val"
+        )
+        fold["missing_speakers"]["train"] = train_missing
+        fold["missing_speakers"]["val"] = val_missing
+
         if "test" in speakers:
-            fold["test_idx"] = _speaker_indices(df, speakers["test"], f"fold{fold_idx}_test")
+            fold["test_idx"], test_missing = _speaker_indices(
+                df, speakers["test"], f"fold{fold_idx}_test"
+            )
+            fold["missing_speakers"]["test"] = test_missing
         folds.append(fold)
     return folds
