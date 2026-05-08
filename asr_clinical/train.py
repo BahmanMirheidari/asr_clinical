@@ -12,7 +12,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import get_linear_schedule_with_warmup
+from transformers import AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 
 from .config import TrainConfig, parse_args
 from .data import (
@@ -70,6 +70,45 @@ def class_weights_for(labels, num_labels: int, device, cfg: TrainConfig):
     return torch.tensor(weights, dtype=torch.float, device=device)
 
 
+def saved_model_exists(model_dir: Path) -> bool:
+    return (model_dir / "config.json").exists()
+
+
+def load_saved_model(model_dir: Path, device):
+    tokenizer = load_tokenizer(str(model_dir))
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+    model.eval()
+    return model, tokenizer
+
+
+def maybe_load_trained_fold(
+    fold_dir: Path,
+    val_df: pd.DataFrame,
+    cfg: TrainConfig,
+    metadata: dict,
+):
+    model_dir = fold_dir / "model"
+    pred_path = fold_dir / "predictions.csv"
+    metrics_path = fold_dir / "metrics.json"
+    if not saved_model_exists(model_dir):
+        return None
+
+    print(f"skipping existing model in {fold_dir}")
+    device = choose_device()
+    model, tokenizer = load_saved_model(model_dir, device)
+    if pred_path.exists() and metrics_path.exists():
+        pred_df = pd.read_csv(pred_path)
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    else:
+        pred_df = predict(model, tokenizer, val_df, cfg, metadata, device)
+        pred_df.to_csv(pred_path, index=False)
+        metrics = score_predictions(
+            pred_df, cfg.task, cfg.aggregate_level, metadata.get("labels")
+        )
+        metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return metrics, pred_df, model, tokenizer, device
+
+
 def train_one_fold(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -77,6 +116,10 @@ def train_one_fold(
     metadata: dict,
     fold_dir: Path,
 ):
+    cached = maybe_load_trained_fold(fold_dir, val_df, cfg, metadata)
+    if cached is not None:
+        return cached
+
     device = choose_device()
     tokenizer = load_tokenizer(cfg.model_name)
     num_labels = len(metadata["labels"]) if cfg.task == "classification" else 1
@@ -200,6 +243,22 @@ def predict(model, tokenizer, df: pd.DataFrame, cfg: TrainConfig, metadata: dict
 
 def train_final_model(train_df, test_df, cfg: TrainConfig, metadata: dict, out_dir: Path):
     final_dir = out_dir / "final_model"
+    final_pred_path = out_dir / "final_test_predictions.csv"
+    final_metrics_path = out_dir / "final_test_metrics.json"
+    if saved_model_exists(final_dir / "model"):
+        print("skipping existing final_model")
+        if final_pred_path.exists() and final_metrics_path.exists():
+            return json.loads(final_metrics_path.read_text(encoding="utf-8"))
+        device = choose_device()
+        model, tokenizer = load_saved_model(final_dir / "model", device)
+        pred_df = predict(model, tokenizer, test_df, cfg, metadata, device)
+        pred_df.to_csv(final_pred_path, index=False)
+        metrics = score_predictions(
+            pred_df, cfg.task, cfg.aggregate_level, metadata.get("labels")
+        )
+        final_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return metrics
+
     subtrain_idx, dev_idx = make_final_test_split(
         train_df, cfg.task, cfg.final_dev_size, cfg.seed + 1000
     )
@@ -283,19 +342,26 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
         val_pred_df.to_csv(fold_dir / "val_predictions.csv", index=False)
 
         if eval_name == "test":
-            test_pred_df = predict(model, tokenizer, eval_df, cfg, metadata, device)
-            test_metrics = score_predictions(
-                test_pred_df, cfg.task, cfg.aggregate_level, metadata.get("labels")
-            )
+            test_pred_path = fold_dir / "test_predictions.csv"
+            test_metrics_path = fold_dir / "test_metrics.json"
+            if test_pred_path.exists() and test_metrics_path.exists():
+                print(f"fold {fold_idx}: skipping existing test predictions")
+                test_pred_df = pd.read_csv(test_pred_path)
+                test_metrics = json.loads(test_metrics_path.read_text(encoding="utf-8"))
+            else:
+                test_pred_df = predict(model, tokenizer, eval_df, cfg, metadata, device)
+                test_metrics = score_predictions(
+                    test_pred_df, cfg.task, cfg.aggregate_level, metadata.get("labels")
+                )
+                test_pred_df.to_csv(test_pred_path, index=False)
+                test_metrics_path.write_text(
+                    json.dumps(test_metrics, indent=2), encoding="utf-8"
+                )
             test_metrics["fold"] = fold_idx
             test_metrics["split"] = "test"
             split_metrics.append(test_metrics)
             test_pred_df["fold"] = fold_idx
             test_pred_df["split"] = "test"
-            test_pred_df.to_csv(fold_dir / "test_predictions.csv", index=False)
-            (fold_dir / "test_metrics.json").write_text(
-                json.dumps(test_metrics, indent=2), encoding="utf-8"
-            )
             split_predictions.append(test_pred_df)
         else:
             split_predictions.append(val_pred_df)
@@ -314,6 +380,17 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
             all_preds, cfg.task, cfg.aggregate_level, metadata.get("labels")
         )
         imp.to_csv(out_dir / "cv_question_importance.csv", index=False)
+
+    final_train_idx, final_test_idx = make_final_test_split(
+        df, cfg.task, cfg.test_size, cfg.seed
+    )
+    final_train_df = df.iloc[final_train_idx].reset_index(drop=True)
+    final_test_df = df.iloc[final_test_idx].reset_index(drop=True)
+    final_train_df.to_csv(out_dir / "trainval_examples.csv", index=False)
+    final_test_df.to_csv(out_dir / "final_test_examples.csv", index=False)
+    print("training final model on trainval and evaluating final held-out test")
+    final_metrics = train_final_model(final_train_df, final_test_df, cfg, metadata, out_dir)
+    print(json.dumps({"final_test": final_metrics}, indent=2))
 
 
 def main():

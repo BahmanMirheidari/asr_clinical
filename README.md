@@ -95,6 +95,15 @@ For each fold, the model trains on `foldN_train.csv`, early-stops on
 `foldN_val.csv`, and evaluates on `foldN_test.csv` if it exists. If no test file
 exists for a fold, validation predictions are used as that fold's CV prediction.
 
+After fold evaluation, a final model is also trained the same way as the default
+workflow: the full usable dataset is split into a fresh speaker-safe final holdout
+using `--test-size`, then `final_model` is trained on the remaining trainval data
+and evaluated on that held-out final test set.
+
+If a fold already has a saved `model/`, training for that fold is skipped. Missing
+prediction or metric files are regenerated from the saved model. Existing
+`final_model/model` is handled the same way.
+
 ## SHAP Question Importance
 
 After training with question-level inputs, run SHAP over the saved prediction table:
