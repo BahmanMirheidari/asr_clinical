@@ -237,11 +237,17 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
         eval_idx = fold["test_idx"] if fold["test_idx"] is not None else fold["val_idx"]
         eval_name = "test" if fold["test_idx"] is not None else "val"
         eval_df = df.iloc[eval_idx].reset_index(drop=True)
+        removed = fold.get("removed_from_train") or []
 
         print(
             f"fold {fold_idx}: train={len(train_df)} val={len(val_df)} "
             f"{eval_name}={len(eval_df)}"
         )
+        if removed:
+            print(
+                f"fold {fold_idx}: removed {len(removed)} leaked speaker(s) "
+                f"from train: {removed[:10]}"
+            )
         val_metrics, val_pred_df, model, tokenizer, device = train_one_fold(
             train_df,
             val_df,

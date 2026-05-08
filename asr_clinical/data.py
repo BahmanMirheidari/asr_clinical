@@ -247,21 +247,33 @@ def read_splits_folder(path: str | Path, df: pd.DataFrame):
             split_name: _read_split_speakers(split_path)
             for split_name, split_path in split_files.items()
         }
-        overlap_checks = [("train", "val"), ("train", "test"), ("val", "test")]
-        for left, right in overlap_checks:
-            if left in speakers and right in speakers:
-                overlap = speakers[left] & speakers[right]
+        removed_from_train = set()
+        for protected_split in ["val", "test"]:
+            if protected_split in speakers:
+                overlap = speakers["train"] & speakers[protected_split]
                 if overlap:
-                    raise ValueError(
-                        f"fold{fold_idx} has speaker leakage between {left} and {right}: "
-                        f"{sorted(overlap)[:10]}"
-                    )
+                    removed_from_train.update(overlap)
+                    speakers["train"] = speakers["train"] - overlap
+
+        if "test" in speakers:
+            val_test_overlap = speakers["val"] & speakers["test"]
+            if val_test_overlap:
+                raise ValueError(
+                    f"fold{fold_idx} has speaker leakage between val and test: "
+                    f"{sorted(val_test_overlap)[:10]}"
+                )
+
+        if not speakers["train"]:
+            raise ValueError(
+                f"fold{fold_idx} has no training speakers after removing leakage."
+            )
 
         fold = {
             "fold": fold_idx,
             "train_idx": _speaker_indices(df, speakers["train"], f"fold{fold_idx}_train"),
             "val_idx": _speaker_indices(df, speakers["val"], f"fold{fold_idx}_val"),
             "test_idx": None,
+            "removed_from_train": sorted(removed_from_train),
         }
         if "test" in speakers:
             fold["test_idx"] = _speaker_indices(df, speakers["test"], f"fold{fold_idx}_test")
