@@ -21,16 +21,116 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
+from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from transformers import AutoModelForSequenceClassification
 
 from .config import TrainConfig
-from .data import load_examples, make_final_test_split
+from .data import load_examples
 from .model import load_tokenizer
 from .train import choose_device, load_saved_model, saved_model_exists, train_one_fold
 
 
+# ----------------------------------------------------------------------
+#  Corrected train/test split function (replaces buggy make_final_test_split)
+# ----------------------------------------------------------------------
+def safe_make_final_test_split(
+    df: pd.DataFrame,
+    task: str,
+    test_size: float,
+    seed: int,
+    min_examples_per_label: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Split dataframe into train and test indices, preserving speaker-level grouping
+    and stratification for classification tasks. This version correctly handles
+    label columns that might be returned as DataFrames or multi-dimensional objects.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns 'speaker_id' and 'label' (the target).
+    task : str
+        'classification' or 'regression'.
+    test_size : float
+        Proportion of speakers to hold out for testing.
+    seed : int
+        Random seed.
+    min_examples_per_label : int
+        Minimum number of examples a label must have to be included in stratification.
+
+    Returns
+    -------
+    train_idx, test_idx : np.ndarray
+        Indices into the original dataframe.
+    """
+    # Ensure we have a copy and the label column is a 1D Series of scalars
+    df_work = df.copy()
+    label_col = df_work["label"]
+
+    # If 'label' is a DataFrame (e.g., from a faulty groupby), flatten it
+    if isinstance(label_col, pd.DataFrame):
+        # Try to take the first column (most common)
+        if label_col.shape[1] >= 1:
+            label_col = label_col.iloc[:, 0]
+        else:
+            raise ValueError("label column is an empty DataFrame")
+    # If it's a Series of arrays/lists, extract first element (or raise if ambiguous)
+    if isinstance(label_col, pd.Series) and label_col.apply(lambda x: hasattr(x, "__len__") and not isinstance(x, str)).any():
+        # Check if all entries are length 1
+        lengths = label_col.apply(lambda x: len(x) if hasattr(x, "__len__") and not isinstance(x, str) else 1)
+        if (lengths == 1).all():
+            label_col = label_col.apply(lambda x: x[0] if hasattr(x, "__len__") else x)
+        else:
+            raise ValueError("label column contains multi-element sequences; cannot flatten")
+
+    # Now label_col should be a Series of scalars
+    df_work["label"] = label_col
+
+    # Group by speaker_id and get first label (assuming all utterances of a speaker share the same label)
+    speaker_labels = df_work.groupby("speaker_id")["label"].first().reset_index()
+    speaker_labels.columns = ["speaker_id", "label"]
+
+    # For classification, use stratified split based on speaker labels
+    if task == "classification":
+        # Count how many speakers per label
+        label_counts = speaker_labels["label"].value_counts()
+        # Remove labels that have too few examples
+        valid_labels = label_counts[label_counts >= min_examples_per_label].index.tolist()
+        if len(valid_labels) < len(label_counts):
+            print(f"Warning: Removing labels with < {min_examples_per_label} speakers: {set(label_counts.index) - set(valid_labels)}")
+            speaker_labels = speaker_labels[speaker_labels["label"].isin(valid_labels)]
+            if speaker_labels.empty:
+                raise ValueError("No labels left after filtering by min_examples_per_label")
+
+        stratify = speaker_labels["label"]
+        splitter = StratifiedShuffleSplit(
+            n_splits=1, test_size=test_size, random_state=seed
+        )
+        train_speaker_idx, test_speaker_idx = next(
+            splitter.split(speaker_labels, stratify)
+        )
+    else:  # regression
+        splitter = ShuffleSplit(
+            n_splits=1, test_size=test_size, random_state=seed
+        )
+        train_speaker_idx, test_speaker_idx = next(
+            splitter.split(speaker_labels)
+        )
+
+    train_speakers = speaker_labels.iloc[train_speaker_idx]["speaker_id"].values
+    test_speakers = speaker_labels.iloc[test_speaker_idx]["speaker_id"].values
+
+    train_idx = df_work[df_work["speaker_id"].isin(train_speakers)].index.to_numpy()
+    test_idx = df_work[df_work["speaker_id"].isin(test_speakers)].index.to_numpy()
+
+    return train_idx, test_idx
+
+
+# ----------------------------------------------------------------------
+#  Rest of the original code (with minor defensive updates)
+# ----------------------------------------------------------------------
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -185,7 +285,8 @@ def train_question_models(df, trainval_df, test_df, metadata, args, out_dir: Pat
 
         q_dir = out_dir / "question_models" / question
         q_cfg = make_question_cfg(args, question, q_dir)
-        q_train_idx, q_dev_idx = make_final_test_split(
+        # Use the corrected split function for final dev split
+        q_train_idx, q_dev_idx = safe_make_final_test_split(
             q_trainval, args.task, args.final_dev_size, args.seed + int(question[1:])
         )
         q_train = q_trainval.iloc[q_train_idx].reset_index(drop=True)
@@ -370,7 +471,8 @@ def permutation_question_importance(model, val_df, feature_cols, args):
 
 def train_meta_model(trainval_features, test_features, feature_cols, args, out_dir: Path):
     speaker_df = trainval_features[["speaker_id", "y_true"]].copy()
-    train_idx, dev_idx = make_final_test_split(
+    # Use corrected split function for final dev split inside meta-training
+    train_idx, dev_idx = safe_make_final_test_split(
         speaker_df, args.task, args.final_dev_size, args.seed + 9999
     )
     meta_train = trainval_features.iloc[train_idx].reset_index(drop=True)
@@ -518,7 +620,8 @@ def main():
     )
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-    train_idx, test_idx = make_final_test_split(df, args.task, args.test_size, args.seed)
+    # Use the corrected split function instead of the buggy make_final_test_split
+    train_idx, test_idx = safe_make_final_test_split(df, args.task, args.test_size, args.seed)
     trainval_df = df.iloc[train_idx].reset_index(drop=True)
     test_df = df.iloc[test_idx].reset_index(drop=True)
     trainval_df.to_csv(out_dir / "trainval_question_examples.csv", index=False)
