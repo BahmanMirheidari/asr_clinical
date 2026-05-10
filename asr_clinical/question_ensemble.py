@@ -29,93 +29,268 @@ from transformers import AutoModelForSequenceClassification
 from .config import TrainConfig
 from .data import load_examples
 from .model import load_tokenizer
-from .train import choose_device, load_saved_model, saved_model_exists, train_one_fold
-
+from .train import choose_device, saved_model_exists, train_one_fold
 
 # ----------------------------------------------------------------------
-#  Corrected train/test split function (replaces buggy make_final_test_split)
+#  Split management (creates / loads CSV files)
 # ----------------------------------------------------------------------
-def safe_make_final_test_split(
-    df: pd.DataFrame,
-    task: str,
-    test_size: float,
-    seed: int,
-    target_col: str = "label",          # parameter added
-    min_examples_per_label: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Split dataframe into train and test indices, preserving speaker-level grouping
-    and stratification for classification tasks.
+class SplitManager:
+    def __init__(self, splits_dir: Path, task: str, train_frac: float, val_frac: float,
+                 test_frac: float, seed: int, n_folds: int = 5):
+        self.splits_dir = Path(splits_dir)
+        self.task = task
+        self.train_frac = train_frac
+        self.val_frac = val_frac
+        self.test_frac = test_frac
+        self.seed = seed
+        self.n_folds = n_folds
+        self.splits_dir.mkdir(parents=True, exist_ok=True)
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain columns 'speaker_id' and target_col (the target).
-    task : str
-        'classification' or 'regression'.
-    test_size : float
-        Proportion of speakers to hold out for testing.
-    seed : int
-        Random seed.
-    target_col : str
-        Name of the column containing the target variable. Default 'label'.
-    min_examples_per_label : int
-        Minimum number of examples a label must have to be included in stratification.
+    def get_final_splits(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Load or create final_train/val/test CSV files."""
+        train_path = self.splits_dir / "final_train.csv"
+        val_path = self.splits_dir / "final_val.csv"
+        test_path = self.splits_dir / "final_test.csv"
 
-    Returns
-    -------
-    train_idx, test_idx : np.ndarray
-        Indices into the original dataframe.
-    """
-    df_work = df.copy()
-    label_col = df_work[target_col]          # <-- use target_col, not hardcoded "label"
+        if train_path.exists() and val_path.exists() and test_path.exists():
+            print("Loading existing final splits.")
+            return (
+                pd.read_csv(train_path),
+                pd.read_csv(val_path),
+                pd.read_csv(test_path),
+            )
 
-    # If label_col is a DataFrame, flatten it
-    if isinstance(label_col, pd.DataFrame):
-        if label_col.shape[1] >= 1:
+        print("Creating final train/val/test splits (by speaker).")
+        trainval_idx, test_idx = self._speaker_split(df, self.test_frac, self.seed)
+        trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
+        test_df = df.iloc[test_idx].reset_index(drop=True)
+
+        rel_val_frac = self.val_frac / (self.train_frac + self.val_frac)
+        train_idx, val_idx = self._speaker_split(trainval_df, rel_val_frac, self.seed + 1)
+        train_df = trainval_df.iloc[train_idx].reset_index(drop=True)
+        val_df = trainval_df.iloc[val_idx].reset_index(drop=True)
+
+        for df_out, path in zip([train_df, val_df, test_df],
+                                [train_path, val_path, test_path]):
+            df_out.to_csv(path, index=False)
+        print("Final splits saved.")
+        return train_df, val_df, test_df
+
+    def get_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Load or create fold splits for inner CV. Also creates fold*_test.csv as copies of final_test.csv."""
+        folds = []
+        for fold_idx in range(self.n_folds):
+            train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
+            val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
+            test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
+
+            # Create a copy of final_test.csv for each fold (to satisfy naming requirement)
+            if not test_copy_path.exists():
+                test_df.to_csv(test_copy_path, index=False)
+
+            if train_path.exists() and val_path.exists():
+                folds.append((pd.read_csv(train_path), pd.read_csv(val_path)))
+            else:
+                # Need to create all folds at once
+                return self._create_fold_splits(train_df, test_df)
+        return folds
+
+    def _create_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Create K folds from the final training set (by speaker, stratified if classification)."""
+        print(f"Creating {self.n_folds} folds from final training set.")
+        speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
+        speakers.columns = ["speaker_id", "label"]
+
+        if self.task == "classification":
+            from sklearn.model_selection import StratifiedKFold
+            kf = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=self.seed)
+            fold_splits = list(kf.split(speakers, speakers["label"]))
+        else:
+            from sklearn.model_selection import KFold
+            kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.seed)
+            fold_splits = list(kf.split(speakers))
+
+        folds = []
+        for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
+            train_speakers = speakers.iloc[train_speaker_idx]["speaker_id"].values
+            val_speakers = speakers.iloc[val_speaker_idx]["speaker_id"].values
+            fold_train = train_df[train_df["speaker_id"].isin(train_speakers)]
+            fold_val = train_df[train_df["speaker_id"].isin(val_speakers)]
+
+            # Save train and val splits
+            train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
+            val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
+            fold_train.to_csv(train_path, index=False)
+            fold_val.to_csv(val_path, index=False)
+
+            # Save a copy of the final test set as fold*_test.csv (for naming consistency)
+            test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
+            test_df.to_csv(test_copy_path, index=False)
+
+            folds.append((fold_train, fold_val))
+        print(f"Created {self.n_folds} fold splits (train/val) and copied final test set to fold*_test.csv.")
+        return folds 
+
+    def _speaker_split(self, df: pd.DataFrame, test_size: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+        """Split indices by speaker (stratified for classification)."""
+        df_work = df.copy()
+        label_col = df_work["label"]
+        if isinstance(label_col, pd.DataFrame):
             label_col = label_col.iloc[:, 0]
+        df_work["label"] = label_col
+
+        speaker_labels = df_work.groupby("speaker_id")["label"].first().reset_index()
+        speaker_labels.columns = ["speaker_id", "label"]
+
+        if self.task == "classification":
+            # Filter rare labels if needed (optional)
+            splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+            train_speaker_idx, test_speaker_idx = next(
+                splitter.split(speaker_labels, speaker_labels["label"])
+            )
         else:
-            raise ValueError(f"Target column '{target_col}' is an empty DataFrame")
+            splitter = ShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+            train_speaker_idx, test_speaker_idx = next(splitter.split(speaker_labels))
 
-    # If label_col is a Series of sequences, try to flatten single‑element sequences
-    if isinstance(label_col, pd.Series) and label_col.apply(lambda x: hasattr(x, "__len__") and not isinstance(x, str)).any():
-        lengths = label_col.apply(lambda x: len(x) if hasattr(x, "__len__") and not isinstance(x, str) else 1)
-        if (lengths == 1).all():
-            label_col = label_col.apply(lambda x: x[0] if hasattr(x, "__len__") else x)
-        else:
-            raise ValueError(f"Target column '{target_col}' contains multi‑element sequences; cannot flatten")
+        train_speakers = speaker_labels.iloc[train_speaker_idx]["speaker_id"].values
+        test_speakers = speaker_labels.iloc[test_speaker_idx]["speaker_id"].values
+        train_idx = df_work[df_work["speaker_id"].isin(train_speakers)].index.to_numpy()
+        test_idx = df_work[df_work["speaker_id"].isin(test_speakers)].index.to_numpy()
+        return train_idx, test_idx
 
-    df_work[target_col] = label_col
 
-    # Group by speaker, using the (now clean) target column
-    speaker_labels = df_work.groupby("speaker_id")[target_col].first().reset_index()
-    speaker_labels.columns = ["speaker_id", "label"]   # rename for internal use
-
-    if task == "classification":
-        label_counts = speaker_labels["label"].value_counts()
-        valid_labels = label_counts[label_counts >= min_examples_per_label].index.tolist()
-        if len(valid_labels) < len(label_counts):
-            print(f"Warning: Removing labels with < {min_examples_per_label} speakers: {set(label_counts.index) - set(valid_labels)}")
-            speaker_labels = speaker_labels[speaker_labels["label"].isin(valid_labels)]
-            if speaker_labels.empty:
-                raise ValueError("No labels left after filtering by min_examples_per_label")
-        stratify = speaker_labels["label"]
-        splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-        train_speaker_idx, test_speaker_idx = next(splitter.split(speaker_labels, stratify))
-    else:  # regression
-        splitter = ShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-        train_speaker_idx, test_speaker_idx = next(splitter.split(speaker_labels))
-
-    train_speakers = speaker_labels.iloc[train_speaker_idx]["speaker_id"].values
-    test_speakers = speaker_labels.iloc[test_speaker_idx]["speaker_id"].values
-
-    train_idx = df_work[df_work["speaker_id"].isin(train_speakers)].index.to_numpy()
-    test_idx = df_work[df_work["speaker_id"].isin(test_speakers)].index.to_numpy()
-
-    return train_idx, test_idx
-    
 # ----------------------------------------------------------------------
-#  Rest of the original code (with minor defensive updates)
+#  Hyperparameter search using cross‑validation
+# ----------------------------------------------------------------------
+def hyperparameter_search(
+    train_df: pd.DataFrame,
+    split_manager: SplitManager,
+    args,
+    metadata: dict,
+    n_folds: int = 5,
+) -> dict:
+    """
+    Perform grid search over hyperparameters using K‑fold CV on the final training set.
+    Returns best parameters (learning_rate, batch_size, epochs).
+    """
+    print("Starting hyperparameter search (nested CV) for per‑question models.")
+    # Choose a representative question (first with enough data)
+    candidate_questions = [q.upper() for q in args.questions]
+    rep_question = None
+    for q in candidate_questions:
+        q_train = train_df[train_df["question_id"] == q]
+        if len(q_train) >= 20:
+            rep_question = q
+            break
+    if rep_question is None:
+        print("No question with enough training data for hyperparameter search. Using defaults.")
+        return {
+            "learning_rate": args.learning_rate,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+        }
+
+    print(f"Using question '{rep_question}' for hyperparameter search.")
+    # Get fold splits (from split_manager, they are already created or will be created)
+    folds = split_manager.get_fold_splits(train_df)
+
+    param_grid = {
+        "learning_rate": [1e-5, 2e-5, 5e-5],
+        "batch_size": [4, 8, 16],
+        "epochs": [3, 5],
+    }
+    best_score = -float("inf") if args.task == "classification" else float("inf")
+    best_params = None
+
+    # For each parameter combination, evaluate on each fold and average
+    for lr in param_grid["learning_rate"]:
+        for bs in param_grid["batch_size"]:
+            for ep in param_grid["epochs"]:
+                fold_scores = []
+                for fold_idx, (fold_train, fold_val) in enumerate(folds):
+                    # Filter for the representative question
+                    q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
+                    q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
+                    if len(q_fold_train) == 0 or len(q_fold_val) == 0:
+                        continue
+                    # Create temporary config
+                    temp_out = Path(args.output_dir) / "temp_hpo" / rep_question / f"lr{lr}_bs{bs}_ep{ep}_fold{fold_idx}"
+                    temp_cfg = TrainConfig(
+                        asr_file=args.asr_file,
+                        demo_file=args.demo_file,
+                        target_column=args.target_column,
+                        task=args.task,
+                        output_dir=str(temp_out),
+                        model_name=args.model_name,
+                        text_mode="question",
+                        aggregate_level="speaker",
+                        num_folds=1,
+                        test_size=0.0,
+                        final_dev_size=0.0,
+                        seed=args.seed,
+                        max_length=args.max_length,
+                        batch_size=bs,
+                        eval_batch_size=bs,
+                        epochs=ep,
+                        learning_rate=lr,
+                        weight_decay=args.weight_decay,
+                        warmup_ratio=args.warmup_ratio,
+                        patience=args.patience,
+                        class_weights=args.class_weights,
+                        loss=args.loss,
+                        focal_gamma=args.focal_gamma,
+                        filter_questions=[rep_question],
+                        min_text_chars=args.min_text_chars,
+                    )
+                    # Train and get validation metrics (we only need primary score)
+                    # We'll call a helper that trains and returns metrics
+                    metrics = _train_and_evaluate(q_fold_train, q_fold_val, temp_cfg, metadata)
+                    if metrics is not None:
+                        score = metrics["macro_f1"] if args.task == "classification" else -metrics["mae"]
+                        fold_scores.append(score)
+                if fold_scores:
+                    avg_score = np.mean(fold_scores)
+                    if (args.task == "classification" and avg_score > best_score) or \
+                       (args.task == "regression" and avg_score < best_score):
+                        best_score = avg_score
+                        best_params = {"learning_rate": lr, "batch_size": bs, "epochs": ep}
+                        print(f"New best: {best_params} with score {avg_score:.4f}")
+
+    if best_params is None:
+        best_params = {"learning_rate": args.learning_rate, "batch_size": args.batch_size, "epochs": args.epochs}
+    print(f"Best hyperparameters: {best_params}")
+    # Save to output dir
+    best_path = Path(args.output_dir) / "best_hyperparams.json"
+    best_path.write_text(json.dumps(best_params, indent=2))
+    return best_params
+
+
+def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> dict | None:
+    """Train a model and return validation metrics (or None if fails)."""
+    # Use a temporary directory
+    model_dir = Path(cfg.output_dir) / "model"
+    if model_dir.exists() and saved_model_exists(model_dir):
+        # Already trained
+        pass
+    else:
+        try:
+            train_one_fold(train_df, val_df, cfg, metadata, Path(cfg.output_dir))
+        except Exception as e:
+            print(f"Training failed: {e}")
+            return None
+    # Load model and evaluate on val
+    from transformers import AutoModelForSequenceClassification
+    device = choose_device()
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+    tokenizer = load_tokenizer(str(model_dir))
+    # Quick evaluation
+    from .train import evaluate
+    metrics = evaluate(model, val_df, tokenizer, cfg, device)
+    return metrics
+
+
+# ----------------------------------------------------------------------
+#  Main ensemble pipeline (per‑question models, embeddings, meta‑model)
 # ----------------------------------------------------------------------
 def set_seed(seed: int):
     random.seed(seed)
@@ -125,33 +300,19 @@ def set_seed(seed: int):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Fine-tune one LLM model per question, export embeddings, select important "
-            "question embeddings, and train a final meta-model."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Train per‑question models with nested CV for hyperparameter tuning and top‑k selection using a fixed validation set.")
     parser.add_argument("--asr-file", required=True)
     parser.add_argument("--demo-file", required=True)
     parser.add_argument("--target-column", required=True)
     parser.add_argument("--task", choices=["classification", "regression"], required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--splits-dir", required=True, help="Directory containing final_train/val/test.csv and fold*_train/val.csv; created if missing.")
     parser.add_argument("--model-name", default="distilroberta-base")
-    parser.add_argument(
-        "--questions",
-        nargs="+",
-        default=[f"Q{i}" for i in range(1, 14)],
-        help="Questions to train separately. Default: Q1 Q2 ... Q13",
-    )
-    parser.add_argument("--top-k", type=int, default=0, help="0 means use all questions.")
-    parser.add_argument(
-        "--evaluate-all-top-k",
-        action="store_true",
-        default=True,
-        help="Evaluate top-k question subsets from k=1 to all questions.",
-    )
-    parser.add_argument("--test-size", type=float, default=0.1)
-    parser.add_argument("--final-dev-size", type=float, default=0.1)
+    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 14)])
+    parser.add_argument("--train-frac", type=float, default=0.8, help="Fraction for final training set (rest split equally into val and test).")
+    parser.add_argument("--val-frac", type=float, default=0.1, help="Fraction for final validation set.")
+    parser.add_argument("--test-frac", type=float, default=0.1, help="Fraction for final test set.")
+    parser.add_argument("--n-cv-folds", type=int, default=5, help="Number of inner CV folds for hyperparameter tuning.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -169,15 +330,12 @@ def build_parser():
     parser.add_argument("--n-estimators", type=int, default=500)
     parser.add_argument("--permutation-repeats", type=int, default=5)
     parser.add_argument("--embedding-batch-size", type=int, default=32)
-    parser.add_argument(
-        "--force-embeddings",
-        action="store_true",
-        help="Regenerate embedding CSV files even if they already exist.",
-    )
+    parser.add_argument("--force-embeddings", action="store_true")
+    parser.add_argument("--force-hpo", action="store_true", help="Force hyperparameter search even if best_hyperparams.json exists.")
     return parser
 
 
-def make_question_cfg(args, question: str, question_dir: Path) -> TrainConfig:
+def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dict) -> TrainConfig:
     return TrainConfig(
         asr_file=args.asr_file,
         demo_file=args.demo_file,
@@ -188,14 +346,14 @@ def make_question_cfg(args, question: str, question_dir: Path) -> TrainConfig:
         text_mode="question",
         aggregate_level="speaker",
         num_folds=1,
-        test_size=args.test_size,
-        final_dev_size=args.final_dev_size,
+        test_size=0.0,
+        final_dev_size=0.0,
         seed=args.seed,
         max_length=args.max_length,
-        batch_size=args.batch_size,
-        eval_batch_size=args.eval_batch_size,
-        epochs=args.epochs,
-        learning_rate=args.learning_rate,
+        batch_size=best_hparams["batch_size"],
+        eval_batch_size=best_hparams["batch_size"],
+        epochs=best_hparams["epochs"],
+        learning_rate=best_hparams["learning_rate"],
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         patience=args.patience,
@@ -215,7 +373,7 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
 
 
 @torch.no_grad()
-def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path):
+def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path, max_length: int):
     if output_csv.exists() and not args.force_embeddings:
         return pd.read_csv(output_csv)
 
@@ -227,15 +385,10 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
     rows = []
     texts = df["text"].tolist()
     for start in range(0, len(texts), args.embedding_batch_size):
-        batch_df = df.iloc[start : start + args.embedding_batch_size].reset_index(drop=True)
-        enc = tokenizer(
-            batch_df["text"].tolist(),
-            truncation=True,
-            padding=True,
-            max_length=args.max_length,
-            return_tensors="pt",
-        )
-        enc = {key: value.to(device) for key, value in enc.items()}
+        batch_df = df.iloc[start:start+args.embedding_batch_size].reset_index(drop=True)
+        enc = tokenizer(batch_df["text"].tolist(), truncation=True, padding=True,
+                        max_length=max_length, return_tensors="pt")
+        enc = {k: v.to(device) for k, v in enc.items()}
         outputs = model(**enc, output_hidden_states=True)
         embeddings = mean_pool(outputs.hidden_states[-1], enc["attention_mask"]).cpu().numpy()
 
@@ -248,7 +401,7 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
                 "question_id": meta["question_id"],
                 "y_true": meta["label"],
             }
-            row.update({f"emb_{i}": float(value) for i, value in enumerate(embedding)})
+            row.update({f"emb_{i}": float(v) for i, v in enumerate(embedding)})
             rows.append(row)
 
     emb_df = pd.DataFrame(rows)
@@ -257,140 +410,120 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
     return emb_df
 
 
-def train_question_models(df, trainval_df, test_df, metadata, args, out_dir: Path):
-    question_dirs = {}
-    embedding_files = {"trainval": {}, "test": {}}
-    question_summaries = []
+def train_question_models(train_df, val_df, test_df, metadata, args, best_hparams, out_dir: Path):
+    embedding_files = {"train": {}, "val": {}, "test": {}}
+    summaries = []
 
     for question in [q.upper() for q in args.questions]:
-        q_trainval = trainval_df[trainval_df["question_id"] == question].reset_index(drop=True)
+        q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
+        q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
         q_test = test_df[test_df["question_id"] == question].reset_index(drop=True)
-        if q_trainval.empty:
-            print(f"{question}: skipping, no trainval examples")
+
+        if q_train.empty:
+            print(f"{question}: skipping, no training examples")
             continue
 
         q_dir = out_dir / "question_models" / question
-        q_cfg = make_question_cfg(args, question, q_dir)
-        # Use the corrected split function for final dev split
-        q_train_idx, q_dev_idx = safe_make_final_test_split(
-            q_trainval, args.task, args.final_dev_size, args.seed + int(question[1:])
-        )
-        q_train = q_trainval.iloc[q_train_idx].reset_index(drop=True)
-        q_dev = q_trainval.iloc[q_dev_idx].reset_index(drop=True)
-        print(f"{question}: train={len(q_train)} dev={len(q_dev)} test={len(q_test)}")
-
-        train_one_fold(q_train, q_dev, q_cfg, metadata, q_dir)
         model_dir = q_dir / "model"
+        train_emb = q_dir / "embeddings_train.csv"
+        val_emb = q_dir / "embeddings_val.csv"
+        test_emb = q_dir / "embeddings_test.csv"
+
+        if (model_dir.exists() and saved_model_exists(model_dir) and
+            train_emb.exists() and val_emb.exists() and (q_test.empty or test_emb.exists())):
+            print(f"{question}: model and embeddings already exist, loading.")
+            embedding_files["train"][question] = train_emb
+            embedding_files["val"][question] = val_emb
+            embedding_files["test"][question] = test_emb if not q_test.empty else None
+            summaries.append({"question_id": question, "train_examples": len(q_train),
+                              "val_examples": len(q_val), "test_examples": len(q_test),
+                              "model_dir": str(model_dir)})
+            continue
+
+        print(f"{question}: training model on {len(q_train)} examples, val on {len(q_val)}")
+        q_cfg = make_question_cfg(args, question, q_dir, best_hparams)
+        train_one_fold(q_train, q_val, q_cfg, metadata, q_dir)
         if not saved_model_exists(model_dir):
             raise FileNotFoundError(f"Expected saved model at {model_dir}")
 
-        train_emb_csv = q_dir / "embeddings_trainval.csv"
-        test_emb_csv = q_dir / "embeddings_test.csv"
-        extract_embeddings(model_dir, q_trainval, args, train_emb_csv)
+        extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
+        extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
         if not q_test.empty:
-            extract_embeddings(model_dir, q_test, args, test_emb_csv)
+            extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
 
-        question_dirs[question] = q_dir
-        embedding_files["trainval"][question] = train_emb_csv
-        if q_test.empty:
-            embedding_files["test"][question] = None
-        else:
-            embedding_files["test"][question] = test_emb_csv
-        question_summaries.append(
-            {
-                "question_id": question,
-                "trainval_examples": len(q_trainval),
-                "test_examples": len(q_test),
-                "model_dir": str(model_dir),
-                "trainval_embeddings": str(train_emb_csv),
-                "test_embeddings": str(test_emb_csv) if not q_test.empty else None,
-            }
-        )
+        embedding_files["train"][question] = train_emb
+        embedding_files["val"][question] = val_emb
+        embedding_files["test"][question] = test_emb if not q_test.empty else None
+        summaries.append({"question_id": question, "train_examples": len(q_train),
+                          "val_examples": len(q_val), "test_examples": len(q_test),
+                          "model_dir": str(model_dir)})
 
-    pd.DataFrame(question_summaries).to_csv(out_dir / "question_model_summary.csv", index=False)
+    pd.DataFrame(summaries).to_csv(out_dir / "question_model_summary.csv", index=False)
     return embedding_files
 
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     tables = []
-    for question in questions:
-        path = embedding_paths.get(question)
+    for q in questions:
+        path = embedding_paths.get(q)
         if path is None or not Path(path).exists():
             continue
         emb_df = pd.read_csv(path)
-        emb_cols = [col for col in emb_df.columns if col.startswith("emb_")]
+        emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
         if not emb_cols:
             continue
         grouped = emb_df.groupby("speaker_id", as_index=True).agg(
             y_true=("y_true", "first"),
             **{col: (col, "mean") for col in emb_cols},
         )
-        grouped = grouped.rename(columns={col: f"{question}__{col}" for col in emb_cols})
-        grouped[f"{question}__present"] = 1.0
+        grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
+        grouped[f"{q}__present"] = 1.0
         tables.append(grouped)
-
     if not tables:
-        raise ValueError("No embedding tables were available for meta-model training.")
-
+        raise ValueError("No embedding tables available.")
     merged = tables[0]
-    for table in tables[1:]:
-        merged = merged.join(table.drop(columns=["y_true"]), how="outer")
-        merged["y_true"] = merged["y_true"].combine_first(table["y_true"])
-
+    for t in tables[1:]:
+        merged = merged.join(t.drop(columns=["y_true"]), how="outer")
+        merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
     merged = merged.reset_index()
-    feature_cols = [col for col in merged.columns if "__" in col]
+    feature_cols = [c for c in merged.columns if "__" in c]
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
     return merged, feature_cols
 
 
-def align_feature_tables(train_df, test_df, feature_cols):
-    for col in feature_cols:
-        if col not in test_df.columns:
-            test_df[col] = 0.0
-    extra_cols = [col for col in test_df.columns if "__" in col and col not in feature_cols]
-    if extra_cols:
-        test_df = test_df.drop(columns=extra_cols)
-    return train_df, test_df
+def align_feature_tables(train_df, val_df, test_df, feature_cols):
+    for df in (val_df, test_df):
+        for col in feature_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+        extra = [c for c in df.columns if "__" in c and c not in feature_cols]
+        if extra:
+            df.drop(columns=extra, inplace=True)
+    return train_df, val_df, test_df
 
 
 def make_meta_model(args):
     if args.task == "classification":
         if args.meta_model == "random_forest":
             return RandomForestClassifier(
-                n_estimators=args.n_estimators,
-                random_state=args.seed,
-                class_weight="balanced",
-                min_samples_leaf=2,
-                n_jobs=-1,
+                n_estimators=args.n_estimators, random_state=args.seed,
+                class_weight="balanced", min_samples_leaf=2, n_jobs=-1
             )
-        return Pipeline(
-            [
-                ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    LogisticRegression(
-                        max_iter=5000,
-                        class_weight="balanced",
-                        random_state=args.seed,
-                    ),
-                ),
-            ]
-        )
-    if args.meta_model == "random_forest":
-        return RandomForestRegressor(
-            n_estimators=args.n_estimators,
-            random_state=args.seed,
-            min_samples_leaf=2,
-            n_jobs=-1,
-        )
-    return Pipeline(
-        [
+        return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
-            ("model", Ridge(alpha=1.0)),
-        ]
-    )
+            ("model", LogisticRegression(max_iter=5000, class_weight="balanced", random_state=args.seed)),
+        ])
+    if args.meta_model == "random_forest":
+        return RandomForestRegressor(
+            n_estimators=args.n_estimators, random_state=args.seed,
+            min_samples_leaf=2, n_jobs=-1
+        )
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", Ridge(alpha=1.0)),
+    ])
 
 
 def score_meta_model(model, x, y, task):
@@ -400,16 +533,10 @@ def score_meta_model(model, x, y, task):
             "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
             "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
             "balanced_accuracy": balanced_accuracy_score(y, pred),
-            "classification_report": classification_report(
-                y, pred, output_dict=True, zero_division=0
-            ),
+            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
             "confusion_matrix": confusion_matrix(y, pred).tolist(),
         }
-    return {
-        "mae": mean_absolute_error(y, pred),
-        "rmse": float(np.sqrt(mean_squared_error(y, pred))),
-        "r2": r2_score(y, pred),
-    }
+    return {"mae": mean_absolute_error(y, pred), "rmse": float(np.sqrt(mean_squared_error(y, pred))), "r2": r2_score(y, pred)}
 
 
 def primary_score(metrics: dict, task: str) -> float:
@@ -418,9 +545,9 @@ def primary_score(metrics: dict, task: str) -> float:
 
 def question_groups(feature_cols):
     groups = {}
-    for col in feature_cols:
-        question = col.split("__", 1)[0]
-        groups.setdefault(question, []).append(col)
+    for c in feature_cols:
+        q = c.split("__", 1)[0]
+        groups.setdefault(q, []).append(c)
     return groups
 
 
@@ -432,200 +559,164 @@ def permutation_question_importance(model, val_df, feature_cols, args):
     groups = question_groups(feature_cols)
     rng = np.random.RandomState(args.seed)
     rows = []
-
-    col_to_idx = {col: idx for idx, col in enumerate(feature_cols)}
-    for question, cols in groups.items():
+    col_to_idx = {c: i for i, c in enumerate(feature_cols)}
+    for q, cols in groups.items():
+        indices = [col_to_idx[c] for c in cols]
         drops = []
-        indices = [col_to_idx[col] for col in cols]
         for _ in range(args.permutation_repeats):
             x_perm = x_val.copy()
             shuffled = x_perm[:, indices].copy()
             rng.shuffle(shuffled)
             x_perm[:, indices] = shuffled
-            metrics = score_meta_model(model, x_perm, y_val, args.task)
-            drops.append(base_score - primary_score(metrics, args.task))
-        rows.append(
-            {
-                "question_id": question,
-                "importance": float(np.mean(drops)),
-                "importance_std": float(np.std(drops)),
-                "base_score": float(base_score),
-            }
-        )
+            m = score_meta_model(model, x_perm, y_val, args.task)
+            drops.append(base_score - primary_score(m, args.task))
+        rows.append({"question_id": q, "importance": float(np.mean(drops)), "importance_std": float(np.std(drops)), "base_score": float(base_score)})
     return pd.DataFrame(rows).sort_values("importance", ascending=False)
 
 
-def train_meta_model(trainval_features, test_features, feature_cols, args, out_dir: Path):
-    speaker_df = trainval_features[["speaker_id", "y_true"]].copy()
-    # Use corrected split function for final dev split inside meta-training
-    train_idx, dev_idx = safe_make_final_test_split(
-    speaker_df, args.task, args.final_dev_size, args.seed + 9999,
-        target_col="y_true"      # <-- specify the correct column name
-    )
-    meta_train = trainval_features.iloc[train_idx].reset_index(drop=True)
-    meta_dev = trainval_features.iloc[dev_idx].reset_index(drop=True)
-
+def train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir: Path):
+    # Compute question importance using the validation set
     base_model = make_meta_model(args)
-    base_model.fit(meta_train[feature_cols].to_numpy(), meta_train["y_true"].to_numpy())
-    importance_df = permutation_question_importance(base_model, meta_dev, feature_cols, args)
+    base_model.fit(train_features[feature_cols].to_numpy(), train_features["y_true"].to_numpy())
+    importance_df = permutation_question_importance(base_model, val_features, feature_cols, args)
     importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
 
     questions_ranked = importance_df["question_id"].tolist()
     if not questions_ranked:
-        raise ValueError("No ranked questions available for meta-model training.")
+        raise ValueError("No ranked questions.")
 
-    requested_ks = list(range(1, len(questions_ranked) + 1))
-    if args.top_k and args.top_k > 0 and args.top_k not in requested_ks:
-        requested_ks.append(min(args.top_k, len(questions_ranked)))
-    requested_ks = sorted(set(requested_ks))
+    max_k = len(questions_ranked)
+    ks = list(range(1, max_k + 1))
+    if args.top_k and 0 < args.top_k < max_k:
+        ks = sorted(set(ks + [args.top_k]))
 
-    topk_dir = out_dir / "topk_meta_models"
-    topk_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
-    all_metrics = {}
+    # Evaluate each k on validation set
+    val_metrics = {}
+    best_val_score = -float("inf") if args.task == "classification" else float("inf")
+    best_k = 1
+    for k in ks:
+        selected_qs = questions_ranked[:k]
+        selected_cols = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs)]
+        model = make_meta_model(args)
+        model.fit(train_features[selected_cols].to_numpy(), train_features["y_true"].to_numpy())
+        m = score_meta_model(model, val_features[selected_cols].to_numpy(), val_features["y_true"].to_numpy(), args.task)
+        val_metrics[k] = m
+        score = m["macro_f1"] if args.task == "classification" else m["mae"]
+        if (args.task == "classification" and score > best_val_score) or (args.task == "regression" and score < best_val_score):
+            best_val_score = score
+            best_k = k
+    print(f"Best k on validation set: {best_k} (score: {best_val_score})")
 
-    for k in requested_ks:
-        selected_questions = questions_ranked[:k]
-        selected_feature_cols = [
-            col for col in feature_cols if col.split("__", 1)[0] in set(selected_questions)
-        ]
-        run_name = f"top_{k}"
-        model_path = topk_dir / f"{run_name}_meta_model.joblib"
-        metrics_path = topk_dir / f"{run_name}_metrics.json"
-        predictions_path = topk_dir / f"{run_name}_predictions.csv"
-        features_path = topk_dir / f"{run_name}_features.csv"
-        questions_path = topk_dir / f"{run_name}_questions.csv"
+    # Retrain on train+val with best_k
+    trainval_features = pd.concat([train_features, val_features], ignore_index=True)
+    selected_qs_final = questions_ranked[:best_k]
+    selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
+    final_model = make_meta_model(args)
+    final_model.fit(trainval_features[selected_cols_final].to_numpy(), trainval_features["y_true"].to_numpy())
 
-        if model_path.exists() and metrics_path.exists() and predictions_path.exists():
-            print(f"skipping existing {run_name} meta-model")
-            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        else:
-            final_model = make_meta_model(args)
-            final_model.fit(
-                trainval_features[selected_feature_cols].to_numpy(),
-                trainval_features["y_true"].to_numpy(),
-            )
-            metrics = score_meta_model(
-                final_model,
-                test_features[selected_feature_cols].to_numpy(),
-                test_features["y_true"].to_numpy(),
-                args.task,
-            )
-            predictions = test_features[["speaker_id", "y_true"]].copy()
-            x_test = test_features[selected_feature_cols].to_numpy()
-            predictions["y_pred"] = final_model.predict(x_test)
-            if args.task == "classification" and hasattr(final_model, "predict_proba"):
-                probs = final_model.predict_proba(x_test)
-                classes = list(final_model.classes_) if hasattr(final_model, "classes_") else []
-                if not classes and hasattr(final_model, "named_steps"):
-                    classes = list(final_model.named_steps["model"].classes_)
-                for class_idx, class_id in enumerate(classes):
-                    predictions[f"prob_{class_id}"] = probs[:, class_idx]
-
-            joblib.dump(final_model, model_path)
-            predictions.to_csv(predictions_path, index=False)
-            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-            pd.DataFrame({"feature": selected_feature_cols}).to_csv(features_path, index=False)
-            pd.DataFrame({"question_id": selected_questions}).to_csv(questions_path, index=False)
-
-        summary_metric = metrics["macro_f1"] if args.task == "classification" else metrics["mae"]
-        rows.append(
-            {
-                "top_k": k,
-                "questions": ",".join(selected_questions),
-                "n_features": len(selected_feature_cols),
-                "primary_metric": summary_metric,
-                **{
-                    key: value
-                    for key, value in metrics.items()
-                    if isinstance(value, (int, float, str))
-                },
-            }
-        )
-        all_metrics[run_name] = metrics
-
-    summary_df = pd.DataFrame(rows)
-    if args.task == "classification":
-        best_idx = summary_df["macro_f1"].idxmax()
-        all_idx = summary_df["top_k"].idxmax()
-        all_score = summary_df.loc[all_idx, "macro_f1"]
-        summary_df["matches_or_beats_all_questions"] = summary_df["macro_f1"] >= all_score
-    else:
-        best_idx = summary_df["mae"].idxmin()
-        all_idx = summary_df["top_k"].idxmax()
-        all_score = summary_df.loc[all_idx, "mae"]
-        summary_df["matches_or_beats_all_questions"] = summary_df["mae"] <= all_score
-
-    best_row = summary_df.loc[best_idx].to_dict()
-    all_row = summary_df.loc[all_idx].to_dict()
-    summary_df.to_csv(out_dir / "topk_meta_metrics.csv", index=False)
-    (out_dir / "topk_meta_metrics.json").write_text(
-        json.dumps(all_metrics, indent=2), encoding="utf-8"
+    # Final evaluation on test set
+    test_metrics = score_meta_model(
+        final_model,
+        test_features[selected_cols_final].to_numpy(),
+        test_features["y_true"].to_numpy(),
+        args.task
     )
+    print("Final test metrics:")
+    print(json.dumps(test_metrics, indent=2))
 
-    best_k = int(best_row["top_k"])
-    best_prefix = topk_dir / f"top_{best_k}"
-    for source, target in [
-        (Path(str(best_prefix) + "_meta_model.joblib"), out_dir / "meta_model.joblib"),
-        (Path(str(best_prefix) + "_predictions.csv"), out_dir / "meta_test_predictions.csv"),
-        (Path(str(best_prefix) + "_metrics.json"), out_dir / "meta_test_metrics.json"),
-        (Path(str(best_prefix) + "_features.csv"), out_dir / "selected_embedding_features.csv"),
-        (Path(str(best_prefix) + "_questions.csv"), out_dir / "selected_questions.csv"),
-    ]:
-        if source.exists():
-            target.write_bytes(source.read_bytes())
+    # Save outputs
+    out_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_model, out_dir / "meta_model.joblib")
+    pd.DataFrame({"question_id": selected_qs_final}).to_csv(out_dir / "selected_questions.csv", index=False)
+    pd.DataFrame({"feature": selected_cols_final}).to_csv(out_dir / "selected_embedding_features.csv", index=False)
+    with open(out_dir / "meta_test_metrics.json", "w") as f:
+        json.dump(test_metrics, f, indent=2)
 
-    best_summary = {
-        "best_top_k": best_k,
-        "best": best_row,
-        "all_questions": all_row,
-    }
-    (out_dir / "best_topk_summary.json").write_text(
-        json.dumps(best_summary, indent=2), encoding="utf-8"
-    )
-    return best_summary
+    # Predictions
+    preds = final_model.predict(test_features[selected_cols_final].to_numpy())
+    out_df = test_features[["speaker_id", "y_true"]].copy()
+    out_df["y_pred"] = preds
+    if args.task == "classification" and hasattr(final_model, "predict_proba"):
+        probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
+        classes = final_model.classes_
+        for i, cls in enumerate(classes):
+            out_df[f"prob_{cls}"] = probs[:, i]
+    out_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
+
+    # Save validation metrics per k
+    val_summary = []
+    for k, m in val_metrics.items():
+        row = {"top_k": k, "questions": ",".join(questions_ranked[:k])}
+        row.update({k2: v2 for k2, v2 in m.items() if isinstance(v2, (int, float, str))})
+        val_summary.append(row)
+    pd.DataFrame(val_summary).to_csv(out_dir / "topk_val_metrics.csv", index=False)
+
+    return {"best_k": best_k, "best_val_score": best_val_score, "test_metrics": test_metrics}
 
 
+# ----------------------------------------------------------------------
+#  Main
+# ----------------------------------------------------------------------
 def main():
     args = build_parser().parse_args()
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "question_ensemble_config.json").write_text(
-        json.dumps(vars(args), indent=2), encoding="utf-8"
-    )
+    splits_dir = Path(args.splits_dir)
 
+    # Save config
+    (out_dir / "question_ensemble_config.json").write_text(json.dumps(vars(args), indent=2))
+
+    # Load full dataset
     questions = [q.upper() for q in args.questions]
     df, metadata = load_examples(
-        args.asr_file,
-        args.demo_file,
-        args.target_column,
-        args.task,
-        text_mode="question",
-        min_text_chars=args.min_text_chars,
+        args.asr_file, args.demo_file, args.target_column, args.task,
+        text_mode="question", min_text_chars=args.min_text_chars,
         filter_questions=questions,
     )
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
-    # Use the corrected split function instead of the buggy make_final_test_split
-    train_idx, test_idx = safe_make_final_test_split(df, args.task, args.test_size, args.seed)
-    trainval_df = df.iloc[train_idx].reset_index(drop=True)
-    test_df = df.iloc[test_idx].reset_index(drop=True)
-    trainval_df.to_csv(out_dir / "trainval_question_examples.csv", index=False)
-    test_df.to_csv(out_dir / "final_test_question_examples.csv", index=False)
-
-    embedding_files = train_question_models(df, trainval_df, test_df, metadata, args, out_dir)
-    available_questions = list(embedding_files["trainval"].keys())
-    train_features, feature_cols = build_feature_table(
-        embedding_files["trainval"], available_questions
+    # Manage splits
+    split_mgr = SplitManager(
+        splits_dir, args.task,
+        args.train_frac, args.val_frac, args.test_frac,
+        args.seed, args.n_cv_folds
     )
-    test_features, _ = build_feature_table(embedding_files["test"], available_questions)
-    train_features, test_features = align_feature_tables(train_features, test_features, feature_cols)
-    train_features.to_csv(out_dir / "meta_trainval_features.csv", index=False)
+    final_train, final_val, final_test = split_mgr.get_final_splits(df)
+    print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
+
+    # Hyperparameter search (if not already done and not forced)
+    best_hparams_path = out_dir / "best_hyperparams.json"
+    if best_hparams_path.exists() and not args.force_hpo:
+        best_hparams = json.loads(best_hparams_path.read_text())
+        print(f"Loaded best hyperparameters from {best_hparams_path}: {best_hparams}")
+    else:
+        best_hparams = hyperparameter_search(final_train, split_mgr, args, metadata, args.n_cv_folds)
+        best_hparams["max_length"] = args.max_length  # add for embedding extraction
+    # Update args for later use (optional)
+    args.learning_rate = best_hparams["learning_rate"]
+    args.batch_size = best_hparams["batch_size"]
+    args.epochs = best_hparams["epochs"]
+
+    # Train per‑question models using best hyperparameters
+    embedding_files = train_question_models(final_train, final_val, final_test, metadata, args, best_hparams, out_dir)
+
+    # Build feature tables
+    available_qs = list(embedding_files["train"].keys())
+    train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
+    val_features, _ = build_feature_table(embedding_files["val"], available_qs)
+    test_features, _ = build_feature_table(embedding_files["test"], available_qs)
+    train_features, val_features, test_features = align_feature_tables(train_features, val_features, test_features, feature_cols)
+
+    # Save raw feature tables
+    train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
+    val_features.to_csv(out_dir / "meta_val_features.csv", index=False)
     test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
 
-    metrics = train_meta_model(train_features, test_features, feature_cols, args, out_dir)
-    print(json.dumps({"meta_test": metrics}, indent=2))
+    # Train meta‑model (top‑k selection using validation set)
+    results = train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir)
+    print("\n===== Final Results =====")
+    print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":
