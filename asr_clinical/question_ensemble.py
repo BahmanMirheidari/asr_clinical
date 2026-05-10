@@ -167,6 +167,7 @@ def hyperparameter_search(
     split_manager: SplitManager,
     args,
     metadata: dict,
+    test_df: pd.DataFrame,
     n_folds: int = 5,
 ) -> dict:
     """
@@ -192,7 +193,7 @@ def hyperparameter_search(
 
     print(f"Using question '{rep_question}' for hyperparameter search.")
     # Get fold splits (from split_manager, they are already created or will be created)
-    folds = split_manager.get_fold_splits(train_df)
+    folds = split_manager.get_fold_splits(train_df, test_df)
 
     param_grid = {
         "learning_rate": [1e-5, 2e-5, 5e-5],
@@ -266,27 +267,58 @@ def hyperparameter_search(
 
 
 def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> dict | None:
-    """Train a model and return validation metrics (or None if fails)."""
-    # Use a temporary directory
+    """Train a model and return validation metrics (macro_f1 for classification, mae for regression)."""
+    from transformers import AutoModelForSequenceClassification
+    from .model import load_tokenizer
+    from .train import choose_device, train_one_fold, saved_model_exists
+
     model_dir = Path(cfg.output_dir) / "model"
-    if model_dir.exists() and saved_model_exists(model_dir):
-        # Already trained
-        pass
-    else:
+    if not (model_dir.exists() and saved_model_exists(model_dir)):
         try:
             train_one_fold(train_df, val_df, cfg, metadata, Path(cfg.output_dir))
         except Exception as e:
             print(f"Training failed: {e}")
             return None
-    # Load model and evaluate on val
-    from transformers import AutoModelForSequenceClassification
+
+    # Load model and tokenizer for evaluation
     device = choose_device()
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
     tokenizer = load_tokenizer(str(model_dir))
-    # Quick evaluation
-    from .train import evaluate
-    metrics = evaluate(model, val_df, tokenizer, cfg, device)
-    return metrics
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+    model.eval()
+
+    texts = val_df["text"].tolist()
+    labels = val_df["label"].values
+    preds = []
+    batch_size = cfg.eval_batch_size
+
+    for start in range(0, len(texts), batch_size):
+        batch_texts = texts[start:start+batch_size]
+        enc = tokenizer(
+            batch_texts,
+            truncation=True,
+            padding=True,
+            max_length=cfg.max_length,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            outputs = model(**enc)
+        logits = outputs.logits.cpu().numpy()
+        if cfg.task == "classification":
+            batch_preds = np.argmax(logits, axis=1)
+        else:   # regression
+            batch_preds = logits.squeeze()
+        preds.extend(batch_preds)
+
+    preds = np.array(preds)
+    if cfg.task == "classification":
+        from sklearn.metrics import f1_score
+        macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
+        return {"macro_f1": macro_f1}
+    else:
+        from sklearn.metrics import mean_absolute_error
+        mae = mean_absolute_error(labels, preds)
+        return {"mae": mae}
 
 
 # ----------------------------------------------------------------------
@@ -332,6 +364,7 @@ def build_parser():
     parser.add_argument("--embedding-batch-size", type=int, default=32)
     parser.add_argument("--force-embeddings", action="store_true")
     parser.add_argument("--force-hpo", action="store_true", help="Force hyperparameter search even if best_hyperparams.json exists.")
+    parser.add_argument("--top-k", type=int, default=0, help="If >0, evaluate all k up to that value; if 0, evaluate all.")
     return parser
 
 
@@ -691,7 +724,7 @@ def main():
         best_hparams = json.loads(best_hparams_path.read_text())
         print(f"Loaded best hyperparameters from {best_hparams_path}: {best_hparams}")
     else:
-        best_hparams = hyperparameter_search(final_train, split_mgr, args, metadata, args.n_cv_folds)
+        best_hparams = hyperparameter_search(final_train, split_mgr, args, metadata, final_test, args.n_cv_folds)
         best_hparams["max_length"] = args.max_length  # add for embedding extraction
     # Update args for later use (optional)
     args.learning_rate = best_hparams["learning_rate"]
