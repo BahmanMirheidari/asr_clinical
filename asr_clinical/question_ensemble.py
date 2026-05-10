@@ -40,23 +40,25 @@ def safe_make_final_test_split(
     task: str,
     test_size: float,
     seed: int,
+    target_col: str = "label",          # parameter added
     min_examples_per_label: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Split dataframe into train and test indices, preserving speaker-level grouping
-    and stratification for classification tasks. This version correctly handles
-    label columns that might be returned as DataFrames or multi-dimensional objects.
+    and stratification for classification tasks.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain columns 'speaker_id' and 'label' (the target).
+        Must contain columns 'speaker_id' and target_col (the target).
     task : str
         'classification' or 'regression'.
     test_size : float
         Proportion of speakers to hold out for testing.
     seed : int
         Random seed.
+    target_col : str
+        Name of the column containing the target variable. Default 'label'.
     min_examples_per_label : int
         Minimum number of examples a label must have to be included in stratification.
 
@@ -65,59 +67,44 @@ def safe_make_final_test_split(
     train_idx, test_idx : np.ndarray
         Indices into the original dataframe.
     """
-    # Ensure we have a copy and the label column is a 1D Series of scalars
     df_work = df.copy()
-    label_col = df_work["label"]
+    label_col = df_work[target_col]          # <-- use target_col, not hardcoded "label"
 
-    # If 'label' is a DataFrame (e.g., from a faulty groupby), flatten it
+    # If label_col is a DataFrame, flatten it
     if isinstance(label_col, pd.DataFrame):
-        # Try to take the first column (most common)
         if label_col.shape[1] >= 1:
             label_col = label_col.iloc[:, 0]
         else:
-            raise ValueError("label column is an empty DataFrame")
-    # If it's a Series of arrays/lists, extract first element (or raise if ambiguous)
+            raise ValueError(f"Target column '{target_col}' is an empty DataFrame")
+
+    # If label_col is a Series of sequences, try to flatten single‑element sequences
     if isinstance(label_col, pd.Series) and label_col.apply(lambda x: hasattr(x, "__len__") and not isinstance(x, str)).any():
-        # Check if all entries are length 1
         lengths = label_col.apply(lambda x: len(x) if hasattr(x, "__len__") and not isinstance(x, str) else 1)
         if (lengths == 1).all():
             label_col = label_col.apply(lambda x: x[0] if hasattr(x, "__len__") else x)
         else:
-            raise ValueError("label column contains multi-element sequences; cannot flatten")
+            raise ValueError(f"Target column '{target_col}' contains multi‑element sequences; cannot flatten")
 
-    # Now label_col should be a Series of scalars
-    df_work["label"] = label_col
+    df_work[target_col] = label_col
 
-    # Group by speaker_id and get first label (assuming all utterances of a speaker share the same label)
-    speaker_labels = df_work.groupby("speaker_id")["label"].first().reset_index()
-    speaker_labels.columns = ["speaker_id", "label"]
+    # Group by speaker, using the (now clean) target column
+    speaker_labels = df_work.groupby("speaker_id")[target_col].first().reset_index()
+    speaker_labels.columns = ["speaker_id", "label"]   # rename for internal use
 
-    # For classification, use stratified split based on speaker labels
     if task == "classification":
-        # Count how many speakers per label
         label_counts = speaker_labels["label"].value_counts()
-        # Remove labels that have too few examples
         valid_labels = label_counts[label_counts >= min_examples_per_label].index.tolist()
         if len(valid_labels) < len(label_counts):
             print(f"Warning: Removing labels with < {min_examples_per_label} speakers: {set(label_counts.index) - set(valid_labels)}")
             speaker_labels = speaker_labels[speaker_labels["label"].isin(valid_labels)]
             if speaker_labels.empty:
                 raise ValueError("No labels left after filtering by min_examples_per_label")
-
         stratify = speaker_labels["label"]
-        splitter = StratifiedShuffleSplit(
-            n_splits=1, test_size=test_size, random_state=seed
-        )
-        train_speaker_idx, test_speaker_idx = next(
-            splitter.split(speaker_labels, stratify)
-        )
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        train_speaker_idx, test_speaker_idx = next(splitter.split(speaker_labels, stratify))
     else:  # regression
-        splitter = ShuffleSplit(
-            n_splits=1, test_size=test_size, random_state=seed
-        )
-        train_speaker_idx, test_speaker_idx = next(
-            splitter.split(speaker_labels)
-        )
+        splitter = ShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        train_speaker_idx, test_speaker_idx = next(splitter.split(speaker_labels))
 
     train_speakers = speaker_labels.iloc[train_speaker_idx]["speaker_id"].values
     test_speakers = speaker_labels.iloc[test_speaker_idx]["speaker_id"].values
@@ -126,8 +113,7 @@ def safe_make_final_test_split(
     test_idx = df_work[df_work["speaker_id"].isin(test_speakers)].index.to_numpy()
 
     return train_idx, test_idx
-
-
+    
 # ----------------------------------------------------------------------
 #  Rest of the original code (with minor defensive updates)
 # ----------------------------------------------------------------------
@@ -473,7 +459,8 @@ def train_meta_model(trainval_features, test_features, feature_cols, args, out_d
     speaker_df = trainval_features[["speaker_id", "y_true"]].copy()
     # Use corrected split function for final dev split inside meta-training
     train_idx, dev_idx = safe_make_final_test_split(
-        speaker_df, args.task, args.final_dev_size, args.seed + 9999
+    speaker_df, args.task, args.final_dev_size, args.seed + 9999,
+        target_col="y_true"      # <-- specify the correct column name
     )
     meta_train = trainval_features.iloc[train_idx].reset_index(drop=True)
     meta_dev = trainval_features.iloc[dev_idx].reset_index(drop=True)
