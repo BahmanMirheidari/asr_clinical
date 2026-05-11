@@ -34,6 +34,7 @@ class TrainConfig:
     filter_questions: list[str] | None = None
     question_importance: bool = False
     min_text_chars: int = 1
+    regression_metric: str = "rmse"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--folds-file", default=None)
+    parser.add_argument("--regression-metric", choices=["mae", "rmse"], default="rmse",
+                        help="Metric to optimize for regression tasks (default: rmse)")
     parser.add_argument(
         "--splits-folder",
         default=None,
