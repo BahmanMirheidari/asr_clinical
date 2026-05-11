@@ -34,6 +34,274 @@ from .train import choose_device, saved_model_exists, train_one_fold
 import shutil
 from pathlib import Path
 
+
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
+from functools import partial
+
+def hyperparameter_search_optuna(
+    train_df: pd.DataFrame,
+    split_manager: SplitManager,
+    args,
+    metadata: dict,
+    test_df: pd.DataFrame,
+    n_folds: int = 5,
+) -> dict:
+    """
+    Perform hyperparameter search using Optuna (Bayesian optimization).
+    Learns from previous trials and prunes unpromising ones.
+    """
+    print("Starting Optuna hyperparameter search (Bayesian optimization + pruning)")
+    
+    # Validate that train_df has required columns
+    if 'question_id' not in train_df.columns:
+        raise KeyError(f"train_df missing 'question_id' column. Available: {train_df.columns.tolist()}")
+    
+    # Choose representative question
+    candidate_questions = [q.upper() for q in args.questions]
+    rep_question = None
+    for q in candidate_questions:
+        q_train = train_df[train_df["question_id"] == q]
+        if len(q_train) >= 20:
+            rep_question = q
+            break
+    
+    if rep_question is None:
+        print("No question with enough training data. Using defaults.")
+        return get_default_params(args)
+    
+    print(f"Using question '{rep_question}' for hyperparameter search")
+    
+    # Determine metric and direction
+    if args.task == "classification":
+        metric_name = "macro_f1"
+        direction = "maximize"
+    else:
+        metric_name = getattr(args, 'regression_metric', 'rmse')
+        direction = "minimize"
+    
+    print(f"Optimizing {metric_name} ({direction})")
+    
+    # Get fold splits (create once, reuse for all trials)
+    folds = split_manager.get_fold_splits(train_df, test_df)
+    if not folds:
+        print("No folds created. Using defaults.")
+        return get_default_params(args)
+    
+    # Use only the number of folds specified for HPO
+    folds = folds[:args.hpo_folds]
+    
+    # Create Optuna study
+    sampler = TPESampler(seed=args.seed, n_startup_trials=10)
+    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=3)
+    
+    study = optuna.create_study(
+        direction=direction,
+        sampler=sampler,
+        pruner=pruner,
+        study_name=f"{args.task}_hpo",
+        load_if_exists=True
+    )
+    
+    # Define objective function with partial to pass fixed arguments
+    objective_partial = partial(
+        objective_function,
+        train_df=train_df,
+        folds=folds,
+        rep_question=rep_question,
+        args=args,
+        metadata=metadata,
+        metric_name=metric_name,
+        direction=direction
+    )
+    
+    # Run optimization
+    print(f"\nRunning Optuna for {args.hpo_n_trials} trials with {len(folds)}-fold CV")
+    study.optimize(
+        objective_partial,
+        n_trials=args.hpo_n_trials,
+        timeout=args.hpo_timeout,  # Optional: stop after N seconds
+        show_progress_bar=True,
+        n_jobs=1  # Optuna doesn't parallelize well with GPU models
+    )
+    
+    # Get best parameters
+    best_params = study.best_params
+    best_value = study.best_value
+    
+    print(f"\n=== Optuna Search Complete ===")
+    print(f"Best {metric_name}: {best_value:.4f}")
+    print(f"Best parameters: {best_params}")
+    
+    # Show optimization history
+    print("\nOptimization history:")
+    for trial in study.trials[-10:]:  # Last 10 trials
+        if trial.value is not None:
+            print(f"  Trial {trial.number}: {trial.value:.4f} - {trial.params}")
+    
+    # Save study for later analysis
+    study_path = Path(args.output_dir) / "optuna_study.pkl"
+    joblib.dump(study, study_path)
+    print(f"Saved Optuna study to {study_path}")
+    
+    # Plot optimization history (optional)
+    try:
+        from optuna.visualization import plot_optimization_history, plot_param_importances
+        fig1 = plot_optimization_history(study)
+        fig1.write_image(Path(args.output_dir) / "optuna_history.png")
+        
+        fig2 = plot_param_importances(study)
+        fig2.write_image(Path(args.output_dir) / "optuna_importance.png")
+    except Exception as e:
+        print(f"Could not create plots: {e}")
+    
+    # Add fixed parameters that weren't tuned
+    best_params.update({
+        "max_length": args.max_length,  # Or could be tuned
+        "weight_decay": best_params.get("weight_decay", args.weight_decay),
+        "warmup_ratio": best_params.get("warmup_ratio", args.warmup_ratio),
+    })
+    
+    return best_params
+
+
+def objective_function(
+    trial: optuna.Trial,
+    train_df: pd.DataFrame,
+    folds: list,
+    rep_question: str,
+    args,
+    metadata: dict,
+    metric_name: str,
+    direction: str
+) -> float:
+    """
+    Objective function for Optuna to optimize.
+    Returns the metric to optimize (higher is better for maximization, lower for minimization).
+    """
+    # Suggest hyperparameters with appropriate distributions
+    params = {
+        # Learning rate: log scale works with positive values
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
+        
+        # Batch size: categorical is fine
+        "batch_size": trial.suggest_categorical("batch_size", [4, 8, 16, 32]),
+        
+        # Epochs: integer range
+        "epochs": trial.suggest_int("epochs", 2, 8),
+        
+        # Weight decay: USE REGULAR (not log) when including zero
+        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
+        # OR use log scale with a small epsilon to avoid zero
+        # "weight_decay": trial.suggest_float("weight_decay", 1e-5, 0.1, log=True),
+        
+        # Warmup ratio: regular scale is fine (can be zero)
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.2),
+        
+        # Max length: categorical
+        "max_length": trial.suggest_categorical("max_length", [128, 256, 384, 512]),
+    }
+    
+    # Optional: Add conditional parameters for classification
+    if args.task == "classification":
+        params["class_weights"] = trial.suggest_categorical("class_weights", ["none", "balanced"])
+        if args.loss == "focal":
+            params["focal_gamma"] = trial.suggest_float("focal_gamma", 1.0, 3.0)
+    
+    print(f"\nTrial {trial.number}: testing {params}")
+    
+    # Evaluate on all folds
+    fold_scores = []
+    fold_metrics = []
+    
+    for fold_idx, (fold_train, fold_val) in enumerate(folds):
+        # Filter for representative question
+        q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
+        q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
+        
+        if len(q_fold_train) == 0 or len(q_fold_val) == 0:
+            continue
+        
+        # Create temp config
+        temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}"
+        temp_cfg = TrainConfig(
+            asr_file=args.asr_file,
+            demo_file=args.demo_file,
+            target_column=args.target_column,
+            task=args.task,
+            output_dir=str(temp_out),
+            model_name=args.model_name,
+            text_mode="question",
+            aggregate_level="speaker",
+            num_folds=1,
+            test_size=0.0,
+            final_dev_size=0.0,
+            seed=args.seed + trial.number + fold_idx,
+            max_length=params["max_length"],
+            batch_size=params["batch_size"],
+            eval_batch_size=params["batch_size"],
+            epochs=params["epochs"],
+            learning_rate=params["learning_rate"],
+            weight_decay=params["weight_decay"],
+            warmup_ratio=params["warmup_ratio"],
+            patience=args.patience,
+            class_weights=params.get("class_weights", args.class_weights),
+            loss=args.loss,
+            focal_gamma=params.get("focal_gamma", args.focal_gamma),
+            filter_questions=[rep_question],
+            min_text_chars=args.min_text_chars,
+        )
+        
+        # Train and evaluate
+        metrics = _train_and_evaluate(
+            q_fold_train, q_fold_val, temp_cfg, metadata,
+            regression_metric=metric_name
+        )
+        
+        if metrics is not None:
+            score = metrics[metric_name]
+            fold_scores.append(score)
+            fold_metrics.append(metrics)
+            
+            # Report intermediate value for pruning
+            trial.report(np.mean(fold_scores), fold_idx)
+            
+            # Handle pruning
+            if trial.should_prune():
+                print(f"Trial {trial.number} pruned at fold {fold_idx}")
+                raise optuna.TrialPruned()
+        
+        # Clean up temp directory
+        try:
+            import shutil
+            shutil.rmtree(temp_out)
+        except:
+            pass
+    
+    if not fold_scores:
+        return float('inf') if direction == "minimize" else float('-inf')
+    
+    # Return the average score
+    avg_score = np.mean(fold_scores)
+    print(f"Trial {trial.number} complete: {metric_name}={avg_score:.4f} (±{np.std(fold_scores):.4f})")
+    
+    return avg_score
+
+
+def get_default_params(args):
+    """Return default hyperparameters"""
+    return {
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "weight_decay": args.weight_decay,
+        "warmup_ratio": args.warmup_ratio,
+        "max_length": args.max_length,
+        "regression_metric": getattr(args, 'regression_metric', 'rmse'),
+    }
+
+
 def cleanup_temp_dirs(temp_dir: Path, keep_best: bool = True, best_params: dict = None):
     """
     Clean up temporary directories created during hyperparameter search.
@@ -491,11 +759,19 @@ def hyperparameter_search(
     return best_params
 
 
-def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> dict | None:
+def _train_and_evaluate(
+    train_df, 
+    val_df, 
+    cfg: TrainConfig, 
+    metadata: dict, 
+    regression_metric: str = "rmse"
+) -> dict | None:
     """Train a model and return validation metrics."""
     from transformers import AutoModelForSequenceClassification
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, f1_score
+    import numpy as np
 
     model_dir = Path(cfg.output_dir) / "model"
     if not (model_dir.exists() and saved_model_exists(model_dir)):
@@ -536,7 +812,7 @@ def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> d
             else:  # regression
                 # For regression, logits shape is (batch_size, 1)
                 if logits.ndim == 2 and logits.shape[1] == 1:
-                    batch_preds = logits[:, 0]  # Extract first (and only) column
+                    batch_preds = logits[:, 0]
                 elif logits.ndim == 1:
                     batch_preds = logits
                 elif logits.ndim == 0:
@@ -544,7 +820,6 @@ def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> d
                 else:
                     batch_preds = logits.flatten()
                 
-                # Ensure we have the right number of predictions
                 if len(batch_preds) != len(batch_texts):
                     print(f"Warning: Expected {len(batch_texts)} predictions, got {len(batch_preds)}")
                     if len(batch_preds) > len(batch_texts):
@@ -554,11 +829,9 @@ def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> d
                 
                 preds.extend(batch_preds.tolist())
 
-    # Convert to numpy arrays
     preds = np.array(preds)
     labels = np.array(labels)
     
-    # Final length check
     if len(preds) != len(labels):
         print(f"Error: Final predictions length ({len(preds)}) != labels length ({len(labels)})")
         return None
@@ -567,19 +840,13 @@ def _train_and_evaluate(train_df, val_df, cfg: TrainConfig, metadata: dict) -> d
         macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
         return {"macro_f1": macro_f1}
     else:
-        # Calculate both metrics
         mae = mean_absolute_error(labels, preds)
         rmse = np.sqrt(mean_squared_error(labels, preds))
         
-        # Return based on config
-        metrics = {"mae": mae, "rmse": rmse}
-        
-        # Also return the specific metric for optimization
-        if hasattr(cfg, 'regression_metric') and cfg.regression_metric:
-            return {cfg.regression_metric: metrics[cfg.regression_metric]}
+        if regression_metric == "mae":
+            return {"mae": mae}
         else:
-            return {"rmse": rmse}  # Default to RMSE
-
+            return {"rmse": rmse}
 # ----------------------------------------------------------------------
 #  Main ensemble pipeline
 # ----------------------------------------------------------------------
@@ -628,6 +895,23 @@ def build_parser():
                         help="Warmup ratios to try (e.g., 0.0 0.06 0.1 0.2)")
     parser.add_argument("--hp-max-lengths", nargs="+", type=int, default=None,
                         help="Max sequence lengths to try (e.g., 128 256 384 512)")
+
+    # Optuna hyperparameter optimization
+    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna",
+                        help="Hyperparameter optimization backend")
+    parser.add_argument("--hpo-n-trials", type=int, default=30,
+                        help="Number of Optuna trials (default: 30)")
+    parser.add_argument("--hpo-timeout", type=int, default=None,
+                        help="Timeout in seconds for Optuna search (default: no timeout)")
+    parser.add_argument("--hpo-folds", type=int, default=3,
+                        help="Number of CV folds for HPO (default: 3)")
+    
+    # Optuna advanced options
+    parser.add_argument("--optuna-sampler", choices=["tpe", "random", "cmaes"], default="tpe",
+                        help="Optuna sampler (default: tpe)")
+    parser.add_argument("--optuna-pruner", choices=["median", "hyperband", "none"], default="median",
+                        help="Optuna pruner (default: median)")
+
     
     # Search strategy
     parser.add_argument("--hp-random-search", action="store_true",
@@ -1023,7 +1307,21 @@ def main():
         best_hparams = json.loads(best_hparams_path.read_text())
         print(f"Loaded best hyperparameters from {best_hparams_path}: {best_hparams}")
     else:
-        best_hparams = hyperparameter_search(final_train, split_mgr, args, metadata, final_test, args.n_cv_folds)
+        if args.hpo_backend == "optuna":
+            best_hparams = hyperparameter_search_optuna(
+                final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
+            )
+        elif args.hpo_backend == "random":
+            # Use existing random search from previous code
+            args.hp_random_search = True
+            args.hp_n_iterations = args.hpo_n_trials
+            best_hparams = hyperparameter_search(
+                final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
+            )
+        else:  # grid search
+            best_hparams = hyperparameter_search(
+                final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
+            )
 
     if args.task == "regression" and 'regression_metric' not in best_hparams:
         best_hparams['regression_metric'] = getattr(args, 'regression_metric', 'rmse')
