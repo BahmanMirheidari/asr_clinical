@@ -336,12 +336,12 @@ def hyperparameter_search(
 
     # Build parameter grid from args
     param_grid = {
-        "learning_rate": args.hp_learning_rates if args.hp_learning_rates else [1e-5, 2e-5, 3e-5, 5e-5],
-        "batch_size": args.hp_batch_sizes if args.hp_batch_sizes else [4, 8, 16, 32],
-        "epochs": args.hp_epochs if args.hp_epochs else [3, 4, 5, 6, 8, 10],
-        "weight_decay": args.hp_weight_decays if args.hp_weight_decays else [0.0, 0.01, 0.1],
-        "warmup_ratio": args.hp_warmup_ratios if args.hp_warmup_ratios else [0.0, 0.06, 0.1],
-        "max_length": args.hp_max_lengths if args.hp_max_lengths else [128, 256, 384, 512],
+        "learning_rate": args.hp_learning_rates if args.hp_learning_rates else [1e-5, 2e-5, 3e-5],
+        "batch_size": args.hp_batch_sizes if args.hp_batch_sizes else [8, 16],
+        "epochs": args.hp_epochs if args.hp_epochs else [5, 8, 10],
+        "weight_decay": args.hp_weight_decays if args.hp_weight_decays else [0.01, 0.1],
+        "warmup_ratio": args.hp_warmup_ratios if args.hp_warmup_ratios else [0.06, 0.1],
+        "max_length": args.hp_max_lengths if args.hp_max_lengths else [128, 256],
     }
     
     # Remove any empty lists
@@ -467,7 +467,7 @@ def hyperparameter_search(
         keep_best=True, 
         best_params=best_params
     )
-    
+
     if best_params is None:
         print("No successful parameter combinations found. Using defaults.")
         best_params = {
