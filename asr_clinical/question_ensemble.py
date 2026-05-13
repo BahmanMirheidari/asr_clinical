@@ -32,353 +32,58 @@ from .data import load_examples
 from .model import load_tokenizer
 from .train import choose_device, saved_model_exists, train_one_fold
 import shutil
-from pathlib import Path
-
 
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
 from functools import partial
 
-def hyperparameter_search_optuna(
-    train_df: pd.DataFrame,
-    split_manager: SplitManager,
-    args,
-    metadata: dict,
-    test_df: pd.DataFrame,
-    n_folds: int = 5,
-) -> dict:
-    """
-    Perform hyperparameter search using Optuna (Bayesian optimization).
-    Learns from previous trials and prunes unpromising ones.
-    """
-    print("Starting Optuna hyperparameter search (Bayesian optimization + pruning)")
-    
-    # Validate that train_df has required columns
-    if 'question_id' not in train_df.columns:
-        raise KeyError(f"train_df missing 'question_id' column. Available: {train_df.columns.tolist()}")
-    
-    # Choose representative question
-    candidate_questions = [q.upper() for q in args.questions]
-    rep_question = None
-    for q in candidate_questions:
-        q_train = train_df[train_df["question_id"] == q]
-        if len(q_train) >= 20:
-            rep_question = q
-            break
-    
-    if rep_question is None:
-        print("No question with enough training data. Using defaults.")
-        return get_default_params(args)
-    
-    print(f"Using question '{rep_question}' for hyperparameter search")
-    
-    # Determine metric and direction
-    if args.task == "classification":
-        metric_name = "macro_f1"
-        direction = "maximize"
-    else:
-        metric_name = getattr(args, 'regression_metric', 'rmse')
-        direction = "minimize"
-    
-    print(f"Optimizing {metric_name} ({direction})")
-    
-    # Get fold splits (create once, reuse for all trials)
-    folds = split_manager.get_fold_splits(train_df, test_df)
-    if not folds:
-        print("No folds created. Using defaults.")
-        return get_default_params(args)
-    
-    # Use only the number of folds specified for HPO
-    folds = folds[:args.hpo_folds]
-    
-    # Create Optuna study
-    sampler = TPESampler(seed=args.seed, n_startup_trials=10)
-    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=3)
-    
-    study = optuna.create_study(
-        direction=direction,
-        sampler=sampler,
-        pruner=pruner,
-        study_name=f"{args.task}_hpo",
-        load_if_exists=True
-    )
-    
-    # Define objective function with partial to pass fixed arguments
-    objective_partial = partial(
-        objective_function,
-        train_df=train_df,
-        folds=folds,
-        rep_question=rep_question,
-        args=args,
-        metadata=metadata,
-        metric_name=metric_name,
-        direction=direction
-    )
-    
-    # Run optimization
-    print(f"\nRunning Optuna for {args.hpo_n_trials} trials with {len(folds)}-fold CV")
-    study.optimize(
-        objective_partial,
-        n_trials=args.hpo_n_trials,
-        timeout=args.hpo_timeout,  # Optional: stop after N seconds
-        show_progress_bar=True,
-        n_jobs=1  # Optuna doesn't parallelize well with GPU models
-    )
-    
-    # Get best parameters
-    best_params = study.best_params
-    best_value = study.best_value
-    
-    print(f"\n=== Optuna Search Complete ===")
-    print(f"Best {metric_name}: {best_value:.4f}")
-    print(f"Best parameters: {best_params}")
-    
-    # Show optimization history
-    print("\nOptimization history:")
-    for trial in study.trials[-10:]:  # Last 10 trials
-        if trial.value is not None:
-            print(f"  Trial {trial.number}: {trial.value:.4f} - {trial.params}")
-    
-    # Save study for later analysis
-    study_path = Path(args.output_dir) / "optuna_study.pkl"
-    joblib.dump(study, study_path)
-    print(f"Saved Optuna study to {study_path}")
-    
-    # Plot optimization history (optional)
-    try:
-        from optuna.visualization import plot_optimization_history, plot_param_importances
-        fig1 = plot_optimization_history(study)
-        fig1.write_image(Path(args.output_dir) / "optuna_history.png")
-        
-        fig2 = plot_param_importances(study)
-        fig2.write_image(Path(args.output_dir) / "optuna_importance.png")
-    except Exception as e:
-        print(f"Could not create plots: {e}")
-    
-    # Add fixed parameters that weren't tuned
-    best_params.update({
-        "max_length": args.max_length,  # Or could be tuned
-        "weight_decay": best_params.get("weight_decay", args.weight_decay),
-        "warmup_ratio": best_params.get("warmup_ratio", args.warmup_ratio),
-    })
-    
-    return best_params
+
+# ----------------------------------------------------------------------
+#  Utility Functions
+# ----------------------------------------------------------------------
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def objective_function(
-    trial: optuna.Trial,
-    train_df: pd.DataFrame,
-    folds: list,
-    rep_question: str,
-    args,
-    metadata: dict,
-    metric_name: str,
-    direction: str
-) -> float:
-    """
-    Objective function for Optuna to optimize.
-    Returns the metric to optimize (higher is better for maximization, lower for minimization).
-    """
-    # Suggest hyperparameters with appropriate distributions
-    params = {
-        # Learning rate: log scale works with positive values
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
-        
-        # Batch size: categorical is fine
-        "batch_size": trial.suggest_categorical("batch_size", [4, 8, 16, 32]),
-        
-        # Epochs: integer range
-        "epochs": trial.suggest_int("epochs", 2, 8),
-        
-        # Weight decay: USE REGULAR (not log) when including zero
-        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        # OR use log scale with a small epsilon to avoid zero
-        # "weight_decay": trial.suggest_float("weight_decay", 1e-5, 0.1, log=True),
-        
-        # Warmup ratio: regular scale is fine (can be zero)
-        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.2),
-        
-        # Max length: categorical
-        "max_length": trial.suggest_categorical("max_length", [128, 256, 384, 512]),
-    }
-    
-    # Optional: Add conditional parameters for classification
-    if args.task == "classification":
-        params["class_weights"] = trial.suggest_categorical("class_weights", ["none", "balanced"])
-        if args.loss == "focal":
-            params["focal_gamma"] = trial.suggest_float("focal_gamma", 1.0, 3.0)
-    
-    print(f"\nTrial {trial.number}: testing {params}")
-    
-    # Evaluate on all folds
-    fold_scores = []
-    fold_metrics = []
-    
-    for fold_idx, (fold_train, fold_val) in enumerate(folds):
-        # Filter for representative question
-        q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
-        q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
-        
-        if len(q_fold_train) == 0 or len(q_fold_val) == 0:
-            continue
-        
-        # Create temp config
-        temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}"
-        temp_cfg = TrainConfig(
-            asr_file=args.asr_file,
-            demo_file=args.demo_file,
-            target_column=args.target_column,
-            task=args.task,
-            output_dir=str(temp_out),
-            model_name=args.model_name,
-            text_mode="question",
-            aggregate_level="speaker",
-            num_folds=1,
-            test_size=0.0,
-            final_dev_size=0.0,
-            seed=args.seed + trial.number + fold_idx,
-            max_length=params["max_length"],
-            batch_size=params["batch_size"],
-            eval_batch_size=params["batch_size"],
-            epochs=params["epochs"],
-            learning_rate=params["learning_rate"],
-            weight_decay=params["weight_decay"],
-            warmup_ratio=params["warmup_ratio"],
-            patience=args.patience,
-            class_weights=params.get("class_weights", args.class_weights),
-            loss=args.loss,
-            focal_gamma=params.get("focal_gamma", args.focal_gamma),
-            filter_questions=[rep_question],
-            min_text_chars=args.min_text_chars,
-        )
-        
-        # Train and evaluate
-        metrics = _train_and_evaluate(
-            q_fold_train, q_fold_val, temp_cfg, metadata,
-            regression_metric=metric_name
-        )
-        
-        if metrics is not None:
-            score = metrics[metric_name]
-            fold_scores.append(score)
-            fold_metrics.append(metrics)
-            
-            # Report intermediate value for pruning
-            trial.report(np.mean(fold_scores), fold_idx)
-            
-            # Handle pruning
-            if trial.should_prune():
-                print(f"Trial {trial.number} pruned at fold {fold_idx}")
-                raise optuna.TrialPruned()
-        
-        # Clean up temp directory
-        try:
-            import shutil
-            shutil.rmtree(temp_out)
-        except:
-            pass
-    
-    if not fold_scores:
-        return float('inf') if direction == "minimize" else float('-inf')
-    
-    # Return the average score
-    avg_score = np.mean(fold_scores)
-    print(f"Trial {trial.number} complete: {metric_name}={avg_score:.4f} (±{np.std(fold_scores):.4f})")
-    
-    return avg_score
-
-
-def get_default_params(args):
-    """Return default hyperparameters"""
-    return {
-        "learning_rate": args.learning_rate,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
-        "max_length": args.max_length,
-        "regression_metric": getattr(args, 'regression_metric', 'rmse'),
-    }
+def cleanup_old_splits(splits_dir: Path):
+    """Delete existing split files to force regeneration with correct columns."""
+    if splits_dir.exists():
+        print(f"Checking for old split files in {splits_dir}")
+        deleted = False
+        for pattern in ["fold*_train.csv", "fold*_val.csv", "fold*_test.csv", "final_*.csv"]:
+            for f in splits_dir.glob(pattern):
+                print(f"  Removing old file: {f.name}")
+                f.unlink()
+                deleted = True
+        if deleted:
+            print("  Old split files removed. Will regenerate with correct columns.")
+        else:
+            print("  No existing split files found.")
 
 
 def cleanup_temp_dirs(temp_dir: Path, keep_best: bool = True, best_params: dict = None):
-    """
-    Clean up temporary directories created during hyperparameter search.
-    
-    Args:
-        temp_dir: Root directory containing temp_hpo folders
-        keep_best: Whether to keep the best performing model's directory
-        best_params: Parameters of the best model to keep
-    """
+    """Clean up temporary directories created during hyperparameter search."""
     if not temp_dir.exists():
         return
     
     temp_hpo_dir = temp_dir / "temp_hpo"
-    if not temp_hpo_dir.exists():
-        return
+    if temp_hpo_dir.exists():
+        print(f"\nCleaning up temporary hyperparameter search directories...")
+        shutil.rmtree(temp_hpo_dir)
+        print(f"  Removed {temp_hpo_dir}")
     
-    print(f"\nCleaning up temporary hyperparameter search directories...")
-    
-    # Keep track of which directories to keep
-    keep_dirs = set()
-    if keep_best and best_params:
-        # Construct the pattern for best params
-        best_pattern = f"lr{best_params['learning_rate']}_bs{best_params['batch_size']}_ep{best_params['epochs']}_wd{best_params['weight_decay']}_wr{best_params['warmup_ratio']}_ml{best_params['max_length']}"
-        keep_dirs.add(best_pattern)
-    
-    # Count directories for reporting
-    total_size = 0
-    deleted_count = 0
-    kept_count = 0
-    
-    # Iterate through all question directories
-    for question_dir in temp_hpo_dir.iterdir():
-        if not question_dir.is_dir():
-            continue
-            
-        # Iterate through parameter combinations
-        for param_dir in question_dir.iterdir():
-            if not param_dir.is_dir():
-                continue
-                
-            # Check if this directory should be kept
-            should_keep = False
-            for keep_pattern in keep_dirs:
-                if keep_pattern in param_dir.name:
-                    should_keep = True
-                    break
-            
-            # Calculate directory size
-            dir_size = sum(f.stat().st_size for f in param_dir.rglob('*') if f.is_file())
-            total_size += dir_size
-            
-            if should_keep:
-                kept_count += 1
-                print(f"  Keeping: {param_dir.name} ({dir_size / 1024 / 1024:.2f} MB)")
-            else:
-                try:
-                    shutil.rmtree(param_dir)
-                    deleted_count += 1
-                    print(f"  Deleted: {param_dir.name} ({dir_size / 1024 / 1024:.2f} MB)")
-                except Exception as e:
-                    print(f"  Error deleting {param_dir.name}: {e}")
-    
-    print(f"\nCleanup complete:")
-    print(f"  - Deleted: {deleted_count} directories ({total_size / 1024 / 1024:.2f} MB)")
-    print(f"  - Kept: {kept_count} directories")
-    
-    # Optionally, also clean up empty question directories
-    for question_dir in temp_hpo_dir.iterdir():
-        if question_dir.is_dir() and not any(question_dir.iterdir()):
-            try:
-                question_dir.rmdir()
-                print(f"  Removed empty directory: {question_dir.name}")
-            except:
-                pass
+    temp_optuna_dir = temp_dir / "temp_hpo_optuna"
+    if temp_optuna_dir.exists():
+        shutil.rmtree(temp_optuna_dir)
+        print(f"  Removed {temp_optuna_dir}")
+
 
 # ----------------------------------------------------------------------
-#  Split management (creates / loads CSV files)
+#  Split Management
 # ----------------------------------------------------------------------
 class SplitManager:
     def __init__(self, splits_dir: Path, task: str, train_frac: float, val_frac: float,
@@ -391,6 +96,49 @@ class SplitManager:
         self.seed = seed
         self.n_folds = n_folds
         self.splits_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Validate existing splits have required columns
+        self._validate_or_cleanup_splits()
+
+    def _validate_or_cleanup_splits(self):
+        """Check if existing splits have required columns, clean up if not."""
+        required_cols = ['question_id', 'label', 'speaker_id']
+        
+        # Check final splits
+        final_train = self.splits_dir / "final_train.csv"
+        if final_train.exists():
+            try:
+                sample = pd.read_csv(final_train, nrows=1)
+                missing = [col for col in required_cols if col not in sample.columns]
+                if missing:
+                    print(f"Existing final splits missing columns: {missing}. Deleting and regenerating...")
+                    self._delete_all_splits()
+                    return
+            except Exception as e:
+                print(f"Error reading existing splits: {e}. Deleting and regenerating...")
+                self._delete_all_splits()
+                return
+        
+        # Check fold splits
+        for fold_idx in range(self.n_folds):
+            train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
+            if train_path.exists():
+                try:
+                    sample = pd.read_csv(train_path, nrows=1)
+                    missing = [col for col in required_cols if col not in sample.columns]
+                    if missing:
+                        print(f"Existing fold splits missing columns: {missing}. Deleting and regenerating...")
+                        self._delete_all_splits()
+                        return
+                except Exception:
+                    self._delete_all_splits()
+                    return
+
+    def _delete_all_splits(self):
+        """Delete all split files."""
+        for pattern in ["fold*_train.csv", "fold*_val.csv", "fold*_test.csv", "final_*.csv"]:
+            for f in self.splits_dir.glob(pattern):
+                f.unlink()
 
     def get_final_splits(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Load or create final_train/val/test CSV files."""
@@ -400,11 +148,16 @@ class SplitManager:
 
         if train_path.exists() and val_path.exists() and test_path.exists():
             print("Loading existing final splits.")
-            return (
-                pd.read_csv(train_path),
-                pd.read_csv(val_path),
-                pd.read_csv(test_path),
-            )
+            train_df = pd.read_csv(train_path)
+            val_df = pd.read_csv(val_path)
+            test_df = pd.read_csv(test_path)
+            
+            # Verify required columns
+            for name, split_df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+                if 'question_id' not in split_df.columns:
+                    raise KeyError(f"final_{name}.csv missing 'question_id' column. Regenerate splits.")
+            
+            return train_df, val_df, test_df
 
         print("Creating final train/val/test splits (by speaker).")
         trainval_idx, test_idx = self._speaker_split(df, self.test_frac, self.seed)
@@ -432,6 +185,14 @@ class SplitManager:
             if not (train_path.exists() and val_path.exists()):
                 need_create = True
                 break
+            
+            # Also check if existing folds have required columns
+            if train_path.exists():
+                sample = pd.read_csv(train_path, nrows=1)
+                if 'question_id' not in sample.columns or 'label' not in sample.columns:
+                    print(f"Fold {fold_idx} missing required columns. Regenerating all folds.")
+                    need_create = True
+                    break
         
         if need_create:
             return self._create_fold_splits(train_df, test_df)
@@ -534,9 +295,9 @@ class SplitManager:
 
 
 # ----------------------------------------------------------------------
-#  Hyperparameter search using cross‑validation
+#  Optuna Hyperparameter Search
 # ----------------------------------------------------------------------
-def hyperparameter_search(
+def hyperparameter_search_optuna(
     train_df: pd.DataFrame,
     split_manager: SplitManager,
     args,
@@ -544,17 +305,14 @@ def hyperparameter_search(
     test_df: pd.DataFrame,
     n_folds: int = 5,
 ) -> dict:
-    """
-    Perform grid search over hyperparameters using K‑fold CV on the final training set.
-    Returns best parameters (learning_rate, batch_size, epochs, etc.).
-    """
-    print("Starting hyperparameter search (nested CV) for per‑question models.")
+    """Perform hyperparameter search using Optuna (Bayesian optimization)."""
+    print("Starting Optuna hyperparameter search (Bayesian optimization + pruning)")
     
     # Validate that train_df has required columns
     if 'question_id' not in train_df.columns:
         raise KeyError(f"train_df missing 'question_id' column. Available: {train_df.columns.tolist()}")
     
-    # Choose a representative question (first with enough data)
+    # Choose representative question
     candidate_questions = [q.upper() for q in args.questions]
     rep_question = None
     for q in candidate_questions:
@@ -564,199 +322,200 @@ def hyperparameter_search(
             break
     
     if rep_question is None:
-        print("No question with enough training data for hyperparameter search. Using defaults.")
-        return {
-            "learning_rate": args.learning_rate,
-            "batch_size": args.batch_size,
-            "epochs": args.epochs,
-            "weight_decay": args.weight_decay,
-            "warmup_ratio": args.warmup_ratio,
-            "max_length": args.max_length,
-            "regression_metric": getattr(args, 'regression_metric', 'rmse'),
-        }
-
-    print(f"Using question '{rep_question}' for hyperparameter search.")
+        print("No question with enough training data. Using defaults.")
+        return get_default_params(args)
     
-    # Determine optimization metric and direction
+    print(f"Using question '{rep_question}' for hyperparameter search")
+    
+    # Determine metric and direction
     if args.task == "classification":
         metric_name = "macro_f1"
-        higher_is_better = True
-        print(f"Optimizing for {metric_name} (higher is better)")
+        direction = "maximize"
     else:
         metric_name = getattr(args, 'regression_metric', 'rmse')
-        higher_is_better = False  # Lower MAE/RMSE is better
-        print(f"Optimizing for {metric_name} (lower is better)")
+        direction = "minimize"
     
-    # Get fold splits
+    print(f"Optimizing {metric_name} ({direction})")
+    
+    # Get fold splits (create once, reuse for all trials)
     folds = split_manager.get_fold_splits(train_df, test_df)
-    
     if not folds:
-        print("No folds created. Using default hyperparameters.")
-        return {
-            "learning_rate": args.learning_rate,
-            "batch_size": args.batch_size,
-            "epochs": args.epochs,
-            "weight_decay": args.weight_decay,
-            "warmup_ratio": args.warmup_ratio,
-            "max_length": args.max_length,
-            "regression_metric": metric_name,
-        }
-
-    # Build parameter grid from args
-    param_grid = {
-        "learning_rate": args.hp_learning_rates if args.hp_learning_rates else [1e-5, 2e-5, 3e-5],
-        "batch_size": args.hp_batch_sizes if args.hp_batch_sizes else [8, 16],
-        "epochs": args.hp_epochs if args.hp_epochs else [5, 8, 10],
-        "weight_decay": args.hp_weight_decays if args.hp_weight_decays else [0.01, 0.1],
-        "warmup_ratio": args.hp_warmup_ratios if args.hp_warmup_ratios else [0.06, 0.1],
-        "max_length": args.hp_max_lengths if args.hp_max_lengths else [128, 256],
-    }
+        print("No folds created. Using defaults.")
+        return get_default_params(args)
     
-    # Remove any empty lists
-    param_grid = {k: v for k, v in param_grid.items() if v}
+    # Use only the number of folds specified for HPO
+    folds = folds[:args.hpo_folds]
     
-    # Generate parameter combinations
-    keys = param_grid.keys()
-    all_combinations = [dict(zip(keys, values)) for values in product(*param_grid.values())]
+    # Create Optuna study
+    sampler = TPESampler(seed=args.seed, n_startup_trials=10)
+    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=3)
     
-    # Limit combinations if specified
-    if args.hp_max_combinations and len(all_combinations) > args.hp_max_combinations:
-        print(f"Limiting to {args.hp_max_combinations} random combinations (from {len(all_combinations)})")
-        import random as rand
-        rand.seed(args.seed)
-        param_combinations = rand.sample(all_combinations, args.hp_max_combinations)
-    else:
-        param_combinations = all_combinations
-    
-    print(f"Searching over {len(param_combinations)} parameter combinations")
-    print(f"Parameter grid sizes: { {k: len(v) for k, v in param_grid.items()} }")
-    
-    best_score = -float("inf") if higher_is_better else float("inf")
-    best_params = None
-    best_raw_scores = []
-    temp_hpo_root = Path(args.output_dir) / "temp_hpo"
-    
-    # For each parameter combination, evaluate on each fold and average
-    for combo_idx, params in enumerate(param_combinations):
-        lr = params["learning_rate"]
-        bs = params["batch_size"]
-        ep = params["epochs"]
-        wd = params["weight_decay"]
-        wr = params["warmup_ratio"]
-        ml = params["max_length"]
-        
-        print(f"\nEvaluating combo {combo_idx+1}/{len(param_combinations)}: LR={lr}, BS={bs}, Epochs={ep}, WD={wd}, WR={wr}, ML={ml}")
-        
-        fold_scores = []
-        fold_raw_scores = []
-        
-        for fold_idx, (fold_train, fold_val) in enumerate(folds):
-            # Verify question_id exists in fold
-            if 'question_id' not in fold_train.columns:
-                print(f"ERROR: fold {fold_idx} missing question_id column")
-                continue
-            
-            # Filter for the representative question
-            q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
-            q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
-            
-            if len(q_fold_train) == 0 or len(q_fold_val) == 0:
-                continue
-            
-            # Create temporary config
-            temp_out = Path(args.output_dir) / "temp_hpo" / rep_question / f"lr{lr}_bs{bs}_ep{ep}_wd{wd}_wr{wr}_ml{ml}_fold{fold_idx}"
-            temp_cfg = TrainConfig(
-                asr_file=args.asr_file,
-                demo_file=args.demo_file,
-                target_column=args.target_column,
-                task=args.task,
-                output_dir=str(temp_out),
-                model_name=args.model_name,
-                text_mode="question",
-                aggregate_level="speaker",
-                num_folds=1,
-                test_size=0.0,
-                final_dev_size=0.0,
-                seed=args.seed,
-                max_length=ml,
-                batch_size=bs,
-                eval_batch_size=bs,
-                epochs=ep,
-                learning_rate=lr,
-                weight_decay=wd,
-                warmup_ratio=wr,
-                patience=args.patience,
-                class_weights=args.class_weights,
-                loss=args.loss,
-                focal_gamma=args.focal_gamma,
-                filter_questions=[rep_question],
-                min_text_chars=args.min_text_chars,
-                regression_metric=metric_name,  # Pass the metric to config
-            )
-            
-            # Train and get validation metrics
-            metrics = _train_and_evaluate(q_fold_train, q_fold_val, temp_cfg, metadata)
-            
-            if metrics is not None:
-                raw_score = metrics[metric_name]
-                fold_raw_scores.append(raw_score)
-                
-                # Convert score for consistent maximization
-                if higher_is_better:
-                    score = raw_score
-                else:
-                    score = -raw_score  # Negate so lower raw scores become higher scores
-                
-                fold_scores.append(score)
-                print(f"  Fold {fold_idx}: {metric_name}={raw_score:.4f} → score={score:.4f}")
-        
-        if fold_scores:
-            avg_score = np.mean(fold_scores)
-            std_score = np.std(fold_scores)
-            avg_raw = np.mean(fold_raw_scores)
-            
-            print(f"  Average: score={avg_score:.4f} (±{std_score:.4f}), raw {metric_name}={avg_raw:.4f}")
-            
-            # Update best parameters
-            if higher_is_better:
-                is_better = avg_score > best_score
-            else:
-                is_better = avg_score < best_score
-            
-            if is_better or best_params is None:
-                best_score = avg_score
-                best_params = params.copy()
-                best_raw_scores = fold_raw_scores
-                print(f"  *** New best! {metric_name}={avg_raw:.4f} with params: {best_params} ***")
-    
-    # Clean up temporary directories after search
-    cleanup_temp_dirs(
-        Path(args.output_dir), 
-        keep_best=True, 
-        best_params=best_params
+    study = optuna.create_study(
+        direction=direction,
+        sampler=sampler,
+        pruner=pruner,
+        study_name=f"{args.task}_hpo",
+        load_if_exists=True
     )
-
-    if best_params is None:
-        print("No successful parameter combinations found. Using defaults.")
-        best_params = {
-            "learning_rate": args.learning_rate,
-            "batch_size": args.batch_size,
-            "epochs": args.epochs,
-            "weight_decay": args.weight_decay,
-            "warmup_ratio": args.warmup_ratio,
-            "max_length": args.max_length,
-            "regression_metric": metric_name,
-        }
-    else:
-        print(f"\n=== Hyperparameter Search Complete ===")
-        print(f"Best parameters: {best_params}")
-        print(f"Best {metric_name}: {np.mean(best_raw_scores):.4f} (±{np.std(best_raw_scores):.4f})")
     
-    # Save to output dir
-    best_path = Path(args.output_dir) / "best_hyperparams.json"
-    best_path.write_text(json.dumps(best_params, indent=2))
+    # Define objective function with partial to pass fixed arguments
+    objective_partial = partial(
+        objective_function,
+        folds=folds,
+        rep_question=rep_question,
+        args=args,
+        metadata=metadata,
+        metric_name=metric_name,
+        direction=direction
+    )
+    
+    # Run optimization
+    print(f"\nRunning Optuna for {args.hpo_n_trials} trials with {len(folds)}-fold CV")
+    study.optimize(
+        objective_partial,
+        n_trials=args.hpo_n_trials,
+        timeout=args.hpo_timeout,
+        show_progress_bar=True,
+        n_jobs=1
+    )
+    
+    # Get best parameters
+    best_params = study.best_params
+    best_value = study.best_value
+    
+    print(f"\n=== Optuna Search Complete ===")
+    print(f"Best {metric_name}: {best_value:.4f}")
+    print(f"Best parameters: {best_params}")
+    
+    # Show optimization history
+    print("\nOptimization history:")
+    for trial in study.trials[-10:]:
+        if trial.value is not None:
+            print(f"  Trial {trial.number}: {trial.value:.4f} - {trial.params}")
+    
+    # Save study for later analysis
+    study_path = Path(args.output_dir) / "optuna_study.pkl"
+    joblib.dump(study, study_path)
+    print(f"Saved Optuna study to {study_path}")
+    
+    # Add fixed parameters that weren't tuned
+    best_params.update({
+        "max_length": args.max_length,
+        "weight_decay": best_params.get("weight_decay", args.weight_decay),
+        "warmup_ratio": best_params.get("warmup_ratio", args.warmup_ratio),
+    })
     
     return best_params
+
+
+def objective_function(
+    trial: optuna.Trial,
+    folds: list,
+    rep_question: str,
+    args,
+    metadata: dict,
+    metric_name: str,
+    direction: str
+) -> float:
+    """Objective function for Optuna to optimize."""
+    # Suggest hyperparameters with appropriate distributions
+    params = {
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [8, 16]),  # Reduced for speed
+        "epochs": trial.suggest_int("epochs", 3, 6),
+        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.2),
+        "max_length": trial.suggest_categorical("max_length", [256]),  # Fix for speed
+    }
+    
+    print(f"\nTrial {trial.number}: testing {params}")
+    
+    # Evaluate on all folds
+    fold_scores = []
+    
+    for fold_idx, (fold_train, fold_val) in enumerate(folds):
+        # Filter for representative question
+        q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
+        q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
+        
+        if len(q_fold_train) == 0 or len(q_fold_val) == 0:
+            continue
+        
+        # Create temp config
+        temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}"
+        temp_cfg = TrainConfig(
+            asr_file=args.asr_file,
+            demo_file=args.demo_file,
+            target_column=args.target_column,
+            task=args.task,
+            output_dir=str(temp_out),
+            model_name=args.model_name,
+            text_mode="question",
+            aggregate_level="speaker",
+            num_folds=1,
+            test_size=0.0,
+            final_dev_size=0.0,
+            seed=args.seed + trial.number + fold_idx,
+            max_length=params["max_length"],
+            batch_size=params["batch_size"],
+            eval_batch_size=params["batch_size"],
+            epochs=params["epochs"],
+            learning_rate=params["learning_rate"],
+            weight_decay=params["weight_decay"],
+            warmup_ratio=params["warmup_ratio"],
+            patience=args.patience,
+            class_weights=args.class_weights,
+            loss=args.loss,
+            focal_gamma=args.focal_gamma,
+            filter_questions=[rep_question],
+            min_text_chars=args.min_text_chars,
+        )
+        
+        # Train and evaluate
+        metrics = _train_and_evaluate(
+            q_fold_train, q_fold_val, temp_cfg, metadata,
+            regression_metric=metric_name if args.task == "regression" else None
+        )
+        
+        if metrics is not None:
+            score = metrics[metric_name]
+            fold_scores.append(score)
+            
+            # Report intermediate value for pruning
+            trial.report(np.mean(fold_scores), fold_idx)
+            
+            # Handle pruning
+            if trial.should_prune():
+                print(f"Trial {trial.number} pruned at fold {fold_idx}")
+                raise optuna.TrialPruned()
+        
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_out)
+        except:
+            pass
+    
+    if not fold_scores:
+        return float('inf') if direction == "minimize" else float('-inf')
+    
+    # Return the average score
+    avg_score = np.mean(fold_scores)
+    print(f"Trial {trial.number} complete: {metric_name}={avg_score:.4f} (±{np.std(fold_scores):.4f})")
+    
+    return avg_score
+
+
+def get_default_params(args):
+    """Return default hyperparameters"""
+    return {
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "weight_decay": args.weight_decay,
+        "warmup_ratio": args.warmup_ratio,
+        "max_length": args.max_length,
+        "regression_metric": getattr(args, 'regression_metric', 'rmse'),
+    }
 
 
 def _train_and_evaluate(
@@ -770,8 +529,6 @@ def _train_and_evaluate(
     from transformers import AutoModelForSequenceClassification
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
-    from sklearn.metrics import mean_absolute_error, mean_squared_error, f1_score
-    import numpy as np
 
     model_dir = Path(cfg.output_dir) / "model"
     if not (model_dir.exists() and saved_model_exists(model_dir)):
@@ -810,7 +567,6 @@ def _train_and_evaluate(
                 batch_preds = np.argmax(logits, axis=1)
                 preds.extend(batch_preds)
             else:  # regression
-                # For regression, logits shape is (batch_size, 1)
                 if logits.ndim == 2 and logits.shape[1] == 1:
                     batch_preds = logits[:, 0]
                 elif logits.ndim == 1:
@@ -847,34 +603,154 @@ def _train_and_evaluate(
             return {"mae": mae}
         else:
             return {"rmse": rmse}
-# ----------------------------------------------------------------------
-#  Main ensemble pipeline
-# ----------------------------------------------------------------------
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
+# ----------------------------------------------------------------------
+#  Legacy Hyperparameter Search (Grid/Random)
+# ----------------------------------------------------------------------
+def hyperparameter_search(
+    train_df: pd.DataFrame,
+    split_manager: SplitManager,
+    args,
+    metadata: dict,
+    test_df: pd.DataFrame,
+    n_folds: int = 5,
+) -> dict:
+    """Legacy grid/random search (kept for compatibility)."""
+    print("Starting hyperparameter search...")
+    
+    if 'question_id' not in train_df.columns:
+        raise KeyError(f"train_df missing 'question_id' column. Available: {train_df.columns.tolist()}")
+    
+    candidate_questions = [q.upper() for q in args.questions]
+    rep_question = None
+    for q in candidate_questions:
+        q_train = train_df[train_df["question_id"] == q]
+        if len(q_train) >= 20:
+            rep_question = q
+            break
+    
+    if rep_question is None:
+        print("No question with enough training data. Using defaults.")
+        return get_default_params(args)
+    
+    print(f"Using question '{rep_question}' for hyperparameter search")
+    
+    if args.task == "classification":
+        metric_name = "macro_f1"
+        higher_is_better = True
+    else:
+        metric_name = getattr(args, 'regression_metric', 'rmse')
+        higher_is_better = False
+    
+    folds = split_manager.get_fold_splits(train_df, test_df)
+    if not folds:
+        return get_default_params(args)
+    
+    # Build parameter grid
+    param_grid = {
+        "learning_rate": args.hp_learning_rates if args.hp_learning_rates else [1e-5, 2e-5, 3e-5],
+        "batch_size": args.hp_batch_sizes if args.hp_batch_sizes else [8, 16],
+        "epochs": args.hp_epochs if args.hp_epochs else [3, 4, 5],
+        "weight_decay": args.hp_weight_decays if args.hp_weight_decays else [0.01],
+        "warmup_ratio": args.hp_warmup_ratios if args.hp_warmup_ratios else [0.06],
+        "max_length": args.hp_max_lengths if args.hp_max_lengths else [256],
+    }
+    
+    param_grid = {k: v for k, v in param_grid.items() if v}
+    keys = param_grid.keys()
+    all_combinations = [dict(zip(keys, values)) for values in product(*param_grid.values())]
+    
+    if args.hp_random_search and args.hp_n_iterations:
+        import random as rand
+        rand.seed(args.seed)
+        param_combinations = rand.sample(all_combinations, min(args.hp_n_iterations, len(all_combinations)))
+    else:
+        param_combinations = all_combinations
+    
+    print(f"Searching over {len(param_combinations)} combinations")
+    
+    best_score = -float("inf") if higher_is_better else float("inf")
+    best_params = None
+    
+    for params in param_combinations:
+        fold_scores = []
+        for fold_train, fold_val in folds:
+            q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
+            q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
+            
+            if len(q_fold_train) == 0 or len(q_fold_val) == 0:
+                continue
+            
+            temp_out = Path(args.output_dir) / "temp_hpo" / rep_question / f"fold_{len(fold_scores)}"
+            temp_cfg = TrainConfig(
+                asr_file=args.asr_file,
+                demo_file=args.demo_file,
+                target_column=args.target_column,
+                task=args.task,
+                output_dir=str(temp_out),
+                model_name=args.model_name,
+                text_mode="question",
+                aggregate_level="speaker",
+                num_folds=1,
+                test_size=0.0,
+                final_dev_size=0.0,
+                seed=args.seed,
+                max_length=params["max_length"],
+                batch_size=params["batch_size"],
+                eval_batch_size=params["batch_size"],
+                epochs=params["epochs"],
+                learning_rate=params["learning_rate"],
+                weight_decay=params["weight_decay"],
+                warmup_ratio=params["warmup_ratio"],
+                patience=args.patience,
+                class_weights=args.class_weights,
+                loss=args.loss,
+                focal_gamma=args.focal_gamma,
+                filter_questions=[rep_question],
+                min_text_chars=args.min_text_chars,
+            )
+            
+            metrics = _train_and_evaluate(q_fold_train, q_fold_val, temp_cfg, metadata)
+            if metrics:
+                score = metrics[metric_name]
+                if not higher_is_better:
+                    score = -score
+                fold_scores.append(score)
+        
+        if fold_scores:
+            avg_score = np.mean(fold_scores)
+            if (higher_is_better and avg_score > best_score) or (not higher_is_better and avg_score < best_score):
+                best_score = avg_score
+                best_params = params.copy()
+    
+    if best_params is None:
+        best_params = get_default_params(args)
+    
+    best_params["max_length"] = best_params.get("max_length", args.max_length)
+    return best_params
+
+
+# ----------------------------------------------------------------------
+#  Main Ensemble Pipeline (Continued)
+# ----------------------------------------------------------------------
 def build_parser():
-    parser = argparse.ArgumentParser(description="Train per‑question models with nested CV for hyperparameter tuning and top‑k selection using a fixed validation set.")
+    parser = argparse.ArgumentParser(description="Train per‑question models with nested CV for hyperparameter tuning")
     parser.add_argument("--asr-file", required=True)
     parser.add_argument("--demo-file", required=True)
     parser.add_argument("--target-column", required=True)
     parser.add_argument("--task", choices=["classification", "regression"], required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--splits-dir", required=True, help="Directory containing final_train/val/test.csv and fold*_train/val.csv; created if missing.")
+    parser.add_argument("--splits-dir", required=True)
     parser.add_argument("--model-name", default="distilroberta-base")
     parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 14)])
-    parser.add_argument("--train-frac", type=float, default=0.8, help="Fraction for final training set (rest split equally into val and test).")
-    parser.add_argument("--val-frac", type=float, default=0.1, help="Fraction for final validation set.")
-    parser.add_argument("--test-frac", type=float, default=0.1, help="Fraction for final test set.")
-    parser.add_argument("--n-cv-folds", type=int, default=5, help="Number of inner CV folds for hyperparameter tuning.")
+    parser.add_argument("--train-frac", type=float, default=0.8)
+    parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--test-frac", type=float, default=0.1)
+    parser.add_argument("--n-cv-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--regression-metric", choices=["mae", "rmse"], default="rmse", help="Metric to optimize for regression tasks (default: rmse)")
+    parser.add_argument("--regression-metric", choices=["mae", "rmse"], default="rmse")
     
-    # Default hyperparameters (fallback if no tuning)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=5)
@@ -882,46 +758,25 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     
-    # Hyperparameter search space
-    parser.add_argument("--hp-learning-rates", nargs="+", type=float, default=None,
-                        help="Learning rates to try (e.g., 1e-5 2e-5 3e-5 5e-5)")
-    parser.add_argument("--hp-batch-sizes", nargs="+", type=int, default=None,
-                        help="Batch sizes to try (e.g., 4 8 16 32)")
-    parser.add_argument("--hp-epochs", nargs="+", type=int, default=None,
-                        help="Number of epochs to try (e.g., 3 4 5 6 8 10)")
-    parser.add_argument("--hp-weight-decays", nargs="+", type=float, default=None,
-                        help="Weight decays to try (e.g., 0.0 0.01 0.1 0.001)")
-    parser.add_argument("--hp-warmup-ratios", nargs="+", type=float, default=None,
-                        help="Warmup ratios to try (e.g., 0.0 0.06 0.1 0.2)")
-    parser.add_argument("--hp-max-lengths", nargs="+", type=int, default=None,
-                        help="Max sequence lengths to try (e.g., 128 256 384 512)")
-
-    # Optuna hyperparameter optimization
-    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna",
-                        help="Hyperparameter optimization backend")
-    parser.add_argument("--hpo-n-trials", type=int, default=30,
-                        help="Number of Optuna trials (default: 30)")
-    parser.add_argument("--hpo-timeout", type=int, default=None,
-                        help="Timeout in seconds for Optuna search (default: no timeout)")
-    parser.add_argument("--hpo-folds", type=int, default=3,
-                        help="Number of CV folds for HPO (default: 3)")
+    parser.add_argument("--hp-learning-rates", nargs="+", type=float, default=None)
+    parser.add_argument("--hp-batch-sizes", nargs="+", type=int, default=None)
+    parser.add_argument("--hp-epochs", nargs="+", type=int, default=None)
+    parser.add_argument("--hp-weight-decays", nargs="+", type=float, default=None)
+    parser.add_argument("--hp-warmup-ratios", nargs="+", type=float, default=None)
+    parser.add_argument("--hp-max-lengths", nargs="+", type=int, default=None)
     
-    # Optuna advanced options
-    parser.add_argument("--optuna-sampler", choices=["tpe", "random", "cmaes"], default="tpe",
-                        help="Optuna sampler (default: tpe)")
-    parser.add_argument("--optuna-pruner", choices=["median", "hyperband", "none"], default="median",
-                        help="Optuna pruner (default: median)")
-
+    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
+    parser.add_argument("--hpo-n-trials", type=int, default=30)
+    parser.add_argument("--hpo-timeout", type=int, default=None)
+    parser.add_argument("--hpo-folds", type=int, default=3)
     
-    # Search strategy
-    parser.add_argument("--hp-random-search", action="store_true",
-                        help="Use random search instead of full grid search")
-    parser.add_argument("--hp-n-iterations", type=int, default=50,
-                        help="Number of iterations for random search")
-    parser.add_argument("--hp-max-combinations", type=int, default=None,
-                        help="Maximum number of combinations to try (randomly sampled if exceeded)")
+    parser.add_argument("--optuna-sampler", choices=["tpe", "random", "cmaes"], default="tpe")
+    parser.add_argument("--optuna-pruner", choices=["median", "hyperband", "none"], default="median")
     
-    # Other training parameters
+    parser.add_argument("--hp-random-search", action="store_true")
+    parser.add_argument("--hp-n-iterations", type=int, default=50)
+    parser.add_argument("--hp-max-combinations", type=int, default=None)
+    
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--class-weights", choices=["none", "balanced"], default="balanced")
@@ -929,14 +784,13 @@ def build_parser():
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--min-text-chars", type=int, default=1)
     
-    # Meta-model parameters
     parser.add_argument("--meta-model", choices=["linear", "random_forest"], default="linear")
     parser.add_argument("--n-estimators", type=int, default=500)
     parser.add_argument("--permutation-repeats", type=int, default=5)
     parser.add_argument("--embedding-batch-size", type=int, default=32)
     parser.add_argument("--force-embeddings", action="store_true")
-    parser.add_argument("--force-hpo", action="store_true", help="Force hyperparameter search even if best_hyperparams.json exists.")
-    parser.add_argument("--top-k", type=int, default=0, help="If >0, evaluate all k up to that value; if 0, evaluate all.")
+    parser.add_argument("--force-hpo", action="store_true")
+    parser.add_argument("--top-k", type=int, default=0)
     
     return parser
 
@@ -1181,7 +1035,6 @@ def permutation_question_importance(model, val_df, feature_cols, args):
 
 
 def train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir: Path):
-    # Compute question importance using the validation set
     base_model = make_meta_model(args)
     base_model.fit(train_features[feature_cols].to_numpy(), train_features["y_true"].to_numpy())
     importance_df = permutation_question_importance(base_model, val_features, feature_cols, args)
@@ -1196,7 +1049,6 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
     if args.top_k and 0 < args.top_k < max_k:
         ks = sorted(set(ks + [args.top_k]))
 
-    # Evaluate each k on validation set
     val_metrics = {}
     best_val_score = -float("inf") if args.task == "classification" else float("inf")
     best_k = 1
@@ -1213,14 +1065,12 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
             best_k = k
     print(f"Best k on validation set: {best_k} (score: {best_val_score})")
 
-    # Retrain on train+val with best_k
     trainval_features = pd.concat([train_features, val_features], ignore_index=True)
     selected_qs_final = questions_ranked[:best_k]
     selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
     final_model = make_meta_model(args)
     final_model.fit(trainval_features[selected_cols_final].to_numpy(), trainval_features["y_true"].to_numpy())
 
-    # Final evaluation on test set
     test_metrics = score_meta_model(
         final_model,
         test_features[selected_cols_final].to_numpy(),
@@ -1230,7 +1080,6 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
     print("Final test metrics:")
     print(json.dumps(test_metrics, indent=2))
 
-    # Save outputs
     out_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(final_model, out_dir / "meta_model.joblib")
     pd.DataFrame({"question_id": selected_qs_final}).to_csv(out_dir / "selected_questions.csv", index=False)
@@ -1238,7 +1087,6 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
     with open(out_dir / "meta_test_metrics.json", "w") as f:
         json.dump(test_metrics, f, indent=2)
 
-    # Predictions
     preds = final_model.predict(test_features[selected_cols_final].to_numpy())
     out_df = test_features[["speaker_id", "y_true"]].copy()
     out_df["y_pred"] = preds
@@ -1249,7 +1097,6 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
             out_df[f"prob_{cls}"] = probs[:, i]
     out_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
 
-    # Save validation metrics per k
     val_summary = []
     for k, m in val_metrics.items():
         row = {"top_k": k, "questions": ",".join(questions_ranked[:k])}
@@ -1269,6 +1116,9 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
+    
+    # Clean up old split files to ensure correct columns
+    cleanup_old_splits(splits_dir)
 
     # Save config
     (out_dir / "question_ensemble_config.json").write_text(json.dumps(vars(args), indent=2))
@@ -1281,7 +1131,6 @@ def main():
         filter_questions=questions,
     )
     
-    # Verify question_id exists
     if 'question_id' not in df.columns:
         raise ValueError(f"Loaded DataFrame missing 'question_id' column. Available: {df.columns.tolist()}")
     
@@ -1296,7 +1145,6 @@ def main():
     final_train, final_val, final_test = split_mgr.get_final_splits(df)
     print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
     
-    # Verify question_id in splits
     for name, split_df in [("train", final_train), ("val", final_val), ("test", final_test)]:
         if 'question_id' not in split_df.columns:
             raise KeyError(f"final_{name} missing 'question_id' column")
@@ -1312,13 +1160,12 @@ def main():
                 final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
             )
         elif args.hpo_backend == "random":
-            # Use existing random search from previous code
             args.hp_random_search = True
             args.hp_n_iterations = args.hpo_n_trials
             best_hparams = hyperparameter_search(
                 final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
             )
-        else:  # grid search
+        else:
             best_hparams = hyperparameter_search(
                 final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
             )
@@ -1334,7 +1181,7 @@ def main():
     args.warmup_ratio = best_hparams.get("warmup_ratio", args.warmup_ratio)
     args.max_length = best_hparams.get("max_length", args.max_length)
 
-    # Train per‑question models using best hyperparameters
+    # Train per‑question models
     embedding_files = train_question_models(final_train, final_val, final_test, metadata, args, best_hparams, out_dir)
 
     # Build feature tables
@@ -1353,6 +1200,9 @@ def main():
     results = train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir)
     print("\n===== Final Results =====")
     print(json.dumps(results, indent=2))
+    
+    # Cleanup temporary directories
+    cleanup_temp_dirs(out_dir)
 
 
 if __name__ == "__main__":
