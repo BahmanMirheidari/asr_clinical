@@ -295,6 +295,22 @@ class SplitManager:
 
 
 # ----------------------------------------------------------------------
+#  Primary Score Function (Always Maximize)
+# ----------------------------------------------------------------------
+def primary_score(metrics: dict, task: str) -> float:
+    """
+    Return a score that should always be MAXIMIZED for optimization.
+    For classification: macro_f1 (higher is better)
+    For regression: -rmse (higher is better, equivalent to minimizing RMSE)
+    """
+    if task == "classification":
+        return metrics.get("macro_f1", 0.0)
+    else:  # regression
+        # Return negative RMSE so higher is always better
+        return -metrics.get("rmse", float('inf'))
+
+
+# ----------------------------------------------------------------------
 #  Optuna Hyperparameter Search
 # ----------------------------------------------------------------------
 def hyperparameter_search_optuna(
@@ -327,15 +343,8 @@ def hyperparameter_search_optuna(
     
     print(f"Using question '{rep_question}' for hyperparameter search")
     
-    # Determine metric and direction
-    if args.task == "classification":
-        metric_name = "macro_f1"
-        direction = "maximize"
-    else:
-        metric_name = getattr(args, 'regression_metric', 'rmse')
-        direction = "minimize"
-    
-    print(f"Optimizing {metric_name} ({direction})")
+    # Determine metric and direction (always maximize primary_score)
+    direction = "maximize"
     
     # Get fold splits (create once, reuse for all trials)
     folds = split_manager.get_fold_splits(train_df, test_df)
@@ -365,8 +374,6 @@ def hyperparameter_search_optuna(
         rep_question=rep_question,
         args=args,
         metadata=metadata,
-        metric_name=metric_name,
-        direction=direction
     )
     
     # Run optimization
@@ -384,7 +391,7 @@ def hyperparameter_search_optuna(
     best_value = study.best_value
     
     print(f"\n=== Optuna Search Complete ===")
-    print(f"Best {metric_name}: {best_value:.4f}")
+    print(f"Best primary score: {best_value:.4f}")
     print(f"Best parameters: {best_params}")
     
     # Show optimization history
@@ -414,10 +421,8 @@ def objective_function(
     rep_question: str,
     args,
     metadata: dict,
-    metric_name: str,
-    direction: str
 ) -> float:
-    """Objective function for Optuna to optimize."""
+    """Objective function for Optuna to optimize (maximizes primary_score)."""
     # Suggest hyperparameters with appropriate distributions
     params = {
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
@@ -473,12 +478,11 @@ def objective_function(
         
         # Train and evaluate
         metrics = _train_and_evaluate(
-            q_fold_train, q_fold_val, temp_cfg, metadata,
-            regression_metric=metric_name if args.task == "regression" else None
+            q_fold_train, q_fold_val, temp_cfg, metadata
         )
         
         if metrics is not None:
-            score = metrics[metric_name]
+            score = primary_score(metrics, args.task)
             fold_scores.append(score)
             
             # Report intermediate value for pruning
@@ -496,11 +500,11 @@ def objective_function(
             pass
     
     if not fold_scores:
-        return float('inf') if direction == "minimize" else float('-inf')
+        return float('-inf')  # Worst possible score
     
     # Return the average score
     avg_score = np.mean(fold_scores)
-    print(f"Trial {trial.number} complete: {metric_name}={avg_score:.4f} (±{np.std(fold_scores):.4f})")
+    print(f"Trial {trial.number} complete: primary_score={avg_score:.4f} (±{np.std(fold_scores):.4f})")
     
     return avg_score
 
@@ -514,7 +518,6 @@ def get_default_params(args):
         "weight_decay": args.weight_decay,
         "warmup_ratio": args.warmup_ratio,
         "max_length": args.max_length,
-        "regression_metric": getattr(args, 'regression_metric', 'rmse'),
     }
 
 
@@ -523,7 +526,6 @@ def _train_and_evaluate(
     val_df, 
     cfg: TrainConfig, 
     metadata: dict, 
-    regression_metric: str = "rmse"
 ) -> dict | None:
     """Train a model and return validation metrics."""
     from transformers import AutoModelForSequenceClassification
@@ -596,13 +598,8 @@ def _train_and_evaluate(
         macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
         return {"macro_f1": macro_f1}
     else:
-        mae = mean_absolute_error(labels, preds)
         rmse = np.sqrt(mean_squared_error(labels, preds))
-        
-        if regression_metric == "mae":
-            return {"mae": mae}
-        else:
-            return {"rmse": rmse}
+        return {"rmse": rmse}
 
 
 # ----------------------------------------------------------------------
@@ -636,12 +633,8 @@ def hyperparameter_search(
     
     print(f"Using question '{rep_question}' for hyperparameter search")
     
-    if args.task == "classification":
-        metric_name = "macro_f1"
-        higher_is_better = True
-    else:
-        metric_name = getattr(args, 'regression_metric', 'rmse')
-        higher_is_better = False
+    # Always maximize primary_score
+    higher_is_better = True
     
     folds = split_manager.get_fold_splits(train_df, test_df)
     if not folds:
@@ -670,7 +663,7 @@ def hyperparameter_search(
     
     print(f"Searching over {len(param_combinations)} combinations")
     
-    best_score = -float("inf") if higher_is_better else float("inf")
+    best_score = -float("inf")  # Always maximize
     best_params = None
     
     for params in param_combinations:
@@ -713,14 +706,12 @@ def hyperparameter_search(
             
             metrics = _train_and_evaluate(q_fold_train, q_fold_val, temp_cfg, metadata)
             if metrics:
-                score = metrics[metric_name]
-                if not higher_is_better:
-                    score = -score
+                score = primary_score(metrics, args.task)
                 fold_scores.append(score)
         
         if fold_scores:
             avg_score = np.mean(fold_scores)
-            if (higher_is_better and avg_score > best_score) or (not higher_is_better and avg_score < best_score):
+            if avg_score > best_score:
                 best_score = avg_score
                 best_params = params.copy()
     
@@ -732,7 +723,7 @@ def hyperparameter_search(
 
 
 # ----------------------------------------------------------------------
-#  Main Ensemble Pipeline (Continued)
+#  Main Ensemble Pipeline
 # ----------------------------------------------------------------------
 def build_parser():
     parser = argparse.ArgumentParser(description="Train per‑question models with nested CV for hyperparameter tuning")
@@ -749,7 +740,6 @@ def build_parser():
     parser.add_argument("--test-frac", type=float, default=0.1)
     parser.add_argument("--n-cv-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--regression-metric", choices=["mae", "rmse"], default="rmse")
     
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -974,6 +964,7 @@ def make_meta_model(args):
             ("scaler", StandardScaler()),
             ("model", LogisticRegression(max_iter=5000, class_weight="balanced", random_state=args.seed)),
         ])
+    # Regression
     if args.meta_model == "random_forest":
         return RandomForestRegressor(
             n_estimators=args.n_estimators, random_state=args.seed,
@@ -996,11 +987,13 @@ def score_meta_model(model, x, y, task):
             "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
             "confusion_matrix": confusion_matrix(y, pred).tolist(),
         }
-    return {"mae": mean_absolute_error(y, pred), "rmse": float(np.sqrt(mean_squared_error(y, pred))), "r2": r2_score(y, pred)}
-
-
-def primary_score(metrics: dict, task: str) -> float:
-    return metrics["macro_f1"] if task == "classification" else -metrics["mae"]
+    # Regression - use RMSE as primary metric
+    rmse = np.sqrt(mean_squared_error(y, pred))
+    return {
+        "rmse": rmse,
+        "mae": mean_absolute_error(y, pred),
+        "r2": r2_score(y, pred),
+    }
 
 
 def question_groups(feature_cols):
@@ -1012,6 +1005,7 @@ def question_groups(feature_cols):
 
 
 def permutation_question_importance(model, val_df, feature_cols, args):
+    """Calculate feature importance by permuting all features from each question."""
     x_val = val_df[feature_cols].to_numpy()
     y_val = val_df["y_true"].to_numpy()
     base_metrics = score_meta_model(model, x_val, y_val, args.task)
@@ -1020,6 +1014,7 @@ def permutation_question_importance(model, val_df, feature_cols, args):
     rng = np.random.RandomState(args.seed)
     rows = []
     col_to_idx = {c: i for i, c in enumerate(feature_cols)}
+    
     for q, cols in groups.items():
         indices = [col_to_idx[c] for c in cols]
         drops = []
@@ -1029,12 +1024,20 @@ def permutation_question_importance(model, val_df, feature_cols, args):
             rng.shuffle(shuffled)
             x_perm[:, indices] = shuffled
             m = score_meta_model(model, x_perm, y_val, args.task)
-            drops.append(base_score - primary_score(m, args.task))
-        rows.append({"question_id": q, "importance": float(np.mean(drops)), "importance_std": float(np.std(drops)), "base_score": float(base_score)})
+            perm_score = primary_score(m, args.task)
+            drops.append(base_score - perm_score)
+        rows.append({
+            "question_id": q,
+            "importance": float(np.mean(drops)),
+            "importance_std": float(np.std(drops)),
+            "base_score": float(base_score)
+        })
+    
     return pd.DataFrame(rows).sort_values("importance", ascending=False)
 
 
 def train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir: Path):
+    """Train meta-model with top-k feature selection based on primary_score."""
     base_model = make_meta_model(args)
     base_model.fit(train_features[feature_cols].to_numpy(), train_features["y_true"].to_numpy())
     importance_df = permutation_question_importance(base_model, val_features, feature_cols, args)
@@ -1050,8 +1053,9 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         ks = sorted(set(ks + [args.top_k]))
 
     val_metrics = {}
-    best_val_score = -float("inf") if args.task == "classification" else float("inf")
+    best_val_score = -float("inf")  # Always maximize primary_score
     best_k = 1
+    
     for k in ks:
         selected_qs = questions_ranked[:k]
         selected_cols = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs)]
@@ -1059,12 +1063,20 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         model.fit(train_features[selected_cols].to_numpy(), train_features["y_true"].to_numpy())
         m = score_meta_model(model, val_features[selected_cols].to_numpy(), val_features["y_true"].to_numpy(), args.task)
         val_metrics[k] = m
-        score = m["macro_f1"] if args.task == "classification" else -m["mae"]
-        if (args.task == "classification" and score > best_val_score) or (args.task == "regression" and score < best_val_score):
+        
+        # Use primary_score which always returns a value to MAXIMIZE
+        score = primary_score(m, args.task)
+        
+        # Always maximize (no task-specific condition needed)
+        if score > best_val_score:
             best_val_score = score
             best_k = k
-    print(f"Best k on validation set: {best_k} (score: {best_val_score})")
+            
+    print(f"Best k on validation set: {best_k} (primary_score: {best_val_score:.4f})")
+    if args.task == "regression":
+        print(f"  Equivalent to RMSE: {-best_val_score:.4f}")
 
+    # Train final model on train+val with best k
     trainval_features = pd.concat([train_features, val_features], ignore_index=True)
     selected_qs_final = questions_ranked[:best_k]
     selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
@@ -1077,7 +1089,7 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         test_features["y_true"].to_numpy(),
         args.task
     )
-    print("Final test metrics:")
+    print("\nFinal test metrics:")
     print(json.dumps(test_metrics, indent=2))
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1100,11 +1112,19 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
     val_summary = []
     for k, m in val_metrics.items():
         row = {"top_k": k, "questions": ",".join(questions_ranked[:k])}
-        row.update({k2: v2 for k2, v2 in m.items() if isinstance(v2, (int, float, str))})
+        # Store both primary_score and raw metrics
+        row["primary_score"] = primary_score(m, args.task)
+        for k2, v2 in m.items():
+            if isinstance(v2, (int, float)):
+                row[k2] = v2
         val_summary.append(row)
     pd.DataFrame(val_summary).to_csv(out_dir / "topk_val_metrics.csv", index=False)
 
-    return {"best_k": best_k, "best_val_score": best_val_score, "test_metrics": test_metrics}
+    return {
+        "best_k": best_k,
+        "best_val_primary_score": best_val_score,
+        "test_metrics": test_metrics
+    }
 
 
 # ----------------------------------------------------------------------
@@ -1159,19 +1179,16 @@ def main():
             best_hparams = hyperparameter_search_optuna(
                 final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
             )
-        elif args.hpo_backend == "random":
-            args.hp_random_search = True
-            args.hp_n_iterations = args.hpo_n_trials
-            best_hparams = hyperparameter_search(
-                final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
-            )
         else:
+            # For grid or random search
+            args.hp_random_search = (args.hpo_backend == "random")
+            args.hp_n_iterations = args.hpo_n_trials if args.hpo_backend == "random" else args.hp_n_iterations
             best_hparams = hyperparameter_search(
                 final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
             )
-
-    if args.task == "regression" and 'regression_metric' not in best_hparams:
-        best_hparams['regression_metric'] = getattr(args, 'regression_metric', 'rmse')
+        
+        # Save best hyperparameters
+        best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
     
     # Update args for later use
     args.learning_rate = best_hparams["learning_rate"]
