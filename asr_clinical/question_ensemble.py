@@ -10,9 +10,9 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor, VotingClassifier, VotingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import LogisticRegression, Ridge, Lasso, ElasticNet
 from sklearn.metrics import (
     balanced_accuracy_score,
     classification_report,
@@ -25,6 +25,9 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC, SVR
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from xgboost import XGBClassifier, XGBRegressor
 from transformers import AutoModelForSequenceClassification
 
 from .config import TrainConfig
@@ -65,7 +68,7 @@ def cleanup_old_splits(splits_dir: Path):
             print("  No existing split files found.")
 
 
-def cleanup_temp_dirs(temp_dir: Path, keep_best: bool = True, best_params: dict = None):
+def cleanup_temp_dirs(temp_dir: Path):
     """Clean up temporary directories created during hyperparameter search."""
     if not temp_dir.exists():
         return
@@ -96,15 +99,12 @@ class SplitManager:
         self.seed = seed
         self.n_folds = n_folds
         self.splits_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Validate existing splits have required columns
         self._validate_or_cleanup_splits()
 
     def _validate_or_cleanup_splits(self):
         """Check if existing splits have required columns, clean up if not."""
         required_cols = ['question_id', 'label', 'speaker_id']
         
-        # Check final splits
         final_train = self.splits_dir / "final_train.csv"
         if final_train.exists():
             try:
@@ -114,12 +114,10 @@ class SplitManager:
                     print(f"Existing final splits missing columns: {missing}. Deleting and regenerating...")
                     self._delete_all_splits()
                     return
-            except Exception as e:
-                print(f"Error reading existing splits: {e}. Deleting and regenerating...")
+            except Exception:
                 self._delete_all_splits()
                 return
         
-        # Check fold splits
         for fold_idx in range(self.n_folds):
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
             if train_path.exists():
@@ -152,10 +150,9 @@ class SplitManager:
             val_df = pd.read_csv(val_path)
             test_df = pd.read_csv(test_path)
             
-            # Verify required columns
             for name, split_df in [("train", train_df), ("val", val_df), ("test", test_df)]:
                 if 'question_id' not in split_df.columns:
-                    raise KeyError(f"final_{name}.csv missing 'question_id' column. Regenerate splits.")
+                    raise KeyError(f"final_{name}.csv missing 'question_id' column.")
             
             return train_df, val_df, test_df
 
@@ -177,7 +174,6 @@ class SplitManager:
 
     def get_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
         """Load or create fold splits for inner CV."""
-        # Check if we need to create folds
         need_create = False
         for fold_idx in range(self.n_folds):
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
@@ -186,7 +182,6 @@ class SplitManager:
                 need_create = True
                 break
             
-            # Also check if existing folds have required columns
             if train_path.exists():
                 sample = pd.read_csv(train_path, nrows=1)
                 if 'question_id' not in sample.columns or 'label' not in sample.columns:
@@ -197,39 +192,34 @@ class SplitManager:
         if need_create:
             return self._create_fold_splits(train_df, test_df)
         
-        # Load existing folds
         folds = []
         for fold_idx in range(self.n_folds):
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
             val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
             test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
             
-            # Ensure test copy exists
             if not test_copy_path.exists():
                 test_df.to_csv(test_copy_path, index=False)
             
             fold_train = pd.read_csv(train_path)
             fold_val = pd.read_csv(val_path)
             
-            # Validate required columns
             if 'question_id' not in fold_train.columns:
-                raise KeyError(f"fold{fold_idx}_train.csv missing 'question_id' column. Available: {fold_train.columns.tolist()}")
+                raise KeyError(f"fold{fold_idx}_train.csv missing 'question_id' column.")
             
             folds.append((fold_train, fold_val))
         
         return folds
 
     def _create_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
-        """Create K folds from the final training set (by speaker, stratified if classification)."""
+        """Create K folds from the final training set."""
         print(f"Creating {self.n_folds} folds from final training set.")
         
-        # Validate required columns
         required_cols = ["speaker_id", "label", "question_id"]
         for col in required_cols:
             if col not in train_df.columns:
-                raise ValueError(f"Required column '{col}' not found in training data. Available: {train_df.columns.tolist()}")
+                raise ValueError(f"Required column '{col}' not found in training data.")
         
-        # Group by speaker to get labels for stratification
         speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
         speakers.columns = ["speaker_id", "label"]
 
@@ -248,27 +238,24 @@ class SplitManager:
             fold_train = train_df[train_df["speaker_id"].isin(train_speakers)].reset_index(drop=True)
             fold_val = train_df[train_df["speaker_id"].isin(val_speakers)].reset_index(drop=True)
             
-            # Double-check that question_id is preserved
             if 'question_id' not in fold_train.columns:
                 raise RuntimeError(f"question_id lost when creating fold {fold_idx}")
             
-            # Save train and val splits
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
             val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
             fold_train.to_csv(train_path, index=False)
             fold_val.to_csv(val_path, index=False)
             
-            # Save a copy of the final test set as fold*_test.csv
             test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
             test_df.to_csv(test_copy_path, index=False)
             
             folds.append((fold_train, fold_val))
         
-        print(f"Created {self.n_folds} fold splits (train/val) and copied final test set.")
+        print(f"Created {self.n_folds} fold splits.")
         return folds
 
     def _speaker_split(self, df: pd.DataFrame, test_size: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
-        """Split indices by speaker (stratified for classification)."""
+        """Split indices by speaker."""
         df_work = df.copy()
         label_col = df_work["label"]
         if isinstance(label_col, pd.DataFrame):
@@ -295,89 +282,57 @@ class SplitManager:
 
 
 # ----------------------------------------------------------------------
-#  Primary Score Function (Always Maximize)
+#  Primary Score Function
 # ----------------------------------------------------------------------
 def primary_score(metrics: dict, task: str) -> float:
-    """
-    Return a score that should always be MAXIMIZED for optimization.
-    For classification: macro_f1 (higher is better)
-    For regression: -rmse (higher is better, equivalent to minimizing RMSE)
-    """
     if task == "classification":
         return metrics.get("macro_f1", 0.0)
-    else:  # regression
-        # Return negative RMSE so higher is always better
+    else:
         return -metrics.get("rmse", float('inf'))
 
 
 # ----------------------------------------------------------------------
-#  Optuna Hyperparameter Search
+#  Hyperparameter Search on ALL Questions
 # ----------------------------------------------------------------------
-def hyperparameter_search_optuna(
+def hyperparameter_search_optuna_all_questions(
     train_df: pd.DataFrame,
     split_manager: SplitManager,
     args,
     metadata: dict,
     test_df: pd.DataFrame,
-    n_folds: int = 5,
 ) -> dict:
-    """Perform hyperparameter search using Optuna (Bayesian optimization)."""
-    print("Starting Optuna hyperparameter search (Bayesian optimization + pruning)")
+    """Perform hyperparameter search across ALL questions."""
+    print("=" * 60)
+    print("Starting Optuna hyperparameter search on ALL QUESTIONS")
+    print("=" * 60)
     
-    # Validate that train_df has required columns
-    if 'question_id' not in train_df.columns:
-        raise KeyError(f"train_df missing 'question_id' column. Available: {train_df.columns.tolist()}")
-    
-    # Choose representative question
-    candidate_questions = [q.upper() for q in args.questions]
-    rep_question = None
-    for q in candidate_questions:
-        q_train = train_df[train_df["question_id"] == q]
-        if len(q_train) >= 20:
-            rep_question = q
-            break
-    
-    if rep_question is None:
-        print("No question with enough training data. Using defaults.")
-        return get_default_params(args)
-    
-    print(f"Using question '{rep_question}' for hyperparameter search")
-    
-    # Determine metric and direction (always maximize primary_score)
-    direction = "maximize"
-    
-    # Get fold splits (create once, reuse for all trials)
     folds = split_manager.get_fold_splits(train_df, test_df)
-    if not folds:
-        print("No folds created. Using defaults.")
-        return get_default_params(args)
-    
-    # Use only the number of folds specified for HPO
     folds = folds[:args.hpo_folds]
+    all_questions = [q.upper() for q in args.questions]
     
-    # Create Optuna study
-    sampler = TPESampler(seed=args.seed, n_startup_trials=10)
-    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=3)
+    print(f"Optimizing across {len(all_questions)} questions with {len(folds)}-fold CV")
+    print(f"Total trials: {args.hpo_n_trials}")
+    
+    sampler = TPESampler(seed=args.seed, n_startup_trials=5)
+    pruner = MedianPruner(n_startup_trials=3, n_warmup_steps=2)
     
     study = optuna.create_study(
-        direction=direction,
+        direction="maximize",
         sampler=sampler,
         pruner=pruner,
-        study_name=f"{args.task}_hpo",
+        study_name=f"{args.task}_hpo_all_questions",
         load_if_exists=True
     )
     
-    # Define objective function with partial to pass fixed arguments
     objective_partial = partial(
-        objective_function,
+        objective_function_all_questions,
         folds=folds,
-        rep_question=rep_question,
+        all_questions=all_questions,
         args=args,
         metadata=metadata,
     )
     
-    # Run optimization
-    print(f"\nRunning Optuna for {args.hpo_n_trials} trials with {len(folds)}-fold CV")
+    print(f"\nRunning Optuna for {args.hpo_n_trials} trials...")
     study.optimize(
         objective_partial,
         n_trials=args.hpo_n_trials,
@@ -386,7 +341,6 @@ def hyperparameter_search_optuna(
         n_jobs=1
     )
     
-    # Get best parameters
     best_params = study.best_params
     best_value = study.best_value
     
@@ -394,20 +348,11 @@ def hyperparameter_search_optuna(
     print(f"Best primary score: {best_value:.4f}")
     print(f"Best parameters: {best_params}")
     
-    # Show optimization history
-    print("\nOptimization history:")
-    for trial in study.trials[-10:]:
-        if trial.value is not None:
-            print(f"  Trial {trial.number}: {trial.value:.4f} - {trial.params}")
-    
-    # Save study for later analysis
-    study_path = Path(args.output_dir) / "optuna_study.pkl"
+    study_path = Path(args.output_dir) / "optuna_study_all_questions.pkl"
     joblib.dump(study, study_path)
-    print(f"Saved Optuna study to {study_path}")
     
-    # Add fixed parameters that weren't tuned
     best_params.update({
-        "max_length": args.max_length,
+        "max_length": best_params.get("max_length", args.max_length),
         "weight_decay": best_params.get("weight_decay", args.weight_decay),
         "warmup_ratio": best_params.get("warmup_ratio", args.warmup_ratio),
     })
@@ -415,119 +360,94 @@ def hyperparameter_search_optuna(
     return best_params
 
 
-def objective_function(
+def objective_function_all_questions(
     trial: optuna.Trial,
     folds: list,
-    rep_question: str,
+    all_questions: list,
     args,
     metadata: dict,
 ) -> float:
-    """Objective function for Optuna to optimize (maximizes primary_score)."""
-    # Suggest hyperparameters with appropriate distributions
+    """Objective function that averages performance across ALL questions."""
+    
     params = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [8, 16]),  # Reduced for speed
-        "epochs": trial.suggest_int("epochs", 3, 6),
+        "learning_rate": trial.suggest_float("learning_rate", 5e-6, 5e-5, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [8, 16, 32]),
+        "epochs": trial.suggest_int("epochs", 2, 5),
         "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
         "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.2),
-        "max_length": trial.suggest_categorical("max_length", [256]),  # Fix for speed
+        "max_length": trial.suggest_categorical("max_length", [128, 256, 384]),
     }
     
     print(f"\nTrial {trial.number}: testing {params}")
     
-    # Evaluate on all folds
-    fold_scores = []
+    all_question_scores = []
     
     for fold_idx, (fold_train, fold_val) in enumerate(folds):
-        # Filter for representative question
-        q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
-        q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
+        fold_question_scores = []
         
-        if len(q_fold_train) == 0 or len(q_fold_val) == 0:
-            continue
-        
-        # Create temp config
-        temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}"
-        temp_cfg = TrainConfig(
-            asr_file=args.asr_file,
-            demo_file=args.demo_file,
-            target_column=args.target_column,
-            task=args.task,
-            output_dir=str(temp_out),
-            model_name=args.model_name,
-            text_mode="question",
-            aggregate_level="speaker",
-            num_folds=1,
-            test_size=0.0,
-            final_dev_size=0.0,
-            seed=args.seed + trial.number + fold_idx,
-            max_length=params["max_length"],
-            batch_size=params["batch_size"],
-            eval_batch_size=params["batch_size"],
-            epochs=params["epochs"],
-            learning_rate=params["learning_rate"],
-            weight_decay=params["weight_decay"],
-            warmup_ratio=params["warmup_ratio"],
-            patience=args.patience,
-            class_weights=args.class_weights,
-            loss=args.loss,
-            focal_gamma=args.focal_gamma,
-            filter_questions=[rep_question],
-            min_text_chars=args.min_text_chars,
-        )
-        
-        # Train and evaluate
-        metrics = _train_and_evaluate(
-            q_fold_train, q_fold_val, temp_cfg, metadata
-        )
-        
-        if metrics is not None:
-            score = primary_score(metrics, args.task)
-            fold_scores.append(score)
+        for question in all_questions:
+            q_fold_train = fold_train[fold_train["question_id"] == question].reset_index(drop=True)
+            q_fold_val = fold_val[fold_val["question_id"] == question].reset_index(drop=True)
             
-            # Report intermediate value for pruning
-            trial.report(np.mean(fold_scores), fold_idx)
+            if len(q_fold_train) < 5 or len(q_fold_val) < 3:
+                continue
             
-            # Handle pruning
+            temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}_{question}"
+            temp_cfg = TrainConfig(
+                asr_file=args.asr_file,
+                demo_file=args.demo_file,
+                target_column=args.target_column,
+                task=args.task,
+                output_dir=str(temp_out),
+                model_name=args.model_name,
+                text_mode="question",
+                aggregate_level="speaker",
+                num_folds=1,
+                test_size=0.0,
+                final_dev_size=0.0,
+                seed=args.seed + trial.number + fold_idx,
+                max_length=params["max_length"],
+                batch_size=params["batch_size"],
+                eval_batch_size=params["batch_size"],
+                epochs=params["epochs"],
+                learning_rate=params["learning_rate"],
+                weight_decay=params["weight_decay"],
+                warmup_ratio=params["warmup_ratio"],
+                patience=args.patience,
+                class_weights=args.class_weights,
+                loss=args.loss,
+                focal_gamma=args.focal_gamma,
+                filter_questions=[question],
+                min_text_chars=args.min_text_chars,
+            )
+            
+            metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
+            
+            if metrics is not None:
+                score = primary_score(metrics, args.task)
+                fold_question_scores.append(score)
+            
+            try:
+                shutil.rmtree(temp_out)
+            except:
+                pass
+        
+        if fold_question_scores:
+            fold_avg_score = np.mean(fold_question_scores)
+            all_question_scores.append(fold_avg_score)
+            trial.report(np.mean(all_question_scores), fold_idx)
+            
             if trial.should_prune():
-                print(f"Trial {trial.number} pruned at fold {fold_idx}")
                 raise optuna.TrialPruned()
-        
-        # Clean up temp directory
-        try:
-            shutil.rmtree(temp_out)
-        except:
-            pass
     
-    if not fold_scores:
-        return float('-inf')  # Worst possible score
+    if not all_question_scores:
+        return float('-inf')
     
-    # Return the average score
-    avg_score = np.mean(fold_scores)
-    print(f"Trial {trial.number} complete: primary_score={avg_score:.4f} (±{np.std(fold_scores):.4f})")
-    
-    return avg_score
+    return np.mean(all_question_scores)
 
 
-def get_default_params(args):
-    """Return default hyperparameters"""
-    return {
-        "learning_rate": args.learning_rate,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
-        "max_length": args.max_length,
-    }
-
-
-def _train_and_evaluate(
-    train_df, 
-    val_df, 
-    cfg: TrainConfig, 
-    metadata: dict, 
-) -> dict | None:
-    """Train a model and return validation metrics."""
+def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict) -> dict | None:
+    """Fast training and evaluation for hyperparameter search."""
     from transformers import AutoModelForSequenceClassification
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
@@ -536,11 +456,9 @@ def _train_and_evaluate(
     if not (model_dir.exists() and saved_model_exists(model_dir)):
         try:
             train_one_fold(train_df, val_df, cfg, metadata, Path(cfg.output_dir))
-        except Exception as e:
-            print(f"Training failed: {e}")
+        except Exception:
             return None
 
-    # Load model and tokenizer for evaluation
     device = choose_device()
     tokenizer = load_tokenizer(str(model_dir))
     model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
@@ -568,253 +486,327 @@ def _train_and_evaluate(
             if cfg.task == "classification":
                 batch_preds = np.argmax(logits, axis=1)
                 preds.extend(batch_preds)
-            else:  # regression
+            else:
                 if logits.ndim == 2 and logits.shape[1] == 1:
                     batch_preds = logits[:, 0]
-                elif logits.ndim == 1:
-                    batch_preds = logits
-                elif logits.ndim == 0:
-                    batch_preds = np.array([logits.item()])
                 else:
                     batch_preds = logits.flatten()
-                
-                if len(batch_preds) != len(batch_texts):
-                    print(f"Warning: Expected {len(batch_texts)} predictions, got {len(batch_preds)}")
-                    if len(batch_preds) > len(batch_texts):
-                        batch_preds = batch_preds[:len(batch_texts)]
-                    else:
-                        batch_preds = np.pad(batch_preds, (0, len(batch_texts) - len(batch_preds)))
-                
                 preds.extend(batch_preds.tolist())
 
     preds = np.array(preds)
     labels = np.array(labels)
     
     if len(preds) != len(labels):
-        print(f"Error: Final predictions length ({len(preds)}) != labels length ({len(labels)})")
         return None
     
     if cfg.task == "classification":
-        macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
-        return {"macro_f1": macro_f1}
+        return {"macro_f1": f1_score(labels, preds, average="macro", zero_division=0)}
     else:
-        rmse = np.sqrt(mean_squared_error(labels, preds))
-        return {"rmse": rmse}
+        return {"rmse": np.sqrt(mean_squared_error(labels, preds))}
 
 
 # ----------------------------------------------------------------------
-#  Legacy Hyperparameter Search (Grid/Random)
+#  Individual Meta-Model Creators
 # ----------------------------------------------------------------------
-def hyperparameter_search(
-    train_df: pd.DataFrame,
-    split_manager: SplitManager,
-    args,
-    metadata: dict,
-    test_df: pd.DataFrame,
-    n_folds: int = 5,
-) -> dict:
-    """Legacy grid/random search (kept for compatibility)."""
-    print("Starting hyperparameter search...")
+def create_linear_model(task, args):
+    """Create linear model (LogisticRegression for classification, Ridge for regression)"""
+    if task == "classification":
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(
+                max_iter=5000, 
+                class_weight="balanced", 
+                random_state=args.seed,
+                C=getattr(args, 'logreg_C', 1.0)
+            )),
+        ])
+    else:  # regression
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
+        ])
+
+
+def create_ridge(task, args):
+    """Ridge regression (only for regression tasks)"""
+    if task == "regression":
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
+        ])
+    else:
+        # Fallback to linear for classification
+        print("Warning: Ridge not available for classification, using Logistic Regression")
+        return create_linear_model(task, args)
+
+
+def create_lasso(task, args):
+    """Lasso regression (only for regression tasks)"""
+    if task == "regression":
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", Lasso(
+                alpha=getattr(args, 'lasso_alpha', 1.0),
+                random_state=args.seed, 
+                max_iter=5000
+            )),
+        ])
+    else:
+        print("Warning: Lasso not available for classification, using Logistic Regression")
+        return create_linear_model(task, args)
+
+
+def create_elasticnet(task, args):
+    """ElasticNet regression (only for regression tasks)"""
+    if task == "regression":
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", ElasticNet(
+                alpha=getattr(args, 'elasticnet_alpha', 1.0),
+                l1_ratio=getattr(args, 'elasticnet_l1_ratio', 0.5),
+                random_state=args.seed, 
+                max_iter=5000
+            )),
+        ])
+    else:
+        print("Warning: ElasticNet not available for classification, using Logistic Regression")
+        return create_linear_model(task, args)
+
+
+def create_random_forest(task, args):
+    """Create Random Forest model"""
+    if task == "classification":
+        return RandomForestClassifier(
+            n_estimators=args.n_estimators,
+            random_state=args.seed,
+            class_weight="balanced",
+            min_samples_leaf=2,
+            n_jobs=-1,
+            max_depth=getattr(args, 'max_depth', None)
+        )
+    else:  # regression
+        return RandomForestRegressor(
+            n_estimators=args.n_estimators,
+            random_state=args.seed,
+            min_samples_leaf=2,
+            n_jobs=-1,
+            max_depth=getattr(args, 'max_depth', None)
+        )
+
+
+def create_svm(task, args):
+    """Create SVM model"""
+    if task == "classification":
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", SVC(
+                kernel=getattr(args, 'svm_kernel', 'rbf'),
+                C=getattr(args, 'svm_C', 1.0),
+                gamma=getattr(args, 'svm_gamma', 'scale'),
+                probability=True,
+                class_weight="balanced",
+                random_state=args.seed
+            )),
+        ])
+    else:  # regression
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", SVR(
+                kernel=getattr(args, 'svm_kernel', 'rbf'),
+                C=getattr(args, 'svm_C', 1.0),
+                epsilon=getattr(args, 'svm_epsilon', 0.1)
+            )),
+        ])
+
+
+def create_xgboost(task, args):
+    """Create XGBoost model"""
+    if task == "classification":
+        return XGBClassifier(
+            n_estimators=args.n_estimators,
+            max_depth=getattr(args, 'max_depth', 6),
+            learning_rate=getattr(args, 'xgb_lr', 0.1),
+            random_state=args.seed,
+            n_jobs=-1,
+            eval_metric='logloss',
+            use_label_encoder=False
+        )
+    else:  # regression
+        return XGBRegressor(
+            n_estimators=args.n_estimators,
+            max_depth=getattr(args, 'max_depth', 6),
+            learning_rate=getattr(args, 'xgb_lr', 0.1),
+            random_state=args.seed,
+            n_jobs=-1,
+            eval_metric='rmse'
+        )
+
+
+def create_gradient_boosting(task, args):
+    """Create Gradient Boosting model"""
+    if task == "classification":
+        return GradientBoostingClassifier(
+            n_estimators=args.n_estimators,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=args.seed
+        )
+    else:  # regression
+        return GradientBoostingRegressor(
+            n_estimators=args.n_estimators,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=args.seed
+        )
+
+
+def create_knn(task, args):
+    """Create KNN model"""
+    if task == "classification":
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsClassifier(
+                n_neighbors=getattr(args, 'knn_neighbors', 5),
+                weights='distance'
+            )),
+        ])
+    else:  # regression
+        return Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsRegressor(
+                n_neighbors=getattr(args, 'knn_neighbors', 5),
+                weights='distance'
+            )),
+        ])
+
+
+def create_ensemble_model(task, args):
+    """
+    Create an ensemble of multiple meta-models with voting/averaging.
     
-    if 'question_id' not in train_df.columns:
-        raise KeyError(f"train_df missing 'question_id' column. Available: {train_df.columns.tolist()}")
+    For classification: Uses soft voting (probability averaging)
+    For regression: Uses averaging of predictions
     
-    candidate_questions = [q.upper() for q in args.questions]
-    rep_question = None
-    for q in candidate_questions:
-        q_train = train_df[train_df["question_id"] == q]
-        if len(q_train) >= 20:
-            rep_question = q
-            break
+    Ensemble members can be configured via --ensemble-models parameter.
+    Default: ['linear', 'random_forest', 'xgboost']
+    """
     
-    if rep_question is None:
-        print("No question with enough training data. Using defaults.")
-        return get_default_params(args)
+    # Get list of models to include in ensemble
+    ensemble_models = getattr(args, 'ensemble_models', ['linear', 'random_forest', 'xgboost'])
     
-    print(f"Using question '{rep_question}' for hyperparameter search")
-    
-    # Always maximize primary_score
-    higher_is_better = True
-    
-    folds = split_manager.get_fold_splits(train_df, test_df)
-    if not folds:
-        return get_default_params(args)
-    
-    # Build parameter grid
-    param_grid = {
-        "learning_rate": args.hp_learning_rates if args.hp_learning_rates else [1e-5, 2e-5, 3e-5],
-        "batch_size": args.hp_batch_sizes if args.hp_batch_sizes else [8, 16],
-        "epochs": args.hp_epochs if args.hp_epochs else [3, 4, 5],
-        "weight_decay": args.hp_weight_decays if args.hp_weight_decays else [0.01],
-        "warmup_ratio": args.hp_warmup_ratios if args.hp_warmup_ratios else [0.06],
-        "max_length": args.hp_max_lengths if args.hp_max_lengths else [256],
+    # Map model names to creator functions
+    model_creators = {
+        'linear': create_linear_model,
+        'ridge': create_ridge,
+        'lasso': create_lasso,
+        'elasticnet': create_elasticnet,
+        'random_forest': create_random_forest,
+        'svm': create_svm,
+        'xgboost': create_xgboost,
+        'gradient_boosting': create_gradient_boosting,
+        'knn': create_knn,
     }
     
-    param_grid = {k: v for k, v in param_grid.items() if v}
-    keys = param_grid.keys()
-    all_combinations = [dict(zip(keys, values)) for values in product(*param_grid.values())]
+    # Create individual models
+    estimators = []
+    for model_name in ensemble_models:
+        if model_name in model_creators:
+            try:
+                model = model_creators[model_name](task, args)
+                estimators.append((model_name, model))
+                print(f"  - Adding {model_name} to ensemble")
+            except Exception as e:
+                print(f"  - Warning: Could not create {model_name}: {e}")
+        else:
+            print(f"  - Warning: Unknown model '{model_name}', skipping")
     
-    if args.hp_random_search and args.hp_n_iterations:
-        import random as rand
-        rand.seed(args.seed)
-        param_combinations = rand.sample(all_combinations, min(args.hp_n_iterations, len(all_combinations)))
+    if not estimators:
+        print("No valid ensemble models. Falling back to linear model.")
+        return create_linear_model(task, args)
+    
+    # Create voting ensemble
+    if task == "classification":
+        # Use soft voting (averages probabilities) for better performance
+        ensemble = VotingClassifier(
+            estimators=estimators,
+            voting='soft',  # 'soft' for probability averaging, 'hard' for majority vote
+            weights=getattr(args, 'ensemble_weights', None),  # Optional custom weights
+            n_jobs=-1
+        )
+        print(f"\nCreated classification ensemble with {len(estimators)} models using SOFT voting")
     else:
-        param_combinations = all_combinations
+        # For regression, average predictions
+        ensemble = VotingRegressor(
+            estimators=estimators,
+            weights=getattr(args, 'ensemble_weights', None)
+        )
+        print(f"\nCreated regression ensemble with {len(estimators)} models using AVERAGING")
     
-    print(f"Searching over {len(param_combinations)} combinations")
+    return ensemble
+
+
+def make_meta_model(args):
+    """
+    Create meta-model (single or ensemble based on configuration).
     
-    best_score = -float("inf")  # Always maximize
-    best_params = None
+    For single models, supports:
+    - linear: Logistic Regression (classification) or Ridge (regression)
+    - ridge: Ridge regression (regression only, falls back to linear for classification)
+    - lasso: Lasso regression (regression only, falls back to linear for classification)
+    - elasticnet: ElasticNet regression (regression only, falls back to linear for classification)
+    - random_forest: Random Forest (classification or regression)
+    - svm: SVM (classification or regression)
+    - xgboost: XGBoost (classification or regression)
+    - gradient_boosting: Gradient Boosting (classification or regression)
+    - knn: KNN (classification or regression)
     
-    for params in param_combinations:
-        fold_scores = []
-        for fold_train, fold_val in folds:
-            q_fold_train = fold_train[fold_train["question_id"] == rep_question].reset_index(drop=True)
-            q_fold_val = fold_val[fold_val["question_id"] == rep_question].reset_index(drop=True)
-            
-            if len(q_fold_train) == 0 or len(q_fold_val) == 0:
-                continue
-            
-            temp_out = Path(args.output_dir) / "temp_hpo" / rep_question / f"fold_{len(fold_scores)}"
-            temp_cfg = TrainConfig(
-                asr_file=args.asr_file,
-                demo_file=args.demo_file,
-                target_column=args.target_column,
-                task=args.task,
-                output_dir=str(temp_out),
-                model_name=args.model_name,
-                text_mode="question",
-                aggregate_level="speaker",
-                num_folds=1,
-                test_size=0.0,
-                final_dev_size=0.0,
-                seed=args.seed,
-                max_length=params["max_length"],
-                batch_size=params["batch_size"],
-                eval_batch_size=params["batch_size"],
-                epochs=params["epochs"],
-                learning_rate=params["learning_rate"],
-                weight_decay=params["weight_decay"],
-                warmup_ratio=params["warmup_ratio"],
-                patience=args.patience,
-                class_weights=args.class_weights,
-                loss=args.loss,
-                focal_gamma=args.focal_gamma,
-                filter_questions=[rep_question],
-                min_text_chars=args.min_text_chars,
-            )
-            
-            metrics = _train_and_evaluate(q_fold_train, q_fold_val, temp_cfg, metadata)
-            if metrics:
-                score = primary_score(metrics, args.task)
-                fold_scores.append(score)
+    For ensembles, use --use-ensemble and --ensemble-models
+    """
+    
+    if getattr(args, 'use_ensemble', False):
+        print("\n" + "=" * 50)
+        print("CREATING ENSEMBLE META-MODEL")
+        print("=" * 50)
+        return create_ensemble_model(args.task, args)
+    else:
+        # Single model (original behavior)
+        print(f"\nCreating single meta-model: {args.meta_model}")
         
-        if fold_scores:
-            avg_score = np.mean(fold_scores)
-            if avg_score > best_score:
-                best_score = avg_score
-                best_params = params.copy()
-    
-    if best_params is None:
-        best_params = get_default_params(args)
-    
-    best_params["max_length"] = best_params.get("max_length", args.max_length)
-    return best_params
+        if args.meta_model == "linear":
+            return create_linear_model(args.task, args)
+        elif args.meta_model == "ridge":
+            return create_ridge(args.task, args)
+        elif args.meta_model == "lasso":
+            return create_lasso(args.task, args)
+        elif args.meta_model == "elasticnet":
+            return create_elasticnet(args.task, args)
+        elif args.meta_model == "random_forest":
+            return create_random_forest(args.task, args)
+        elif args.meta_model == "svm":
+            return create_svm(args.task, args)
+        elif args.meta_model == "xgboost":
+            return create_xgboost(args.task, args)
+        elif args.meta_model == "gradient_boosting":
+            return create_gradient_boosting(args.task, args)
+        elif args.meta_model == "knn":
+            return create_knn(args.task, args)
+        else:
+            print(f"Unknown meta_model {args.meta_model}, falling back to linear")
+            return create_linear_model(args.task, args)
 
 
 # ----------------------------------------------------------------------
-#  Main Ensemble Pipeline
+#  Helper Functions
 # ----------------------------------------------------------------------
-def build_parser():
-    parser = argparse.ArgumentParser(description="Train per‑question models with nested CV for hyperparameter tuning")
-    parser.add_argument("--asr-file", required=True)
-    parser.add_argument("--demo-file", required=True)
-    parser.add_argument("--target-column", required=True)
-    parser.add_argument("--task", choices=["classification", "regression"], required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--splits-dir", required=True)
-    parser.add_argument("--model-name", default="distilroberta-base")
-    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 14)])
-    parser.add_argument("--train-frac", type=float, default=0.8)
-    parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--test-frac", type=float, default=0.1)
-    parser.add_argument("--n-cv-folds", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=42)
-    
-    parser.add_argument("--max-length", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.06)
-    
-    parser.add_argument("--hp-learning-rates", nargs="+", type=float, default=None)
-    parser.add_argument("--hp-batch-sizes", nargs="+", type=int, default=None)
-    parser.add_argument("--hp-epochs", nargs="+", type=int, default=None)
-    parser.add_argument("--hp-weight-decays", nargs="+", type=float, default=None)
-    parser.add_argument("--hp-warmup-ratios", nargs="+", type=float, default=None)
-    parser.add_argument("--hp-max-lengths", nargs="+", type=int, default=None)
-    
-    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
-    parser.add_argument("--hpo-n-trials", type=int, default=30)
-    parser.add_argument("--hpo-timeout", type=int, default=None)
-    parser.add_argument("--hpo-folds", type=int, default=3)
-    
-    parser.add_argument("--optuna-sampler", choices=["tpe", "random", "cmaes"], default="tpe")
-    parser.add_argument("--optuna-pruner", choices=["median", "hyperband", "none"], default="median")
-    
-    parser.add_argument("--hp-random-search", action="store_true")
-    parser.add_argument("--hp-n-iterations", type=int, default=50)
-    parser.add_argument("--hp-max-combinations", type=int, default=None)
-    
-    parser.add_argument("--eval-batch-size", type=int, default=16)
-    parser.add_argument("--patience", type=int, default=2)
-    parser.add_argument("--class-weights", choices=["none", "balanced"], default="balanced")
-    parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
-    parser.add_argument("--focal-gamma", type=float, default=2.0)
-    parser.add_argument("--min-text-chars", type=int, default=1)
-    
-    parser.add_argument("--meta-model", choices=["linear", "random_forest"], default="linear")
-    parser.add_argument("--n-estimators", type=int, default=500)
-    parser.add_argument("--permutation-repeats", type=int, default=5)
-    parser.add_argument("--embedding-batch-size", type=int, default=32)
-    parser.add_argument("--force-embeddings", action="store_true")
-    parser.add_argument("--force-hpo", action="store_true")
-    parser.add_argument("--top-k", type=int, default=0)
-    
-    return parser
-
-
-def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dict) -> TrainConfig:
-    return TrainConfig(
-        asr_file=args.asr_file,
-        demo_file=args.demo_file,
-        target_column=args.target_column,
-        task=args.task,
-        output_dir=str(question_dir),
-        model_name=args.model_name,
-        text_mode="question",
-        aggregate_level="speaker",
-        num_folds=1,
-        test_size=0.0,
-        final_dev_size=0.0,
-        seed=args.seed,
-        max_length=best_hparams.get("max_length", args.max_length),
-        batch_size=best_hparams["batch_size"],
-        eval_batch_size=best_hparams["batch_size"],
-        epochs=best_hparams["epochs"],
-        learning_rate=best_hparams["learning_rate"],
-        weight_decay=best_hparams.get("weight_decay", args.weight_decay),
-        warmup_ratio=best_hparams.get("warmup_ratio", args.warmup_ratio),
-        patience=args.patience,
-        class_weights=args.class_weights,
-        loss=args.loss,
-        focal_gamma=args.focal_gamma,
-        filter_questions=[question],
-        min_text_chars=args.min_text_chars,
-    )
-
-
 def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).float()
     summed = (last_hidden_state * mask).sum(dim=1)
@@ -860,11 +852,44 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
     return emb_df
 
 
+def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dict) -> TrainConfig:
+    return TrainConfig(
+        asr_file=args.asr_file,
+        demo_file=args.demo_file,
+        target_column=args.target_column,
+        task=args.task,
+        output_dir=str(question_dir),
+        model_name=args.model_name,
+        text_mode="question",
+        aggregate_level="speaker",
+        num_folds=1,
+        test_size=0.0,
+        final_dev_size=0.0,
+        seed=args.seed,
+        max_length=best_hparams.get("max_length", args.max_length),
+        batch_size=best_hparams["batch_size"],
+        eval_batch_size=best_hparams["batch_size"],
+        epochs=best_hparams["epochs"],
+        learning_rate=best_hparams["learning_rate"],
+        weight_decay=best_hparams.get("weight_decay", args.weight_decay),
+        warmup_ratio=best_hparams.get("warmup_ratio", args.warmup_ratio),
+        patience=args.patience,
+        class_weights=args.class_weights,
+        loss=args.loss,
+        focal_gamma=args.focal_gamma,
+        filter_questions=[question],
+        min_text_chars=args.min_text_chars,
+    )
+
+
 def train_question_models(train_df, val_df, test_df, metadata, args, best_hparams, out_dir: Path):
+    """Train per-question models."""
     embedding_files = {"train": {}, "val": {}, "test": {}}
     summaries = []
-
-    for question in [q.upper() for q in args.questions]:
+    
+    questions = [q.upper() for q in args.questions]
+    
+    for question in questions:
         q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
         q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
         q_test = test_df[test_df["question_id"] == question].reset_index(drop=True)
@@ -882,37 +907,36 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         if (model_dir.exists() and saved_model_exists(model_dir) and
             train_emb.exists() and val_emb.exists() and (q_test.empty or test_emb.exists())):
             print(f"{question}: model and embeddings already exist, loading.")
-            embedding_files["train"][question] = train_emb
-            embedding_files["val"][question] = val_emb
-            embedding_files["test"][question] = test_emb if not q_test.empty else None
-            summaries.append({"question_id": question, "train_examples": len(q_train),
-                              "val_examples": len(q_val), "test_examples": len(q_test),
-                              "model_dir": str(model_dir)})
-            continue
-
-        print(f"{question}: training model on {len(q_train)} examples, val on {len(q_val)}")
-        q_cfg = make_question_cfg(args, question, q_dir, best_hparams)
-        train_one_fold(q_train, q_val, q_cfg, metadata, q_dir)
-        if not saved_model_exists(model_dir):
-            raise FileNotFoundError(f"Expected saved model at {model_dir}")
-
-        extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
-        extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
-        if not q_test.empty:
-            extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
+        else:
+            print(f"{question}: training model on {len(q_train)} examples, val on {len(q_val)}")
+            q_cfg = make_question_cfg(args, question, q_dir, best_hparams)
+            train_one_fold(q_train, q_val, q_cfg, metadata, q_dir)
+            
+            if not saved_model_exists(model_dir):
+                raise FileNotFoundError(f"Expected saved model at {model_dir}")
+            
+            extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
+            extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
+            if not q_test.empty:
+                extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
 
         embedding_files["train"][question] = train_emb
         embedding_files["val"][question] = val_emb
         embedding_files["test"][question] = test_emb if not q_test.empty else None
-        summaries.append({"question_id": question, "train_examples": len(q_train),
-                          "val_examples": len(q_val), "test_examples": len(q_test),
-                          "model_dir": str(model_dir)})
-
+        summaries.append({
+            "question_id": question,
+            "train_examples": len(q_train),
+            "val_examples": len(q_val),
+            "test_examples": len(q_test),
+            "model_dir": str(model_dir)
+        })
+    
     pd.DataFrame(summaries).to_csv(out_dir / "question_model_summary.csv", index=False)
     return embedding_files
 
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
+    """Build feature table from embeddings."""
     tables = []
     for q in questions:
         path = embedding_paths.get(q)
@@ -929,12 +953,15 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
         grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
         grouped[f"{q}__present"] = 1.0
         tables.append(grouped)
+    
     if not tables:
         raise ValueError("No embedding tables available.")
+    
     merged = tables[0]
     for t in tables[1:]:
         merged = merged.join(t.drop(columns=["y_true"]), how="outer")
         merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
+    
     merged = merged.reset_index()
     feature_cols = [c for c in merged.columns if "__" in c]
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
@@ -942,6 +969,7 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
 
 
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
+    """Align feature columns across splits."""
     for df in (val_df, test_df):
         for col in feature_cols:
             if col not in df.columns:
@@ -952,51 +980,8 @@ def align_feature_tables(train_df, val_df, test_df, feature_cols):
     return train_df, val_df, test_df
 
 
-def make_meta_model(args):
-    if args.task == "classification":
-        if args.meta_model == "random_forest":
-            return RandomForestClassifier(
-                n_estimators=args.n_estimators, random_state=args.seed,
-                class_weight="balanced", min_samples_leaf=2, n_jobs=-1
-            )
-        return Pipeline([
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", LogisticRegression(max_iter=5000, class_weight="balanced", random_state=args.seed)),
-        ])
-    # Regression
-    if args.meta_model == "random_forest":
-        return RandomForestRegressor(
-            n_estimators=args.n_estimators, random_state=args.seed,
-            min_samples_leaf=2, n_jobs=-1
-        )
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-        ("scaler", StandardScaler()),
-        ("model", Ridge(alpha=1.0)),
-    ])
-
-
-def score_meta_model(model, x, y, task):
-    pred = model.predict(x)
-    if task == "classification":
-        return {
-            "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
-            "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
-            "balanced_accuracy": balanced_accuracy_score(y, pred),
-            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
-            "confusion_matrix": confusion_matrix(y, pred).tolist(),
-        }
-    # Regression - use RMSE as primary metric
-    rmse = np.sqrt(mean_squared_error(y, pred))
-    return {
-        "rmse": rmse,
-        "mae": mean_absolute_error(y, pred),
-        "r2": r2_score(y, pred),
-    }
-
-
 def question_groups(feature_cols):
+    """Group features by question."""
     groups = {}
     for c in feature_cols:
         q = c.split("__", 1)[0]
@@ -1036,10 +1021,34 @@ def permutation_question_importance(model, val_df, feature_cols, args):
     return pd.DataFrame(rows).sort_values("importance", ascending=False)
 
 
+def score_meta_model(model, x, y, task):
+    """Score a meta-model."""
+    pred = model.predict(x)
+    if task == "classification":
+        return {
+            "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
+            "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
+            "balanced_accuracy": balanced_accuracy_score(y, pred),
+            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
+            "confusion_matrix": confusion_matrix(y, pred).tolist(),
+        }
+    else:
+        rmse = np.sqrt(mean_squared_error(y, pred))
+        return {
+            "rmse": rmse,
+            "mae": mean_absolute_error(y, pred),
+            "r2": r2_score(y, pred),
+        }
+
+
 def train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir: Path):
-    """Train meta-model with top-k feature selection based on primary_score."""
+    """Train meta-model with top-k feature selection."""
+    
+    # Create meta-model (single or ensemble)
     base_model = make_meta_model(args)
     base_model.fit(train_features[feature_cols].to_numpy(), train_features["y_true"].to_numpy())
+    
+    # Calculate feature importance
     importance_df = permutation_question_importance(base_model, val_features, feature_cols, args)
     importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
 
@@ -1053,7 +1062,7 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         ks = sorted(set(ks + [args.top_k]))
 
     val_metrics = {}
-    best_val_score = -float("inf")  # Always maximize primary_score
+    best_val_score = -float("inf")
     best_k = 1
     
     for k in ks:
@@ -1064,17 +1073,12 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         m = score_meta_model(model, val_features[selected_cols].to_numpy(), val_features["y_true"].to_numpy(), args.task)
         val_metrics[k] = m
         
-        # Use primary_score which always returns a value to MAXIMIZE
         score = primary_score(m, args.task)
-        
-        # Always maximize (no task-specific condition needed)
         if score > best_val_score:
             best_val_score = score
             best_k = k
             
     print(f"Best k on validation set: {best_k} (primary_score: {best_val_score:.4f})")
-    if args.task == "regression":
-        print(f"  Equivalent to RMSE: {-best_val_score:.4f}")
 
     # Train final model on train+val with best k
     trainval_features = pd.concat([train_features, val_features], ignore_index=True)
@@ -1102,17 +1106,39 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
     preds = final_model.predict(test_features[selected_cols_final].to_numpy())
     out_df = test_features[["speaker_id", "y_true"]].copy()
     out_df["y_pred"] = preds
-    if args.task == "classification" and hasattr(final_model, "predict_proba"):
-        probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
-        classes = final_model.classes_
-        for i, cls in enumerate(classes):
-            out_df[f"prob_{cls}"] = probs[:, i]
+    
+    # Get probabilities for classification
+    if args.task == "classification":
+        if hasattr(final_model, "predict_proba"):
+            probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
+            classes = final_model.classes_
+            for i, cls in enumerate(classes):
+                out_df[f"prob_{cls}"] = probs[:, i]
+        elif hasattr(final_model, "named_estimators_"):
+            # For voting classifier, get probabilities from individual estimators
+            try:
+                probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
+                classes = final_model.classes_
+                for i, cls in enumerate(classes):
+                    out_df[f"prob_{cls}"] = probs[:, i]
+            except:
+                print("Warning: Could not get probabilities from ensemble")
+    
     out_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
+
+    # Save ensemble details if applicable
+    if getattr(args, 'use_ensemble', False):
+        ensemble_info = {
+            "use_ensemble": True,
+            "ensemble_models": getattr(args, 'ensemble_models', ['linear', 'random_forest', 'xgboost']),
+            "voting_type": "soft" if args.task == "classification" else "average"
+        }
+        with open(out_dir / "ensemble_config.json", "w") as f:
+            json.dump(ensemble_info, f, indent=2)
 
     val_summary = []
     for k, m in val_metrics.items():
         row = {"top_k": k, "questions": ",".join(questions_ranked[:k])}
-        # Store both primary_score and raw metrics
         row["primary_score"] = primary_score(m, args.task)
         for k2, v2 in m.items():
             if isinstance(v2, (int, float)):
@@ -1128,6 +1154,87 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
 
 
 # ----------------------------------------------------------------------
+#  Parser Setup
+# ----------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(description="Train per‑question models with ensemble meta-model")
+    parser.add_argument("--asr-file", required=True)
+    parser.add_argument("--demo-file", required=True)
+    parser.add_argument("--target-column", required=True)
+    parser.add_argument("--task", choices=["classification", "regression"], required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--splits-dir", required=True)
+    parser.add_argument("--model-name", default="distilroberta-base")
+    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 14)])
+    parser.add_argument("--train-frac", type=float, default=0.8)
+    parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--test-frac", type=float, default=0.1)
+    parser.add_argument("--n-cv-folds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    
+    # Hyperparameters
+    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-ratio", type=float, default=0.06)
+    
+    # HPO settings
+    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
+    parser.add_argument("--hpo-n-trials", type=int, default=20)  # Changed to 20
+    parser.add_argument("--hpo-timeout", type=int, default=None)
+    parser.add_argument("--hpo-folds", type=int, default=3)
+    parser.add_argument("--force-hpo", action="store_true")
+    
+    # Meta-model settings - SINGLE MODEL
+    parser.add_argument("--meta-model", 
+                        choices=["linear", "random_forest", "svm", "xgboost", "gradient_boosting", "knn",
+                                "ridge", "lasso", "elasticnet"],
+                        default="linear",
+                        help="Single meta-model to use (ignored if --use-ensemble is set)")
+    
+    # Ensemble settings
+    parser.add_argument("--use-ensemble", action="store_true",
+                        help="Use ensemble of multiple meta-models with voting/averaging")
+    parser.add_argument("--ensemble-models", nargs="+",
+                        choices=["linear", "random_forest", "svm", "xgboost", "gradient_boosting", "knn",
+                                "ridge", "lasso", "elasticnet"],
+                        default=["linear", "random_forest", "xgboost"],
+                        help="Models to include in ensemble")
+    parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None,
+                        help="Custom weights for ensemble members (default: equal weights)")
+    
+    # Model hyperparameters
+    parser.add_argument("--n-estimators", type=int, default=500)
+    parser.add_argument("--max-depth", type=int, default=None)
+    parser.add_argument("--logreg-C", type=float, default=1.0)
+    parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument("--svm-kernel", choices=["linear", "rbf", "poly", "sigmoid"], default="rbf")
+    parser.add_argument("--svm-C", type=float, default=1.0)
+    parser.add_argument("--svm-gamma", default="scale")
+    parser.add_argument("--svm-epsilon", type=float, default=0.1)
+    parser.add_argument("--xgb-lr", type=float, default=0.1)
+    parser.add_argument("--knn-neighbors", type=int, default=5)
+    parser.add_argument("--elasticnet-alpha", type=float, default=1.0)
+    parser.add_argument("--elasticnet-l1-ratio", type=float, default=0.5)
+    
+    # Other settings
+    parser.add_argument("--eval-batch-size", type=int, default=16)
+    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--class-weights", choices=["none", "balanced"], default="balanced")
+    parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--min-text-chars", type=int, default=1)
+    parser.add_argument("--permutation-repeats", type=int, default=5)
+    parser.add_argument("--embedding-batch-size", type=int, default=32)
+    parser.add_argument("--force-embeddings", action="store_true")
+    parser.add_argument("--top-k", type=int, default=0)
+    
+    return parser
+
+
+# ----------------------------------------------------------------------
 #  Main
 # ----------------------------------------------------------------------
 def main():
@@ -1137,12 +1244,11 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
     
-    # Clean up old split files to ensure correct columns
     cleanup_old_splits(splits_dir)
-
+    
     # Save config
     (out_dir / "question_ensemble_config.json").write_text(json.dumps(vars(args), indent=2))
-
+    
     # Load full dataset
     questions = [q.upper() for q in args.questions]
     df, metadata = load_examples(
@@ -1151,11 +1257,8 @@ def main():
         filter_questions=questions,
     )
     
-    if 'question_id' not in df.columns:
-        raise ValueError(f"Loaded DataFrame missing 'question_id' column. Available: {df.columns.tolist()}")
-    
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
-
+    
     # Manage splits
     split_mgr = SplitManager(
         splits_dir, args.task,
@@ -1165,62 +1268,128 @@ def main():
     final_train, final_val, final_test = split_mgr.get_final_splits(df)
     print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
     
-    for name, split_df in [("train", final_train), ("val", final_val), ("test", final_test)]:
-        if 'question_id' not in split_df.columns:
-            raise KeyError(f"final_{name} missing 'question_id' column")
-
-    # Hyperparameter search
-    best_hparams_path = out_dir / "best_hyperparams.json"
+    # Hyperparameter search on ALL questions
+    best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
     if best_hparams_path.exists() and not args.force_hpo:
         best_hparams = json.loads(best_hparams_path.read_text())
-        print(f"Loaded best hyperparameters from {best_hparams_path}: {best_hparams}")
+        print(f"Loaded best hyperparameters from {best_hparams_path}")
     else:
-        if args.hpo_backend == "optuna":
-            best_hparams = hyperparameter_search_optuna(
-                final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
-            )
-        else:
-            # For grid or random search
-            args.hp_random_search = (args.hpo_backend == "random")
-            args.hp_n_iterations = args.hpo_n_trials if args.hpo_backend == "random" else args.hp_n_iterations
-            best_hparams = hyperparameter_search(
-                final_train, split_mgr, args, metadata, final_test, args.n_cv_folds
-            )
-        
-        # Save best hyperparameters
+        best_hparams = hyperparameter_search_optuna_all_questions(
+            final_train, split_mgr, args, metadata, final_test
+        )
         best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
     
-    # Update args for later use
+    # Update args
     args.learning_rate = best_hparams["learning_rate"]
     args.batch_size = best_hparams["batch_size"]
     args.epochs = best_hparams["epochs"]
     args.weight_decay = best_hparams.get("weight_decay", args.weight_decay)
     args.warmup_ratio = best_hparams.get("warmup_ratio", args.warmup_ratio)
     args.max_length = best_hparams.get("max_length", args.max_length)
-
-    # Train per‑question models
-    embedding_files = train_question_models(final_train, final_val, final_test, metadata, args, best_hparams, out_dir)
-
+    
+    # Train per-question models
+    embedding_files = train_question_models(
+        final_train, final_val, final_test, metadata, args, best_hparams, out_dir
+    )
+    
     # Build feature tables
     available_qs = list(embedding_files["train"].keys())
     train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
     val_features, _ = build_feature_table(embedding_files["val"], available_qs)
     test_features, _ = build_feature_table(embedding_files["test"], available_qs)
-    train_features, val_features, test_features = align_feature_tables(train_features, val_features, test_features, feature_cols)
-
+    train_features, val_features, test_features = align_feature_tables(
+        train_features, val_features, test_features, feature_cols
+    )
+    
     # Save raw feature tables
     train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
     val_features.to_csv(out_dir / "meta_val_features.csv", index=False)
     test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
-
-    # Train meta‑model
-    results = train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir)
+    
+    # Train meta-model (single or ensemble)
+    results = train_meta_model(
+        train_features, val_features, test_features, feature_cols, args, out_dir
+    )
+    
     print("\n===== Final Results =====")
     print(json.dumps(results, indent=2))
     
-    # Cleanup temporary directories
+    # Cleanup
     cleanup_temp_dirs(out_dir)
+    
+    # Print ensemble info if used
+    if args.use_ensemble:
+        print("\n" + "=" * 50)
+        print("ENSEMBLE SUMMARY")
+        print("=" * 50)
+        print(f"Models in ensemble: {args.ensemble_models}")
+        print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
+        print(f"Ensemble saved to: {out_dir / 'meta_model.joblib'}")
 
 
 if __name__ == "__main__":
     main()
+'''
+1. Multiple Meta-Model Options:
+linear - Logistic Regression (classification) / Ridge (regression)
+
+random_forest - Random Forest
+
+svm - Support Vector Machine
+
+xgboost - XGBoost
+
+gradient_boosting - Gradient Boosting
+
+knn - K-Nearest Neighbors
+
+2. Ensemble Support:
+bash
+# Use ensemble with default models (linear, random_forest, xgboost)
+python train.py --use-ensemble --task classification ...
+
+# Specify custom ensemble members
+python train.py --use-ensemble --ensemble-models linear svm xgboost --task classification ...
+
+# Use custom weights for ensemble members
+python train.py --use-ensemble --ensemble-models linear random_forest xgboost --ensemble-weights 1.0 2.0 1.5
+3. How Ensemble Works:
+For Classification (Soft Voting):
+
+python
+# Averages probabilities from all models
+final_prob = (prob_linear + prob_rf + prob_xgb) / 3
+prediction = argmax(final_prob)
+For Regression (Averaging):
+
+python
+# Averages predictions from all models
+final_prediction = (pred_linear + pred_rf + pred_xgb) / 3
+4. Usage Examples:
+bash
+# Single model (original behavior)
+python train.py --meta-model xgboost --task classification
+
+# Ensemble of 3 models (default)
+python train.py --use-ensemble --task classification --hpo-n-trials 20
+
+# Ensemble with custom weights (give more weight to XGBoost)
+python train.py --use-ensemble \
+  --ensemble-models linear random_forest xgboost \
+  --ensemble-weights 1.0 1.0 2.0 \
+  --task classification
+
+# Regression ensemble
+python train.py --use-ensemble \
+  --ensemble-models ridge random_forest xgboost \
+  --task regression
+5. Benefits of Ensemble:
+✅ More robust - Less likely to overfit
+
+✅ Better generalization - Combines strengths of different algorithms
+
+✅ Handles different data patterns - Each model captures different relationships
+
+✅ Default 20 trials - Faster hyperparameter search
+
+'''
