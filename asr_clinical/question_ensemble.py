@@ -41,6 +41,24 @@ from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
 from functools import partial
 
+# Add this wrapper class after the imports
+class XGBClassifierWrapper(XGBClassifier):
+    """Wrapper to ensure XGBClassifier is recognized as a classifier by sklearn."""
+    def _estimator_type(self):
+        return "classifier"
+    
+    @property
+    def _estimator_type(self):
+        return "classifier"
+
+class XGBRegressorWrapper(XGBRegressor):
+    """Wrapper to ensure XGBRegressor is recognized as a regressor by sklearn."""
+    def _estimator_type(self):
+        return "regressor"
+    
+    @property
+    def _estimator_type(self):
+        return "regressor"
 
 # ----------------------------------------------------------------------
 #  Utility Functions
@@ -629,7 +647,7 @@ def create_svm(task, args):
 def create_xgboost(task, args):
     """Create XGBoost model"""
     if task == "classification":
-        return XGBClassifier(
+        return XGBClassifierWrapper(
             n_estimators=args.n_estimators,
             max_depth=getattr(args, 'max_depth', 6),
             learning_rate=getattr(args, 'xgb_lr', 0.1),
@@ -639,7 +657,7 @@ def create_xgboost(task, args):
             use_label_encoder=False
         )
     else:  # regression
-        return XGBRegressor(
+        return XGBRegressorWrapper(
             n_estimators=args.n_estimators,
             max_depth=getattr(args, 'max_depth', 6),
             learning_rate=getattr(args, 'xgb_lr', 0.1),
@@ -692,12 +710,6 @@ def create_knn(task, args):
 def create_ensemble_model(task, args):
     """
     Create an ensemble of multiple meta-models with voting/averaging.
-    
-    For classification: Uses soft voting (probability averaging)
-    For regression: Uses averaging of predictions
-    
-    Ensemble members can be configured via --ensemble-models parameter.
-    Default: ['linear', 'random_forest', 'xgboost']
     """
     
     # Get list of models to include in ensemble
@@ -722,6 +734,16 @@ def create_ensemble_model(task, args):
         if model_name in model_creators:
             try:
                 model = model_creators[model_name](task, args)
+                
+                # Wrap XGBoost models to ensure sklearn compatibility
+                if model_name == 'xgboost' and task == 'classification':
+                    from sklearn.base import ClassifierMixin
+                    if not isinstance(model, ClassifierMixin):
+                        # Create a pipeline wrapper
+                        model = Pipeline([
+                            ('xgb', model)
+                        ])
+                
                 estimators.append((model_name, model))
                 print(f"  - Adding {model_name} to ensemble")
             except Exception as e:
