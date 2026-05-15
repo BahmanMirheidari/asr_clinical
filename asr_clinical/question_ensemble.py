@@ -41,20 +41,36 @@ from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
 from functools import partial
 
-# Add this wrapper class after the imports
-class XGBClassifierWrapper(XGBClassifier):
+from sklearn.base import ClassifierMixin, RegressorMixin
+from sklearn.preprocessing import LabelEncoder
+from sklearn.pipeline import Pipeline
+
+# Add these wrapper classes after the imports
+class XGBClassifierWrapper(XGBClassifier, ClassifierMixin):
     """Wrapper to ensure XGBClassifier is recognized as a classifier by sklearn."""
-    def _estimator_type(self):
-        return "classifier"
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def _more_tags(self):
+        return {'requires_fit': True}
+    
+    def fit(self, X, y, **kwargs):
+        # Ensure y is properly encoded for classification
+        if hasattr(self, 'classes_'):
+            pass
+        return super().fit(X, y, **kwargs)
     
     @property
     def _estimator_type(self):
         return "classifier"
 
-class XGBRegressorWrapper(XGBRegressor):
+class XGBRegressorWrapper(XGBRegressor, RegressorMixin):
     """Wrapper to ensure XGBRegressor is recognized as a regressor by sklearn."""
-    def _estimator_type(self):
-        return "regressor"
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def _more_tags(self):
+        return {'requires_fit': True}
     
     @property
     def _estimator_type(self):
@@ -527,7 +543,7 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
 #  Individual Meta-Model Creators
 # ----------------------------------------------------------------------
 def create_linear_model(task, args):
-    """Create linear model (LogisticRegression for classification, Ridge for regression)"""
+    """Create linear model: LogisticRegression for classification, Ridge for regression"""
     if task == "classification":
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -546,9 +562,8 @@ def create_linear_model(task, args):
             ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
         ])
 
-
 def create_ridge(task, args):
-    """Ridge regression (only for regression tasks)"""
+    """Ridge regression (regression only) - falls back to linear for classification"""
     if task == "regression":
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -556,13 +571,11 @@ def create_ridge(task, args):
             ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
         ])
     else:
-        # Fallback to linear for classification
-        print("Warning: Ridge not available for classification, using Logistic Regression")
+        print("  Note: Ridge is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
-
 def create_lasso(task, args):
-    """Lasso regression (only for regression tasks)"""
+    """Lasso regression (regression only) - falls back to linear for classification"""
     if task == "regression":
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -574,12 +587,11 @@ def create_lasso(task, args):
             )),
         ])
     else:
-        print("Warning: Lasso not available for classification, using Logistic Regression")
+        print("  Note: Lasso is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
-
 def create_elasticnet(task, args):
-    """ElasticNet regression (only for regression tasks)"""
+    """ElasticNet regression (regression only) - falls back to linear for classification"""
     if task == "regression":
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -592,12 +604,11 @@ def create_elasticnet(task, args):
             )),
         ])
     else:
-        print("Warning: ElasticNet not available for classification, using Logistic Regression")
+        print("  Note: ElasticNet is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
-
 def create_random_forest(task, args):
-    """Create Random Forest model"""
+    """Create Random Forest model (classification or regression)"""
     if task == "classification":
         return RandomForestClassifier(
             n_estimators=args.n_estimators,
@@ -616,9 +627,8 @@ def create_random_forest(task, args):
             max_depth=getattr(args, 'max_depth', None)
         )
 
-
 def create_svm(task, args):
-    """Create SVM model"""
+    """Create SVM model (SVC for classification, SVR for regression)"""
     if task == "classification":
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -627,7 +637,7 @@ def create_svm(task, args):
                 kernel=getattr(args, 'svm_kernel', 'rbf'),
                 C=getattr(args, 'svm_C', 1.0),
                 gamma=getattr(args, 'svm_gamma', 'scale'),
-                probability=True,
+                probability=True,  # Required for soft voting
                 class_weight="balanced",
                 random_state=args.seed
             )),
@@ -643,11 +653,10 @@ def create_svm(task, args):
             )),
         ])
 
-
 def create_xgboost(task, args):
-    """Create XGBoost model"""
+    """Create XGBoost model (classification or regression)"""
     if task == "classification":
-        return XGBClassifierWrapper(
+        model = XGBClassifier(
             n_estimators=args.n_estimators,
             max_depth=getattr(args, 'max_depth', 6),
             learning_rate=getattr(args, 'xgb_lr', 0.1),
@@ -656,8 +665,9 @@ def create_xgboost(task, args):
             eval_metric='logloss',
             use_label_encoder=False
         )
+        return model
     else:  # regression
-        return XGBRegressorWrapper(
+        model = XGBRegressor(
             n_estimators=args.n_estimators,
             max_depth=getattr(args, 'max_depth', 6),
             learning_rate=getattr(args, 'xgb_lr', 0.1),
@@ -665,10 +675,10 @@ def create_xgboost(task, args):
             n_jobs=-1,
             eval_metric='rmse'
         )
-
+        return model
 
 def create_gradient_boosting(task, args):
-    """Create Gradient Boosting model"""
+    """Create Gradient Boosting model (classification or regression)"""
     if task == "classification":
         return GradientBoostingClassifier(
             n_estimators=args.n_estimators,
@@ -684,9 +694,8 @@ def create_gradient_boosting(task, args):
             random_state=args.seed
         )
 
-
 def create_knn(task, args):
-    """Create KNN model"""
+    """Create KNN model (classification or regression)"""
     if task == "classification":
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -706,14 +715,42 @@ def create_knn(task, args):
             )),
         ])
 
-
 def create_ensemble_model(task, args):
     """
     Create an ensemble of multiple meta-models with voting/averaging.
+    
+    For classification: Uses soft voting (averages probabilities)
+    For regression: Uses averaging (averages predictions)
+    
+    Args:
+        task: "classification" or "regression"
+        args: Command line arguments with ensemble configuration
+        
+    Returns:
+        VotingClassifier or VotingRegressor ensemble
     """
     
     # Get list of models to include in ensemble
     ensemble_models = getattr(args, 'ensemble_models', ['linear', 'random_forest', 'xgboost'])
+    
+    # Validate that models are appropriate for the task
+    classification_only_models = []  # Models that only work for classification
+    regression_only_models = ['ridge', 'lasso', 'elasticnet']  # Models that only work for regression
+    
+    if task == "classification":
+        # Remove regression-only models from ensemble
+        invalid_models = [m for m in ensemble_models if m in regression_only_models]
+        if invalid_models:
+            print(f"Warning: Removing regression-only models from classification ensemble: {invalid_models}")
+            ensemble_models = [m for m in ensemble_models if m not in regression_only_models]
+    else:  # regression
+        # All models should have regression implementations
+        # (classification_only_models is empty, so no filtering needed)
+        pass
+    
+    if not ensemble_models:
+        print("Error: No valid models for ensemble. Falling back to linear model.")
+        return create_linear_model(task, args)
     
     # Map model names to creator functions
     model_creators = {
@@ -730,48 +767,126 @@ def create_ensemble_model(task, args):
     
     # Create individual models
     estimators = []
+    failed_models = []
+    
+    print(f"\nCreating ensemble for {task} task with models: {ensemble_models}")
+    
     for model_name in ensemble_models:
-        if model_name in model_creators:
-            try:
-                model = model_creators[model_name](task, args)
-                
-                # Wrap XGBoost models to ensure sklearn compatibility
-                if model_name == 'xgboost' and task == 'classification':
-                    from sklearn.base import ClassifierMixin
-                    if not isinstance(model, ClassifierMixin):
-                        # Create a pipeline wrapper
-                        model = Pipeline([
-                            ('xgb', model)
-                        ])
-                
-                estimators.append((model_name, model))
-                print(f"  - Adding {model_name} to ensemble")
-            except Exception as e:
-                print(f"  - Warning: Could not create {model_name}: {e}")
-        else:
-            print(f"  - Warning: Unknown model '{model_name}', skipping")
+        if model_name not in model_creators:
+            print(f"  ✗ Unknown model '{model_name}', skipping")
+            failed_models.append(model_name)
+            continue
+        
+        try:
+            # Create the model
+            model = model_creators[model_name](task, args)
+            
+            # Validate the model type matches the task
+            if task == "classification":
+                from sklearn.base import ClassifierMixin
+                if not isinstance(model, ClassifierMixin):
+                    # Try to check if it's a pipeline with a classifier
+                    if hasattr(model, 'named_steps'):
+                        last_step = list(model.named_steps.values())[-1]
+                        if not isinstance(last_step, ClassifierMixin):
+                            raise ValueError(f"{model_name} is not a classifier (got {type(last_step).__name__})")
+                    else:
+                        raise ValueError(f"{model_name} is not a classifier (got {type(model).__name__})")
+            else:  # regression
+                from sklearn.base import RegressorMixin
+                if not isinstance(model, RegressorMixin):
+                    # Try to check if it's a pipeline with a regressor
+                    if hasattr(model, 'named_steps'):
+                        last_step = list(model.named_steps.values())[-1]
+                        if not isinstance(last_step, RegressorMixin):
+                            raise ValueError(f"{model_name} is not a regressor (got {type(last_step).__name__})")
+                    else:
+                        raise ValueError(f"{model_name} is not a regressor (got {type(model).__name__})")
+            
+            estimators.append((model_name, model))
+            print(f"  ✓ Added {model_name} to ensemble")
+            
+        except Exception as e:
+            print(f"  ✗ Failed to create {model_name}: {e}")
+            failed_models.append(model_name)
+    
+    # Remove failed models from ensemble_models list for reporting
+    successful_models = [m for m in ensemble_models if m not in failed_models]
     
     if not estimators:
-        print("No valid ensemble models. Falling back to linear model.")
+        print("\nNo valid ensemble models. Falling back to linear model.")
         return create_linear_model(task, args)
     
-    # Create voting ensemble
+    # Create the appropriate ensemble based on task
     if task == "classification":
-        # Use soft voting (averages probabilities) for better performance
+        # For classification: use soft voting (probability averaging)
+        voting_type = getattr(args, 'ensemble_voting', 'soft')
+        
         ensemble = VotingClassifier(
             estimators=estimators,
-            voting='soft',  # 'soft' for probability averaging, 'hard' for majority vote
-            weights=getattr(args, 'ensemble_weights', None),  # Optional custom weights
+            voting=voting_type,  # 'soft' for probability averaging, 'hard' for majority vote
+            weights=getattr(args, 'ensemble_weights', None),
             n_jobs=-1
         )
-        print(f"\nCreated classification ensemble with {len(estimators)} models using SOFT voting")
+        
+        print(f"\n✓ Created CLASSIFICATION ensemble with {len(estimators)} models")
+        print(f"  - Voting type: {voting_type} {'(probability averaging)' if voting_type == 'soft' else '(majority vote)'}")
+        print(f"  - Models: {successful_models}")
+        
+        if getattr(args, 'ensemble_weights', None):
+            print(f"  - Weights: {args.ensemble_weights}")
+        
+    else:  # regression
+        ensemble = VotingRegressor(
+            estimators=estimators,
+            weights=getattr(args, 'ensemble_weights', None),
+            n_jobs=-1
+        )
+        
+        print(f"\n✓ Created REGRESSION ensemble with {len(estimators)} models")
+        print(f"  - Averaging type: weighted {'with weights' if getattr(args, 'ensemble_weights', None) else 'equal'}")
+        print(f"  - Models: {successful_models}")
+        
+        if getattr(args, 'ensemble_weights', None):
+            print(f"  - Weights: {args.ensemble_weights}")
+    
+    # Save ensemble information to args for later use
+    args.ensemble_models_used = successful_models
+    
+    return ensemble
+
+def create_ensemble_model_with_list(task, args, model_list):
+    """Helper function to create ensemble with a specific list of models."""
+    model_creators = {
+        'linear': create_linear_model,
+        'ridge': create_ridge,
+        'lasso': create_lasso,
+        'elasticnet': create_elasticnet,
+        'random_forest': create_random_forest,
+        'svm': create_svm,
+        'gradient_boosting': create_gradient_boosting,
+        'knn': create_knn,
+    }
+    
+    estimators = []
+    for model_name in model_list:
+        if model_name in model_creators:
+            model = model_creators[model_name](task, args)
+            estimators.append((model_name, model))
+            print(f"  - Adding {model_name} to ensemble")
+    
+    if task == "classification":
+        ensemble = VotingClassifier(
+            estimators=estimators,
+            voting='soft',
+            weights=getattr(args, 'ensemble_weights', None),
+            n_jobs=-1
+        )
     else:
-        # For regression, average predictions
         ensemble = VotingRegressor(
             estimators=estimators,
             weights=getattr(args, 'ensemble_weights', None)
         )
-        print(f"\nCreated regression ensemble with {len(estimators)} models using AVERAGING")
     
     return ensemble
 
