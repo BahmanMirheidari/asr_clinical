@@ -50,6 +50,7 @@ class XGBClassifierWrapper(XGBClassifier, ClassifierMixin):
     """Wrapper to ensure XGBClassifier is recognized as a classifier by sklearn."""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._estimator_type = "classifier"
     
     def _more_tags(self):
         return {'requires_fit': True}
@@ -68,6 +69,7 @@ class XGBRegressorWrapper(XGBRegressor, RegressorMixin):
     """Wrapper to ensure XGBRegressor is recognized as a regressor by sklearn."""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._estimator_type = "regressor"
     
     def _more_tags(self):
         return {'requires_fit': True}
@@ -654,9 +656,8 @@ def create_svm(task, args):
         ])
 
 def create_xgboost(task, args):
-    """Create XGBoost model (classification or regression)"""
     if task == "classification":
-        model = XGBClassifier(
+        return XGBClassifierWrapper(
             n_estimators=args.n_estimators,
             max_depth=getattr(args, 'max_depth', 6),
             learning_rate=getattr(args, 'xgb_lr', 0.1),
@@ -665,9 +666,8 @@ def create_xgboost(task, args):
             eval_metric='logloss',
             use_label_encoder=False
         )
-        return model
-    else:  # regression
-        model = XGBRegressor(
+    else:
+        return XGBRegressorWrapper(
             n_estimators=args.n_estimators,
             max_depth=getattr(args, 'max_depth', 6),
             learning_rate=getattr(args, 'xgb_lr', 0.1),
@@ -675,7 +675,6 @@ def create_xgboost(task, args):
             n_jobs=-1,
             eval_metric='rmse'
         )
-        return model
 
 def create_gradient_boosting(task, args):
     """Create Gradient Boosting model (classification or regression)"""
