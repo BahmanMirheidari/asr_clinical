@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import lightgbm as lgb 
 import argparse
 import json
 import random
@@ -44,39 +45,7 @@ from functools import partial
 from sklearn.base import ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
-
-# Add these wrapper classes after the imports
-class XGBClassifierWrapper(XGBClassifier, ClassifierMixin):
-    """Wrapper to ensure XGBClassifier is recognized as a classifier by sklearn."""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._estimator_type = "classifier"
-    
-    def _more_tags(self):
-        return {'requires_fit': True}
-    
-    def fit(self, X, y, **kwargs):
-        # Ensure y is properly encoded for classification
-        if hasattr(self, 'classes_'):
-            pass
-        return super().fit(X, y, **kwargs)
-    
-    @property
-    def _estimator_type(self):
-        return "classifier"
-
-class XGBRegressorWrapper(XGBRegressor, RegressorMixin):
-    """Wrapper to ensure XGBRegressor is recognized as a regressor by sklearn."""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._estimator_type = "regressor"
-    
-    def _more_tags(self):
-        return {'requires_fit': True}
-    
-    @property
-    def _estimator_type(self):
-        return "regressor"
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
 # ----------------------------------------------------------------------
 #  Utility Functions
@@ -87,6 +56,24 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def create_hist_gradient_boosting(task, args):
+    """Native scikit-learn HistGradientBoosting – no version conflicts."""
+    if task == "classification":
+        return HistGradientBoostingClassifier(
+            max_iter=args.n_estimators,
+            learning_rate=args.xgb_lr,
+            max_depth=getattr(args, 'max_depth', None),
+            random_state=args.seed,
+            verbose=0
+        )
+    else:  # regression
+        return HistGradientBoostingRegressor(
+            max_iter=args.n_estimators,
+            learning_rate=args.xgb_lr,
+            max_depth=getattr(args, 'max_depth', None),
+            random_state=args.seed,
+            verbose=0
+        )
 
 def cleanup_old_splits(splits_dir: Path):
     """Delete existing split files to force regeneration with correct columns."""
@@ -655,27 +642,6 @@ def create_svm(task, args):
             )),
         ])
 
-def create_xgboost(task, args):
-    if task == "classification":
-        return XGBClassifierWrapper(
-            n_estimators=args.n_estimators,
-            max_depth=getattr(args, 'max_depth', 6),
-            learning_rate=getattr(args, 'xgb_lr', 0.1),
-            random_state=args.seed,
-            n_jobs=-1,
-            eval_metric='logloss',
-            use_label_encoder=False
-        )
-    else:
-        return XGBRegressorWrapper(
-            n_estimators=args.n_estimators,
-            max_depth=getattr(args, 'max_depth', 6),
-            learning_rate=getattr(args, 'xgb_lr', 0.1),
-            random_state=args.seed,
-            n_jobs=-1,
-            eval_metric='rmse'
-        )
-
 def create_gradient_boosting(task, args):
     """Create Gradient Boosting model (classification or regression)"""
     if task == "classification":
@@ -758,9 +724,9 @@ def create_ensemble_model(task, args):
         'lasso': create_lasso,
         'elasticnet': create_elasticnet,
         'random_forest': create_random_forest,
-        'svm': create_svm,
-        'xgboost': create_xgboost,
+        'svm': create_svm, 
         'gradient_boosting': create_gradient_boosting,
+        'hist_gradient_boosting': create_hist_gradient_boosting,
         'knn': create_knn,
     }
     
@@ -864,6 +830,7 @@ def create_ensemble_model_with_list(task, args, model_list):
         'random_forest': create_random_forest,
         'svm': create_svm,
         'gradient_boosting': create_gradient_boosting,
+        'hist_gradient_boosting': create_hist_gradient_boosting,
         'knn': create_knn,
     }
     
@@ -901,7 +868,7 @@ def make_meta_model(args):
     - elasticnet: ElasticNet regression (regression only, falls back to linear for classification)
     - random_forest: Random Forest (classification or regression)
     - svm: SVM (classification or regression)
-    - xgboost: XGBoost (classification or regression)
+    - hist_gradient_boosting: Hist Gradient Boosting (classification or regression)
     - gradient_boosting: Gradient Boosting (classification or regression)
     - knn: KNN (classification or regression)
     
@@ -929,8 +896,8 @@ def make_meta_model(args):
             return create_random_forest(args.task, args)
         elif args.meta_model == "svm":
             return create_svm(args.task, args)
-        elif args.meta_model == "xgboost":
-            return create_xgboost(args.task, args)
+        elif args.meta_model == "hist_gradient_boosting":
+            return create_hist_gradient_boosting(args.task, args)
         elif args.meta_model == "gradient_boosting":
             return create_gradient_boosting(args.task, args)
         elif args.meta_model == "knn":
@@ -1266,7 +1233,7 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
     if getattr(args, 'use_ensemble', False):
         ensemble_info = {
             "use_ensemble": True,
-            "ensemble_models": getattr(args, 'ensemble_models', ['linear', 'random_forest', 'xgboost']),
+            "ensemble_models": getattr(args, 'ensemble_models', ['linear', 'random_forest', 'hist_gradient_boosting']),
             "voting_type": "soft" if args.task == "classification" else "average"
         }
         with open(out_dir / "ensemble_config.json", "w") as f:
@@ -1301,7 +1268,7 @@ def build_parser():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--splits-dir", required=True)
     parser.add_argument("--model-name", default="distilroberta-base")
-    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 14)])
+    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 15)])
     parser.add_argument("--train-frac", type=float, default=0.8)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
@@ -1325,7 +1292,7 @@ def build_parser():
     
     # Meta-model settings - SINGLE MODEL
     parser.add_argument("--meta-model", 
-                        choices=["linear", "random_forest", "svm", "xgboost", "gradient_boosting", "knn",
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
                                 "ridge", "lasso", "elasticnet"],
                         default="linear",
                         help="Single meta-model to use (ignored if --use-ensemble is set)")
@@ -1334,9 +1301,9 @@ def build_parser():
     parser.add_argument("--use-ensemble", action="store_true",
                         help="Use ensemble of multiple meta-models with voting/averaging")
     parser.add_argument("--ensemble-models", nargs="+",
-                        choices=["linear", "random_forest", "svm", "xgboost", "gradient_boosting", "knn",
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
                                 "ridge", "lasso", "elasticnet"],
-                        default=["linear", "random_forest", "xgboost"],
+                        default=["linear", "random_forest", "hist_gradient_boosting"],
                         help="Models to include in ensemble")
     parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None,
                         help="Custom weights for ensemble members (default: equal weights)")
