@@ -180,6 +180,29 @@ class SplitManager:
             return train_df, val_df, test_df
 
         print("Creating final train/val/test splits (by speaker).")
+        
+        # Handle test_frac == 0 case
+        if self.test_frac == 0:
+            print("test_frac=0: No test set will be created.")
+            # Split only into train and val
+            rel_val_frac = self.val_frac / (self.train_frac + self.val_frac)
+            train_idx, val_idx = self._speaker_split(df, rel_val_frac, self.seed)
+            train_df = df.iloc[train_idx].reset_index(drop=True)
+            val_df = df.iloc[val_idx].reset_index(drop=True)
+            test_df = pd.DataFrame()  # Empty test DataFrame
+            
+            # Save splits
+            train_df.to_csv(train_path, index=False)
+            val_df.to_csv(val_path, index=False)
+            # Create empty test file with same columns
+            if len(df) > 0:
+                empty_test = pd.DataFrame(columns=df.columns)
+                empty_test.to_csv(test_path, index=False)
+            
+            print("Final splits saved (train/val only).")
+            return train_df, val_df, test_df
+        
+        # Normal case with test_frac > 0
         trainval_idx, test_idx = self._speaker_split(df, self.test_frac, self.seed)
         trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
         test_df = df.iloc[test_idx].reset_index(drop=True)
@@ -221,7 +244,7 @@ class SplitManager:
             val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
             test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
             
-            if not test_copy_path.exists():
+            if not test_copy_path.exists() and not test_df.empty:
                 test_df.to_csv(test_copy_path, index=False)
             
             fold_train = pd.read_csv(train_path)
@@ -269,8 +292,9 @@ class SplitManager:
             fold_train.to_csv(train_path, index=False)
             fold_val.to_csv(val_path, index=False)
             
-            test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
-            test_df.to_csv(test_copy_path, index=False)
+            if not test_df.empty:
+                test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
+                test_df.to_csv(test_copy_path, index=False)
             
             folds.append((fold_train, fold_val))
         
@@ -279,6 +303,15 @@ class SplitManager:
 
     def _speaker_split(self, df: pd.DataFrame, test_size: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
         """Split indices by speaker."""
+        # Handle edge cases
+        if test_size <= 0:
+            # Return all indices as train, empty as test
+            return np.arange(len(df)), np.array([], dtype=int)
+        
+        if test_size >= 1:
+            # Return empty as train, all as test
+            return np.array([], dtype=int), np.arange(len(df))
+        
         df_work = df.copy()
         label_col = df_work["label"]
         if isinstance(label_col, pd.DataFrame):
@@ -992,10 +1025,18 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
     
     questions = [q.upper() for q in args.questions]
     
+    # Check if test_df is empty (test_frac=0 case)
+    is_test_empty = test_df is None or test_df.empty
+    
     for question in questions:
         q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
         q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
-        q_test = test_df[test_df["question_id"] == question].reset_index(drop=True)
+        
+        # Handle test DataFrame properly
+        if not is_test_empty:
+            q_test = test_df[test_df["question_id"] == question].reset_index(drop=True)
+        else:
+            q_test = pd.DataFrame()  # Empty DataFrame
 
         if q_train.empty:
             print(f"{question}: skipping, no training examples")
@@ -1007,8 +1048,12 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         val_emb = q_dir / "embeddings_val.csv"
         test_emb = q_dir / "embeddings_test.csv"
 
-        if (model_dir.exists() and saved_model_exists(model_dir) and
-            train_emb.exists() and val_emb.exists() and (q_test.empty or test_emb.exists())):
+        # Check if we need to train the model
+        model_exists = model_dir.exists() and saved_model_exists(model_dir)
+        embeddings_exist = train_emb.exists() and val_emb.exists()
+        test_embeddings_exist = is_test_empty or test_emb.exists()
+        
+        if (model_exists and embeddings_exist and test_embeddings_exist):
             print(f"{question}: model and embeddings already exist, loading.")
         else:
             print(f"{question}: training model on {len(q_train)} examples, val on {len(q_val)}")
@@ -1020,17 +1065,25 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             
             extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
             extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
-            if not q_test.empty:
+            if not is_test_empty and not q_test.empty:
                 extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
+            elif not is_test_empty:
+                # Create empty test embeddings file with correct structure
+                print(f"{question}: No test examples, creating empty test embeddings placeholder")
+                # Create empty DataFrame with expected columns from training embeddings
+                if train_emb.exists():
+                    sample_emb = pd.read_csv(train_emb, nrows=1)
+                    empty_test_emb = pd.DataFrame(columns=sample_emb.columns)
+                    empty_test_emb.to_csv(test_emb, index=False)
 
         embedding_files["train"][question] = train_emb
         embedding_files["val"][question] = val_emb
-        embedding_files["test"][question] = test_emb if not q_test.empty else None
+        embedding_files["test"][question] = test_emb if not is_test_empty and not q_test.empty else None
         summaries.append({
             "question_id": question,
             "train_examples": len(q_train),
             "val_examples": len(q_val),
-            "test_examples": len(q_test),
+            "test_examples": len(q_test) if not is_test_empty else 0,
             "model_dir": str(model_dir)
         })
     
@@ -1044,18 +1097,29 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
     for q in questions:
         path = embedding_paths.get(q)
         if path is None or not Path(path).exists():
+            print(f"Warning: No embeddings found for question {q}, skipping")
             continue
-        emb_df = pd.read_csv(path)
-        emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
-        if not emb_cols:
+        try:
+            emb_df = pd.read_csv(path)
+            if emb_df.empty:
+                print(f"Warning: Empty embeddings for question {q}, skipping")
+                continue
+                
+            emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
+            if not emb_cols:
+                print(f"Warning: No embedding columns found for question {q}, skipping")
+                continue
+                
+            grouped = emb_df.groupby("speaker_id", as_index=True).agg(
+                y_true=("y_true", "first"),
+                **{col: (col, "mean") for col in emb_cols},
+            )
+            grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
+            grouped[f"{q}__present"] = 1.0
+            tables.append(grouped)
+        except Exception as e:
+            print(f"Error processing embeddings for question {q}: {e}")
             continue
-        grouped = emb_df.groupby("speaker_id", as_index=True).agg(
-            y_true=("y_true", "first"),
-            **{col: (col, "mean") for col in emb_cols},
-        )
-        grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
-        grouped[f"{q}__present"] = 1.0
-        tables.append(grouped)
     
     if not tables:
         raise ValueError("No embedding tables available.")
@@ -1073,13 +1137,14 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
 
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
     """Align feature columns across splits."""
-    for df in (val_df, test_df):
-        for col in feature_cols:
-            if col not in df.columns:
-                df[col] = 0.0
-        extra = [c for c in df.columns if "__" in c and c not in feature_cols]
-        if extra:
-            df.drop(columns=extra, inplace=True)
+    for df in [val_df, test_df]:
+        if df is not None and not df.empty:
+            for col in feature_cols:
+                if col not in df.columns:
+                    df[col] = 0.0
+            extra = [c for c in df.columns if "__" in c and c not in feature_cols]
+            if extra:
+                df.drop(columns=extra, inplace=True)
     return train_df, val_df, test_df
 
 
@@ -1337,10 +1402,331 @@ def build_parser():
     
     return parser
 
+def train_meta_model_cv(
+    train_features, val_features, test_features, feature_cols, args, out_dir: Path
+):
+    """Train meta-model with cross-validation only (test_percentage=0)."""
+    
+    # Combine train and val for CV
+    all_trainval = pd.concat([train_features, val_features], ignore_index=True)
+    
+    # If test_features is provided and not empty, combine it as well? Or ignore?
+    if test_features is not None and not test_features.empty:
+        print(f"Note: test_features has {len(test_features)} samples but test_frac=0. These will be ignored in CV.") 
+    
+    # Create CV splits based on speakers
+    speakers = all_trainval.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers, speakers["label"]))
+    else:
+        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers))
+    
+    fold_results = []
+    all_fold_predictions = []
+    fold_importance_dfs = []
+    best_k_per_fold = []
+    
+    for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
+        print(f"\n{'='*50}")
+        print(f"FOLD {fold_idx + 1}/{args.n_cv_folds}")
+        print(f"{'='*50}")
+        
+        train_speakers = speakers.iloc[train_speaker_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_speaker_idx]["speaker_id"].values
+        
+        fold_train = all_trainval[all_trainval["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val = all_trainval[all_trainval["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        print(f"Train size: {len(fold_train)}, Val size: {len(fold_val)}")
+        
+        # Train base model for importance calculation
+        base_model = make_meta_model(args)
+        base_model.fit(fold_train[feature_cols].to_numpy(), fold_train["y_true"].to_numpy())
+        
+        # Calculate question importance for this fold
+        importance_df = permutation_question_importance(
+            base_model, fold_val, feature_cols, args
+        )
+        importance_df["fold"] = fold_idx
+        fold_importance_dfs.append(importance_df)
+        
+        # Get ranked questions for this fold
+        questions_ranked = importance_df["question_id"].tolist()
+        if not questions_ranked:
+            questions_ranked = [c.split("__", 1)[0] for c in feature_cols]
+        
+        max_k = len(questions_ranked)
+        ks = list(range(1, max_k + 1))
+        if args.top_k and 0 < args.top_k < max_k:
+            ks = sorted(set(ks + [args.top_k]))
+        
+        # Find best k for this fold
+        best_val_score = -float("inf")
+        best_k = 1
+        fold_val_metrics = {}
+        
+        for k in ks:
+            selected_qs = questions_ranked[:k]
+            selected_cols = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs)]
+            
+            if not selected_cols:
+                continue
+                
+            model = make_meta_model(args)
+            model.fit(fold_train[selected_cols].to_numpy(), fold_train["y_true"].to_numpy())
+            metrics = score_meta_model(
+                model, 
+                fold_val[selected_cols].to_numpy(), 
+                fold_val["y_true"].to_numpy(), 
+                args.task
+            )
+            fold_val_metrics[k] = metrics
+            
+            score = primary_score(metrics, args.task)
+            if score > best_val_score:
+                best_val_score = score
+                best_k = k
+        
+        best_k_per_fold.append({"fold": fold_idx, "best_k": best_k, "best_score": best_val_score})
+        print(f"Best k for fold {fold_idx}: {best_k} (score: {best_val_score:.4f})")
+        
+        # Train final model for this fold with best k
+        selected_qs_final = questions_ranked[:best_k]
+        selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
+        
+        final_model = make_meta_model(args)
+        final_model.fit(
+            fold_train[selected_cols_final].to_numpy(), 
+            fold_train["y_true"].to_numpy()
+        )
+        
+        # Evaluate on validation set
+        val_metrics = score_meta_model(
+            final_model,
+            fold_val[selected_cols_final].to_numpy(),
+            fold_val["y_true"].to_numpy(),
+            args.task
+        )
+        
+        # Store predictions
+        val_preds = final_model.predict(fold_val[selected_cols_final].to_numpy())
+        fold_predictions = fold_val[["speaker_id", "y_true"]].copy()
+        fold_predictions["y_pred"] = val_preds
+        fold_predictions["fold"] = fold_idx
+        
+        if args.task == "classification" and hasattr(final_model, "predict_proba"):
+            try:
+                probs = final_model.predict_proba(fold_val[selected_cols_final].to_numpy())
+                classes = final_model.classes_
+                for i, cls in enumerate(classes):
+                    fold_predictions[f"prob_{cls}"] = probs[:, i]
+            except:
+                pass
+        
+        all_fold_predictions.append(fold_predictions)
+        
+        fold_results.append({
+            "fold": fold_idx,
+            "best_k": best_k,
+            "val_metrics": val_metrics,
+            "selected_questions": selected_qs_final,
+            "n_selected_features": len(selected_cols_final)
+        })
+        
+        # Save individual fold model
+        fold_model_dir = out_dir / f"fold_{fold_idx}"
+        fold_model_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(final_model, fold_model_dir / "meta_model.joblib")
+        pd.DataFrame({"question_id": selected_qs_final}).to_csv(
+            fold_model_dir / "selected_questions.csv", index=False
+        )
+    
+    # Aggregate results across folds
+    print("\n" + "="*60)
+    print("AGGREGATED RESULTS ACROSS FOLDS")
+    print("="*60)
+    
+    # Combine all predictions
+    all_predictions = pd.concat(all_fold_predictions, ignore_index=True)
+    all_predictions.to_csv(out_dir / "cv_all_predictions.csv", index=False)
+    
+    # Calculate aggregate metrics
+    aggregate_metrics = score_meta_model(
+        None,  # No model needed, we use stored predictions
+        all_predictions["y_pred"].values,
+        all_predictions["y_true"].values,
+        args.task
+    )
+    
+    print("\nAggregate metrics across all folds:")
+    print(json.dumps(aggregate_metrics, indent=2))
+    
+    # Per-fold statistics
+    fold_summaries = []
+    for res in fold_results:
+        score = primary_score(res["val_metrics"], args.task)
+        fold_summaries.append({
+            "fold": res["fold"],
+            "best_k": res["best_k"],
+            "primary_score": score,
+            "n_selected_questions": len(res["selected_questions"])
+        })
+    
+    fold_summary_df = pd.DataFrame(fold_summaries)
+    fold_summary_df.to_csv(out_dir / "fold_summary.csv", index=False)
+    
+    print("\nPer-fold results:")
+    print(fold_summary_df)
+    print(f"\nMean best_k: {fold_summary_df['best_k'].mean():.1f}")
+    print(f"Mean primary score: {fold_summary_df['primary_score'].mean():.4f} (+/- {fold_summary_df['primary_score'].std():.4f})")
+    
+    # Aggregate question importance across folds
+    all_importance = pd.concat(fold_importance_dfs, ignore_index=True)
+    
+    # Calculate mean importance per question across folds
+    question_importance_agg = all_importance.groupby("question_id").agg({
+        "importance": ["mean", "std", "count"],
+        "importance_std": "mean"
+    }).round(4)
+    question_importance_agg.columns = ["mean_importance", "std_importance", "n_folds", "mean_importance_std"]
+    question_importance_agg = question_importance_agg.sort_values("mean_importance", ascending=False)
+    question_importance_agg.to_csv(out_dir / "aggregated_question_importance.csv")
+    
+    print("\nTop 10 most important questions across folds:")
+    print(question_importance_agg.head(10))
+    
+    # Determine final top K based on average best_k across folds
+    avg_best_k = int(np.round(fold_summary_df['best_k'].mean()))
+    print(f"\nAverage best K across folds: {avg_best_k}")
+    
+    # Get top K questions based on mean importance
+    top_questions = question_importance_agg.head(avg_best_k).index.tolist()
+    top_features = [c for c in feature_cols if c.split("__", 1)[0] in top_questions]
+    
+    print(f"Selected {len(top_questions)} top questions: {top_questions}")
+    
+    # Train final ensemble model on all data using top K questions
+    print("\n" + "="*60)
+    print("TRAINING FINAL MODEL ON ALL DATA WITH TOP K QUESTIONS")
+    print("="*60)
+    
+    final_model = make_meta_model(args)
+    final_model.fit(
+        all_trainval[top_features].to_numpy(),
+        all_trainval["y_true"].to_numpy()
+    )
+    
+    # Save final model
+    joblib.dump(final_model, out_dir / "final_cv_model.joblib")
+    pd.DataFrame({"question_id": top_questions}).to_csv(
+        out_dir / "final_selected_questions.csv", index=False
+    )
+    pd.DataFrame({"feature": top_features}).to_csv(
+        out_dir / "final_selected_features.csv", index=False
+    )
+    
+    # Save aggregate results
+    cv_results = {
+        "cv_folds": args.n_cv_folds,
+        "aggregate_metrics": aggregate_metrics,
+        "per_fold_metrics": fold_summaries,
+        "avg_best_k": avg_best_k,
+        "selected_questions": top_questions,
+        "mean_primary_score": float(fold_summary_df['primary_score'].mean()),
+        "std_primary_score": float(fold_summary_df['primary_score'].std())
+    }
+    
+    with open(out_dir / "cv_results.json", "w") as f:
+        json.dump(cv_results, f, indent=2)
+    
+    # Create summary report
+    with open(out_dir / "cv_summary_report.txt", "w") as f:
+        f.write("="*60 + "\n")
+        f.write("CROSS-VALIDATION SUMMARY REPORT\n")
+        f.write("="*60 + "\n\n")
+        
+        f.write(f"Number of folds: {args.n_cv_folds}\n")
+        f.write(f"Task: {args.task}\n")
+        f.write(f"Total samples: {len(all_trainval)}\n\n")
+        
+        f.write("Per-fold Results:\n")
+        f.write("-"*40 + "\n")
+        for res in fold_summaries:
+            f.write(f"Fold {res['fold']}: best_k={res['best_k']}, primary_score={res['primary_score']:.4f}\n")
+        
+        f.write(f"\nAverage Results:\n")
+        f.write(f"  Mean best_k: {avg_best_k}\n")
+        f.write(f"  Mean primary score: {fold_summary_df['primary_score'].mean():.4f} (+/- {fold_summary_df['primary_score'].std():.4f})\n\n")
+        
+        f.write("Aggregate Metrics Across All Folds:\n")
+        f.write("-"*40 + "\n")
+        for k, v in aggregate_metrics.items():
+            if isinstance(v, (int, float)):
+                f.write(f"  {k}: {v:.4f}\n")
+            elif k == "classification_report" and isinstance(v, dict):
+                f.write(f"  {k}:\n")
+                for class_label, metrics in v.items():
+                    if isinstance(metrics, dict):
+                        f.write(f"    {class_label}: {metrics}\n")
+        
+        f.write("\nTop 10 Most Important Questions:\n")
+        f.write("-"*40 + "\n")
+        for idx, (q, row) in enumerate(question_importance_agg.head(10).iterrows(), 1):
+            f.write(f"  {idx}. {q}: importance={row['mean_importance']:.4f} (+/- {row['std_importance']:.4f})\n")
+        
+        f.write(f"\nFinal Selected Questions (K={avg_best_k}):\n")
+        f.write("-"*40 + "\n")
+        for i, q in enumerate(top_questions, 1):
+            f.write(f"  {i}. {q}\n")
+    
+    print(f"\nResults saved to {out_dir}")
+    print(f"  - cv_all_predictions.csv: All fold predictions")
+    print(f"  - cv_results.json: Aggregate results")
+    print(f"  - cv_summary_report.txt: Detailed summary report")
+    print(f"  - final_cv_model.joblib: Final model trained on all data")
+    print(f"  - aggregated_question_importance.csv: Question importance across folds")
+    
+    return {
+        "cv_folds": args.n_cv_folds,
+        "aggregate_metrics": aggregate_metrics,
+        "per_fold_metrics": fold_summaries,
+        "avg_best_k": avg_best_k,
+        "selected_questions": top_questions,
+        "question_importance": question_importance_agg.to_dict()
+    }
 
-# ----------------------------------------------------------------------
-#  Main
-# ----------------------------------------------------------------------
+
+def main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir):
+    """Run CV-only training when test_frac == 0"""
+    
+    # Check if test_features is empty (which it will be when test_frac=0)
+    if test_features is not None and not test_features.empty:
+        print(f"Warning: test_features is not empty but test_frac=0. This shouldn't happen.")
+    
+    # Train meta-model with CV (since test_frac=0)
+    results = train_meta_model_cv(
+        train_features, val_features, test_features, feature_cols, args, out_dir
+    )
+    
+    print("\n===== Final CV Results =====")
+    print(json.dumps(results, indent=2))
+    
+    # Cleanup
+    cleanup_temp_dirs(out_dir)
+    
+    # Print ensemble info if used
+    if args.use_ensemble:
+        print("\n" + "=" * 50)
+        print("ENSEMBLE SUMMARY")
+        print("=" * 50)
+        print(f"Models in ensemble: {args.ensemble_models}")
+        print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
+        print(f"Final CV model saved to: {out_dir / 'final_cv_model.joblib'}") 
+
 def main():
     args = build_parser().parse_args()
     set_seed(args.seed)
@@ -1358,7 +1744,7 @@ def main():
     df, metadata = load_examples(
         args.asr_file, args.demo_file, args.target_column, args.task,
         text_mode="question", min_text_chars=args.min_text_chars,
-        filter_questions=questions,delimiter=args.delimiter
+        filter_questions=questions, delimiter=args.delimiter
     )
     
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -1400,39 +1786,62 @@ def main():
     available_qs = list(embedding_files["train"].keys())
     train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
     val_features, _ = build_feature_table(embedding_files["val"], available_qs)
-    test_features, _ = build_feature_table(embedding_files["test"], available_qs)
-    train_features, val_features, test_features = align_feature_tables(
-        train_features, val_features, test_features, feature_cols
-    )
+
+    # Handle test features carefully
+    test_features = None
+    if args.test_frac > 0:
+        test_features, _ = build_feature_table(embedding_files["test"], available_qs)
+    else:
+        print("test_frac=0: No test features will be created")
+        # Create empty test_features with same structure as train_features but no rows
+        test_features = pd.DataFrame(columns=train_features.columns)
+
+    # Align features
+    if test_features is not None and not test_features.empty:
+        train_features, val_features, test_features = align_feature_tables(
+            train_features, val_features, test_features, feature_cols
+        )
+    else:
+        # Just align train and val
+        train_features, val_features, _ = align_feature_tables(
+            train_features, val_features, pd.DataFrame(), feature_cols
+        )
     
     # Save raw feature tables
     train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
     val_features.to_csv(out_dir / "meta_val_features.csv", index=False)
-    test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
     
-    # Train meta-model (single or ensemble)
-    results = train_meta_model(
-        train_features, val_features, test_features, feature_cols, args, out_dir
-    )
-    
-    print("\n===== Final Results =====")
-    print(json.dumps(results, indent=2))
-    
-    # Cleanup
-    cleanup_temp_dirs(out_dir)
-    
-    # Print ensemble info if used
-    if args.use_ensemble:
-        print("\n" + "=" * 50)
-        print("ENSEMBLE SUMMARY")
-        print("=" * 50)
-        print(f"Models in ensemble: {args.ensemble_models}")
-        print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
-        print(f"Ensemble saved to: {out_dir / 'meta_model.joblib'}")
+    # Choose training path based on test_frac
+    if args.test_frac == 0:
+        # Cross-validation only (no held-out test set)
+        main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir)
+    else: 
+        # Standard training with held-out test set
+        test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
+        
+        # Train meta-model (single or ensemble)
+        results = train_meta_model(
+            train_features, val_features, test_features, feature_cols, args, out_dir
+        )
+        
+        print("\n===== Final Results =====")
+        print(json.dumps(results, indent=2))
+        
+        # Cleanup
+        cleanup_temp_dirs(out_dir)
+        
+        # Print ensemble info if used
+        if args.use_ensemble:
+            print("\n" + "=" * 50)
+            print("ENSEMBLE SUMMARY")
+            print("=" * 50)
+            print(f"Models in ensemble: {args.ensemble_models}")
+            print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
+            print(f"Ensemble saved to: {out_dir / 'meta_model.joblib'}")
 
 
 if __name__ == "__main__":
-    main()
+    main() 
 '''
 1. Multiple Meta-Model Options:
 linear - Logistic Regression (classification) / Ridge (regression)
