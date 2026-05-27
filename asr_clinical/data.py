@@ -41,31 +41,96 @@ def parse_utterance_id(utterance_id: str) -> tuple[str, str, str]:
     return speaker_id, session_id, question_id
 
 
-def read_asr_file(path: str | Path) -> pd.DataFrame:
+def read_asr_file(path: str | Path, delimiter: str = ";") -> pd.DataFrame:
+    """
+    Read ASR transcript file with flexible delimiter support.
+    
+    Args:
+        path: Path to the transcript file
+        delimiter: Delimiter between utterance ID and text. 
+                   If not ";", assumes space " " as delimiter.
+                   Default: ";"
+    
+    Returns:
+        DataFrame with columns: utterance_id, speaker_id, session_id, question_id, text
+    
+    Notes:
+        - The file format is expected to have utterance_id and text separated by the delimiter
+        - Text may contain spaces, punctuation, and other special characters
+        - The delimiter can be any character, but if not ";", space is used
+        - Handles UTF-8 with BOM encoding
+        - Skips header rows and empty lines
+    """
     rows: list[dict[str, str]] = []
     first = True
+    
+    # Determine actual delimiter
+    actual_delimiter = " " if delimiter != ";" else ";"
+    
+    # For space delimiter, we need special handling since text may contain spaces
+    # We'll read line by line and split only on the first occurrence of delimiter
     with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.reader(f, delimiter=";")
-        for row in reader:
-            if not row or first:
-                first = False
-                continue
-            if len(row) < 2:
-                continue
-            utt_id = row[0].strip()
-            text = row[-1].strip()
-            if utt_id.lower() in {"utt_id", "utterance_id"}:
-                continue
-            speaker_id, session_id, question_id = parse_utterance_id(utt_id)
-            rows.append(
-                {
+        if actual_delimiter == ";":
+            # Simple case: semicolon delimiter
+            reader = csv.reader(f, delimiter=";")
+            for row in reader:
+                if not row or first:
+                    first = False
+                    continue
+                if len(row) < 2:
+                    continue
+                utt_id = row[0].strip()
+                text = row[-1].strip()
+                
+                if utt_id.lower() in {"utt_id", "utterance_id"}:
+                    continue
+                
+                speaker_id, session_id, question_id = parse_utterance_id(utt_id)
+                rows.append({
                     "utterance_id": utt_id,
                     "speaker_id": speaker_id,
                     "session_id": session_id,
                     "question_id": question_id,
                     "text": text,
-                }
-            )
+                })
+        else:
+            # Complex case: space delimiter (or any delimiter that might appear in text)
+            for line in f:
+                line = line.strip()
+                if not line or first:
+                    first = False
+                    continue
+                
+                # Skip empty or header lines
+                if not line or line.lower().startswith(("utt_id", "utterance_id")):
+                    continue
+                
+                # Split on the first occurrence of the delimiter
+                # This ensures text preserves any additional delimiters or spaces
+                parts = line.split(actual_delimiter, 1)
+                
+                if len(parts) < 2:
+                    # If no delimiter found, try space as fallback
+                    parts = line.split(" ", 1)
+                    if len(parts) < 2:
+                        continue
+                
+                utt_id = parts[0].strip()
+                text = parts[1].strip()
+                
+                # Validate utterance ID
+                if utt_id.lower() in {"utt_id", "utterance_id"}:
+                    continue
+                
+                speaker_id, session_id, question_id = parse_utterance_id(utt_id)
+                rows.append({
+                    "utterance_id": utt_id,
+                    "speaker_id": speaker_id,
+                    "session_id": session_id,
+                    "question_id": question_id,
+                    "text": text,
+                })
+    
     return pd.DataFrame(rows)
 
 
@@ -113,10 +178,11 @@ def load_examples(
     target_column: str,
     task: str,
     text_mode: str,
+    delimiter: str = ";",
     min_text_chars: int = 1,
     filter_questions: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    asr = read_asr_file(asr_file)
+    asr = read_asr_file(asr_file,delimiter=delimiter)
     asr["speaker_id"] = asr["speaker_id"].astype(str).str.strip()
     asr_all_speakers = set(asr["speaker_id"].astype(str).unique())
 
