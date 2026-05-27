@@ -1333,6 +1333,7 @@ def build_parser():
     parser.add_argument("--embedding-batch-size", type=int, default=32)
     parser.add_argument("--force-embeddings", action="store_true")
     parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--delimiter", default=";")
     
     return parser
 
@@ -1357,7 +1358,7 @@ def main():
     df, metadata = load_examples(
         args.asr_file, args.demo_file, args.target_column, args.task,
         text_mode="question", min_text_chars=args.min_text_chars,
-        filter_questions=questions,
+        filter_questions=questions,delimiter=args.delimiter
     )
     
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
