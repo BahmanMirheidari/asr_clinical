@@ -1190,8 +1190,22 @@ def permutation_question_importance(model, val_df, feature_cols, args):
 
 
 def score_meta_model(model, x, y, task):
-    """Score a meta-model."""
-    pred = model.predict(x)
+    """
+    Score a meta-model.
+    
+    Args:
+        model: The model to score (can be None if y_pred is provided directly in x?)
+        x: Features or predictions
+        y: True labels
+        task: "classification" or "regression"
+    """
+    # Check if x is actually predictions (when model is None)
+    if model is None:
+        # Assume x contains predictions directly
+        pred = x
+    else:
+        pred = model.predict(x)
+    
     if task == "classification":
         return {
             "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
@@ -1410,10 +1424,6 @@ def train_meta_model_cv(
     # Combine train and val for CV
     all_trainval = pd.concat([train_features, val_features], ignore_index=True)
     
-    # If test_features is provided and not empty, combine it as well? Or ignore?
-    if test_features is not None and not test_features.empty:
-        print(f"Note: test_features has {len(test_features)} samples but test_frac=0. These will be ignored in CV.") 
-    
     # Create CV splits based on speakers
     speakers = all_trainval.groupby("speaker_id")["y_true"].first().reset_index()
     speakers.columns = ["speaker_id", "label"]
@@ -1554,11 +1564,12 @@ def train_meta_model_cv(
     all_predictions = pd.concat(all_fold_predictions, ignore_index=True)
     all_predictions.to_csv(out_dir / "cv_all_predictions.csv", index=False)
     
-    # Calculate aggregate metrics
+    # Calculate aggregate metrics using the stored predictions
+    # Don't pass a model, pass the predictions directly
     aggregate_metrics = score_meta_model(
-        None,  # No model needed, we use stored predictions
-        all_predictions["y_pred"].values,
-        all_predictions["y_true"].values,
+        None,  # No model needed
+        all_predictions["y_pred"].values,  # Pass predictions as x
+        all_predictions["y_true"].values,  # Pass true labels as y
         args.task
     )
     
@@ -1698,7 +1709,6 @@ def train_meta_model_cv(
         "selected_questions": top_questions,
         "question_importance": question_importance_agg.to_dict()
     }
-
 
 def main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir):
     """Run CV-only training when test_frac == 0"""
