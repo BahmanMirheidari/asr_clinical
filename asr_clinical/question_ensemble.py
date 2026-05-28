@@ -46,6 +46,10 @@ from sklearn.base import ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+# Also add a cache directory to avoid redownloading
+import os
+os.environ['HF_HOME'] = '/home/bahman/.cache/huggingface'
+os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers'
 
 # ----------------------------------------------------------------------
 #  Utility Functions
@@ -426,12 +430,12 @@ def objective_function_all_questions(
     """Objective function that averages performance across ALL questions."""
     
     params = {
-        "learning_rate": trial.suggest_float("learning_rate", 5e-6, 5e-5, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [8, 16, 32]),
-        "epochs": trial.suggest_int("epochs", 2, 5),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),  # Narrowed range
+        "batch_size": trial.suggest_categorical("batch_size", [4, 8]),  # Smaller batch sizes
+        "epochs": trial.suggest_int("epochs", 1, 3),  # Fewer epochs for HPO
         "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.2),
-        "max_length": trial.suggest_categorical("max_length", [128, 256, 384]),
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
+        "max_length": trial.suggest_categorical("max_length", [128, 256]),  # Reduced options
     }
     
     print(f"\nTrial {trial.number}: testing {params}")
@@ -445,120 +449,188 @@ def objective_function_all_questions(
             q_fold_train = fold_train[fold_train["question_id"] == question].reset_index(drop=True)
             q_fold_val = fold_val[fold_val["question_id"] == question].reset_index(drop=True)
             
-            if len(q_fold_train) < 5 or len(q_fold_val) < 3:
+            # Need more samples for meaningful training
+            if len(q_fold_train) < 10 or len(q_fold_val) < 3:
+                print(f"  Skipping {question}: train={len(q_fold_train)}, val={len(q_fold_val)} (insufficient data)")
                 continue
             
             temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}_{question}"
-            temp_cfg = TrainConfig(
-                asr_file=args.asr_file,
-                demo_file=args.demo_file,
-                target_column=args.target_column,
-                task=args.task,
-                output_dir=str(temp_out),
-                model_name=args.model_name,
-                text_mode="question",
-                aggregate_level="speaker",
-                num_folds=1,
-                test_size=0.0,
-                final_dev_size=0.0,
-                seed=args.seed + trial.number + fold_idx,
-                max_length=params["max_length"],
-                batch_size=params["batch_size"],
-                eval_batch_size=params["batch_size"],
-                epochs=params["epochs"],
-                learning_rate=params["learning_rate"],
-                weight_decay=params["weight_decay"],
-                warmup_ratio=params["warmup_ratio"],
-                patience=args.patience,
-                class_weights=args.class_weights,
-                loss=args.loss,
-                focal_gamma=args.focal_gamma,
-                filter_questions=[question],
-                min_text_chars=args.min_text_chars,
-            )
             
-            metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
+            # Add retry logic for rate limiting
+            max_retries = 3
+            metrics = None
+            for retry in range(max_retries):
+                try:
+                    temp_cfg = TrainConfig(
+                        asr_file=args.asr_file,
+                        demo_file=args.demo_file,
+                        target_column=args.target_column,
+                        task=args.task,
+                        output_dir=str(temp_out),
+                        model_name=args.model_name,
+                        text_mode="question",
+                        aggregate_level="speaker",
+                        num_folds=1,
+                        test_size=0.0,
+                        final_dev_size=0.0,
+                        seed=args.seed + trial.number + fold_idx + retry,
+                        max_length=params["max_length"],
+                        batch_size=params["batch_size"],
+                        eval_batch_size=params["batch_size"],
+                        epochs=params["epochs"],
+                        learning_rate=params["learning_rate"],
+                        weight_decay=params["weight_decay"],
+                        warmup_ratio=params["warmup_ratio"],
+                        patience=1,  # Reduced patience for HPO
+                        class_weights=args.class_weights,
+                        loss=args.loss,
+                        focal_gamma=args.focal_gamma,
+                        filter_questions=[question],
+                        min_text_chars=args.min_text_chars,
+                    )
+                    
+                    metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
+                    if metrics is not None:
+                        break
+                        
+                except Exception as e:
+                    print(f"  Attempt {retry+1} failed for {question}: {e}")
+                    if "429" in str(e) or "Too Many Requests" in str(e):
+                        import time
+                        wait_time = (retry + 1) * 5  # 5, 10, 15 seconds
+                        print(f"  Rate limited! Waiting {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    continue
+                finally:
+                    # Clean up temp directory
+                    try:
+                        shutil.rmtree(temp_out)
+                    except:
+                        pass
             
             if metrics is not None:
                 score = primary_score(metrics, args.task)
                 fold_question_scores.append(score)
-            
-            try:
-                shutil.rmtree(temp_out)
-            except:
-                pass
+                print(f"  {question}: score={score:.4f}")
+            else:
+                print(f"  {question}: FAILED to train")
         
         if fold_question_scores:
             fold_avg_score = np.mean(fold_question_scores)
             all_question_scores.append(fold_avg_score)
+            print(f"Fold {fold_idx} average score: {fold_avg_score:.4f}")
             trial.report(np.mean(all_question_scores), fold_idx)
             
             if trial.should_prune():
                 raise optuna.TrialPruned()
     
     if not all_question_scores:
+        print(f"Trial {trial.number}: No valid scores - returning -inf")
         return float('-inf')
     
-    return np.mean(all_question_scores)
+    final_score = np.mean(all_question_scores)
+    print(f"Trial {trial.number} final score: {final_score:.4f}")
+    return final_score
+
+def download_with_retry(model_name: str, max_retries: int = 5):
+    """Download model with retry logic for rate limiting."""
+    from transformers import AutoConfig
+    import time
+    
+    for retry in range(max_retries):
+        try:
+            # Try to load the config first
+            config = AutoConfig.from_pretrained(model_name)
+            return config
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                wait_time = (retry + 1) * 10  # 10, 20, 30, 40, 50 seconds
+                print(f"Rate limited! Waiting {wait_time} seconds before retry {retry+1}/{max_retries}...")
+                time.sleep(wait_time)
+            else:
+                raise e
+    raise Exception(f"Failed to download {model_name} after {max_retries} retries")
+
 
 
 def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict) -> dict | None:
-    """Fast training and evaluation for hyperparameter search."""
+    """Fast training and evaluation for hyperparameter search with caching."""
     from transformers import AutoModelForSequenceClassification
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
-
+    
+    # Create a cache key based on the data and config
+    cache_key = f"{hash(frozenset(train_df['utterance_id']))}_{cfg.learning_rate}_{cfg.batch_size}_{cfg.epochs}"
+    cache_path = Path(cfg.output_dir) / f"cache_{cache_key}.pkl"
+    
+    # Check cache
+    if cache_path.exists():
+        try:
+            return joblib.load(cache_path)
+        except:
+            pass
+    
     model_dir = Path(cfg.output_dir) / "model"
     if not (model_dir.exists() and saved_model_exists(model_dir)):
         try:
             train_one_fold(train_df, val_df, cfg, metadata, Path(cfg.output_dir))
-        except Exception:
+        except Exception as e:
+            print(f"Training failed: {e}")
             return None
 
-    device = choose_device()
-    tokenizer = load_tokenizer(str(model_dir))
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
-    model.eval()
+    try:
+        device = choose_device()
+        tokenizer = load_tokenizer(str(model_dir))
+        model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+        model.eval()
 
-    texts = val_df["text"].tolist()
-    labels = val_df["label"].values
-    preds = []
-    batch_size = cfg.eval_batch_size
+        texts = val_df["text"].tolist()
+        labels = val_df["label"].values
+        preds = []
+        batch_size = min(cfg.eval_batch_size, len(texts))  # Ensure batch size doesn't exceed data size
 
-    with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            batch_texts = texts[start:start+batch_size]
-            enc = tokenizer(
-                batch_texts,
-                truncation=True,
-                padding=True,
-                max_length=cfg.max_length,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
-            outputs = model(**enc)
-            logits = outputs.logits.cpu().numpy()
-            
-            if cfg.task == "classification":
-                batch_preds = np.argmax(logits, axis=1)
-                preds.extend(batch_preds)
-            else:
-                if logits.ndim == 2 and logits.shape[1] == 1:
-                    batch_preds = logits[:, 0]
+        with torch.no_grad():
+            for start in range(0, len(texts), batch_size):
+                batch_texts = texts[start:start+batch_size]
+                enc = tokenizer(
+                    batch_texts,
+                    truncation=True,
+                    padding=True,
+                    max_length=cfg.max_length,
+                    return_tensors="pt",
+                )
+                enc = {k: v.to(device) for k, v in enc.items()}
+                outputs = model(**enc)
+                logits = outputs.logits.cpu().numpy()
+                
+                if cfg.task == "classification":
+                    batch_preds = np.argmax(logits, axis=1)
+                    preds.extend(batch_preds)
                 else:
-                    batch_preds = logits.flatten()
-                preds.extend(batch_preds.tolist())
+                    if logits.ndim == 2 and logits.shape[1] == 1:
+                        batch_preds = logits[:, 0]
+                    else:
+                        batch_preds = logits.flatten()
+                    preds.extend(batch_preds.tolist())
 
-    preds = np.array(preds)
-    labels = np.array(labels)
-    
-    if len(preds) != len(labels):
+        preds = np.array(preds)
+        labels = np.array(labels)
+        
+        if len(preds) != len(labels):
+            return None
+        
+        if cfg.task == "classification":
+            result = {"macro_f1": f1_score(labels, preds, average="macro", zero_division=0)}
+        else:
+            result = {"rmse": np.sqrt(mean_squared_error(labels, preds))}
+        
+        # Save to cache
+        joblib.dump(result, cache_path)
+        return result
+        
+    except Exception as e:
+        print(f"Evaluation failed: {e}")
         return None
-    
-    if cfg.task == "classification":
-        return {"macro_f1": f1_score(labels, preds, average="macro", zero_division=0)}
-    else:
-        return {"rmse": np.sqrt(mean_squared_error(labels, preds))}
 
 
 # ----------------------------------------------------------------------
@@ -1188,6 +1260,78 @@ def permutation_question_importance(model, val_df, feature_cols, args):
     
     return pd.DataFrame(rows).sort_values("importance", ascending=False)
 
+import shap
+
+def shap_question_importance(model, train_df, val_df, feature_cols, args):
+    """Calculate question importance using SHAP values."""
+    # Get feature names
+    feature_names = feature_cols
+    
+    # Get feature groups by question
+    groups = question_groups(feature_cols)
+    
+    # Create a SHAP explainer
+    if args.task == "classification":
+        # For classification models
+        if hasattr(model, "predict_proba"):
+            explainer = shap.Explainer(model.predict_proba, train_df[feature_cols].to_numpy())
+            shap_values = explainer(val_df[feature_cols].to_numpy())
+            # For binary classification, take SHAP values for positive class
+            shap_values_array = shap_values.values[:, :, 1] if len(shap_values.values.shape) == 3 else shap_values.values
+        else:
+            explainer = shap.Explainer(model.predict, train_df[feature_cols].to_numpy())
+            shap_values = explainer(val_df[feature_cols].to_numpy())
+            shap_values_array = shap_values.values
+    else:
+        # For regression
+        explainer = shap.Explainer(model.predict, train_df[feature_cols].to_numpy())
+        shap_values = explainer(val_df[feature_cols].to_numpy())
+        shap_values_array = shap_values.values
+    
+    # Aggregate SHAP values by question
+    rows = []
+    for q, cols in groups.items():
+        # Find indices of features belonging to this question
+        col_indices = [feature_cols.index(c) for c in cols if c in feature_cols]
+        if not col_indices:
+            continue
+        
+        # Calculate mean absolute SHAP value for this question's features
+        shap_importance = np.mean(np.abs(shap_values_array[:, col_indices]))
+        
+        rows.append({
+            "question_id": q,
+            "shap_importance": float(shap_importance),
+            "n_features": len(col_indices)
+        })
+    
+    importance_df = pd.DataFrame(rows).sort_values("shap_importance", ascending=False)
+    return importance_df
+
+
+def permutation_question_importance_shap_hybrid(model, train_df, val_df, feature_cols, args):
+    """
+    Hybrid approach: Use permutation importance for feature selection,
+    but also compute SHAP values for interpretation.
+    """
+    # First get permutation importance (as in your original code)
+    perm_importance = permutation_question_importance(model, val_df, feature_cols, args)
+    
+    # Then compute SHAP values for the top features
+    try:
+        shap_importance = shap_question_importance(model, train_df, val_df, feature_cols, args)
+        
+        # Merge both metrics
+        merged = perm_importance.merge(shap_importance, on="question_id", how="left")
+        
+        # Save SHAP values
+        merged.to_csv(Path(args.output_dir) / "shap_question_importance.csv", index=False)
+        
+        return merged
+    except Exception as e:
+        print(f"SHAP computation failed: {e}")
+        return perm_importance
+
 
 def score_meta_model(model, x, y, task):
     """
@@ -1334,7 +1478,6 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         "test_metrics": test_metrics
     }
 
-
 # ----------------------------------------------------------------------
 #  Parser Setup
 # ----------------------------------------------------------------------
@@ -1393,6 +1536,7 @@ def build_parser():
     parser.add_argument("--logreg-C", type=float, default=1.0)
     parser.add_argument("--ridge-alpha", type=float, default=1.0)
     parser.add_argument("--svm-kernel", choices=["linear", "rbf", "poly", "sigmoid"], default="rbf")
+    parser.add_argument("--importance", choices=["shap", "permutation", "hybrid"], default="permutation")
     parser.add_argument("--svm-C", type=float, default=1.0)
     parser.add_argument("--svm-gamma", default="scale")
     parser.add_argument("--svm-epsilon", type=float, default=0.1)
@@ -1456,11 +1600,20 @@ def train_meta_model_cv(
         # Train base model for importance calculation
         base_model = make_meta_model(args)
         base_model.fit(fold_train[feature_cols].to_numpy(), fold_train["y_true"].to_numpy())
-        
+
         # Calculate question importance for this fold
-        importance_df = permutation_question_importance(
-            base_model, fold_val, feature_cols, args
-        )
+        if args.importance == "shap":
+            importance_df = shap_question_importance(
+                base_model, fold_val, feature_cols, args
+            )
+        elif args.importance == "hybrid":
+            importance_df = permutation_question_importance_shap_hybrid(
+                base_model, fold_val, feature_cols, args
+            )
+        else: 
+            importance_df = permutation_question_importance(
+                base_model, fold_val, feature_cols, args
+            )
         importance_df["fold"] = fold_idx
         fold_importance_dfs.append(importance_df)
         
@@ -1768,18 +1921,35 @@ def main():
     final_train, final_val, final_test = split_mgr.get_final_splits(df)
     print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
     
-    # Hyperparameter search on ALL questions
+    # Define best_hparams_path BEFORE using it
     best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
+    
+    # Hyperparameter search on ALL questions
     if best_hparams_path.exists() and not args.force_hpo:
         best_hparams = json.loads(best_hparams_path.read_text())
         print(f"Loaded best hyperparameters from {best_hparams_path}")
+        print(f"Best parameters: {best_hparams}")
     else:
-        best_hparams = hyperparameter_search_optuna_all_questions(
-            final_train, split_mgr, args, metadata, final_test
-        )
-        best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
+        try:
+            best_hparams = hyperparameter_search_optuna_all_questions(
+                final_train, split_mgr, args, metadata, final_test
+            )
+            best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
+            print(f"Saved best hyperparameters to {best_hparams_path}")
+        except Exception as e:
+            print(f"HPO failed: {e}")
+            print("Using default hyperparameters")
+            best_hparams = {
+                "learning_rate": args.learning_rate,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "weight_decay": args.weight_decay,
+                "warmup_ratio": args.warmup_ratio,
+                "max_length": args.max_length,
+            }
+            print(f"Default parameters: {best_hparams}")
     
-    # Update args
+    # Update args with best hyperparameters
     args.learning_rate = best_hparams["learning_rate"]
     args.batch_size = best_hparams["batch_size"]
     args.epochs = best_hparams["epochs"]
@@ -1796,7 +1966,7 @@ def main():
     available_qs = list(embedding_files["train"].keys())
     train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
     val_features, _ = build_feature_table(embedding_files["val"], available_qs)
-
+    
     # Handle test features carefully
     test_features = None
     if args.test_frac > 0:
@@ -1804,9 +1974,16 @@ def main():
     else:
         print("test_frac=0: No test features will be created")
         # Create empty test_features with same structure as train_features but no rows
-        test_features = pd.DataFrame(columns=train_features.columns)
-
-    # Align features
+        if train_features is not None and not train_features.empty:
+            test_features = pd.DataFrame(columns=train_features.columns)
+        else:
+            test_features = pd.DataFrame()
+    
+    # Save raw feature tables
+    train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
+    val_features.to_csv(out_dir / "meta_val_features.csv", index=False)
+    
+    # Align feature columns
     if test_features is not None and not test_features.empty:
         train_features, val_features, test_features = align_feature_tables(
             train_features, val_features, test_features, feature_cols
@@ -1816,10 +1993,6 @@ def main():
         train_features, val_features, _ = align_feature_tables(
             train_features, val_features, pd.DataFrame(), feature_cols
         )
-    
-    # Save raw feature tables
-    train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
-    val_features.to_csv(out_dir / "meta_val_features.csv", index=False)
     
     # Choose training path based on test_frac
     if args.test_frac == 0:
@@ -1848,6 +2021,10 @@ def main():
             print(f"Models in ensemble: {args.ensemble_models}")
             print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
             print(f"Ensemble saved to: {out_dir / 'meta_model.joblib'}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
