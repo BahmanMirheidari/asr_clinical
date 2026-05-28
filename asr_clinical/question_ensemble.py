@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shap
 import lightgbm as lgb 
 import argparse
 import json
@@ -1260,54 +1261,74 @@ def permutation_question_importance(model, val_df, feature_cols, args):
     
     return pd.DataFrame(rows).sort_values("importance", ascending=False)
 
-import shap
-
 def shap_question_importance(model, train_df, val_df, feature_cols, args):
-    """Calculate question importance using SHAP values."""
-    # Get feature names
-    feature_names = feature_cols
+    """SHAP analysis that actually works with small datasets."""
     
-    # Get feature groups by question
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import Ridge
+    import warnings
+    warnings.filterwarnings('ignore')
+    
+    print(f"  SHAP analysis with {len(feature_cols)} features...")
+    
+    n_samples = len(train_df)
+    
+    # CRITICAL: Use at most min(10, n_samples-1) components for stability
+    n_components = min(10, n_samples - 1, len(feature_cols))
+    print(f"  Using {n_components} PCA components (samples: {n_samples})")
+    
+    # Apply PCA
+    pca = PCA(n_components=n_components, random_state=args.seed)
+    train_reduced = pca.fit_transform(train_df[feature_cols].to_numpy())
+    val_reduced = pca.transform(val_df[feature_cols].to_numpy())
+    
+    print(f"  Explained variance: {pca.explained_variance_ratio_.sum():.3f}")
+    
+    # Train a SIMPLE linear model on reduced features (not ensemble)
+    from sklearn.linear_model import Ridge
+    simple_model = Ridge(alpha=1.0, random_state=args.seed)
+    simple_model.fit(train_reduced, train_df["y_true"].to_numpy())
+    
+    print(f"  Simple model R²: {simple_model.score(val_reduced, val_df['y_true'].to_numpy()):.3f}")
+    
+    # Use LinearExplainer (fast, stable, works with small data)
+    print("  Creating LinearExplainer...")
+    explainer = shap.LinearExplainer(simple_model, train_reduced)
+    
+    # Explain validation samples
+    n_explain = min(20, len(val_reduced))
+    val_sample = val_reduced[:n_explain]
+    
+    print(f"  Computing SHAP values for {n_explain} samples...")
+    shap_values = explainer.shap_values(val_sample)
+    
+    # Get mean absolute SHAP per PCA component
+    pca_importance = np.abs(shap_values).mean(axis=0)
+    
+    # Project back to original features
+    feature_importance = np.abs(pca.components_.T @ pca_importance)
+    
+    # Aggregate by question
     groups = question_groups(feature_cols)
-    
-    # Create a SHAP explainer
-    if args.task == "classification":
-        # For classification models
-        if hasattr(model, "predict_proba"):
-            explainer = shap.Explainer(model.predict_proba, train_df[feature_cols].to_numpy())
-            shap_values = explainer(val_df[feature_cols].to_numpy())
-            # For binary classification, take SHAP values for positive class
-            shap_values_array = shap_values.values[:, :, 1] if len(shap_values.values.shape) == 3 else shap_values.values
-        else:
-            explainer = shap.Explainer(model.predict, train_df[feature_cols].to_numpy())
-            shap_values = explainer(val_df[feature_cols].to_numpy())
-            shap_values_array = shap_values.values
-    else:
-        # For regression
-        explainer = shap.Explainer(model.predict, train_df[feature_cols].to_numpy())
-        shap_values = explainer(val_df[feature_cols].to_numpy())
-        shap_values_array = shap_values.values
-    
-    # Aggregate SHAP values by question
     rows = []
-    for q, cols in groups.items():
-        # Find indices of features belonging to this question
-        col_indices = [feature_cols.index(c) for c in cols if c in feature_cols]
-        if not col_indices:
-            continue
-        
-        # Calculate mean absolute SHAP value for this question's features
-        shap_importance = np.mean(np.abs(shap_values_array[:, col_indices]))
-        
-        rows.append({
-            "question_id": q,
-            "shap_importance": float(shap_importance),
-            "n_features": len(col_indices)
-        })
+    feature_to_idx = {c: i for i, c in enumerate(feature_cols)}
     
-    importance_df = pd.DataFrame(rows).sort_values("shap_importance", ascending=False)
+    for q, cols in groups.items():
+        col_indices = [feature_to_idx[c] for c in cols if c in feature_to_idx]
+        if col_indices:
+            importance = np.sum(feature_importance[col_indices])
+            rows.append({
+                "question_id": q,
+                "importance": float(importance),
+                "importance_std": 0.0,
+                "n_features": len(col_indices)
+            })
+    
+    importance_df = pd.DataFrame(rows).sort_values("importance", ascending=False)
+    print(f"  SHAP importance computed for {len(importance_df)} questions")
+    print(f"  Top 5 questions: {importance_df.head(5)['question_id'].tolist()}")
+    
     return importance_df
-
 
 def permutation_question_importance_shap_hybrid(model, train_df, val_df, feature_cols, args):
     """
@@ -1604,11 +1625,12 @@ def train_meta_model_cv(
         # Calculate question importance for this fold
         if args.importance == "shap":
             importance_df = shap_question_importance(
-                base_model, fold_val, feature_cols, args
+                base_model, fold_train, fold_val, feature_cols, args
             )
+
         elif args.importance == "hybrid":
             importance_df = permutation_question_importance_shap_hybrid(
-                base_model, fold_val, feature_cols, args
+                base_model, fold_train, fold_val, feature_cols, args
             )
         else: 
             importance_df = permutation_question_importance(
@@ -2025,10 +2047,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-if __name__ == "__main__":
-    main() 
+ 
 '''
 1. Multiple Meta-Model Options:
 linear - Logistic Regression (classification) / Ridge (regression)
