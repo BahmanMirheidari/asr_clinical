@@ -1230,11 +1230,12 @@ def question_groups(feature_cols):
     return groups
 
 
-def permutation_question_importance(model, val_df, feature_cols, args):
+def permutation_question_importance(model, data_df, feature_cols, args):
     """Calculate feature importance by permuting all features from each question."""
-    x_val = val_df[feature_cols].to_numpy()
-    y_val = val_df["y_true"].to_numpy()
-    base_metrics = score_meta_model(model, x_val, y_val, args.task)
+    # This version works with a single dataset (no separate validation set)
+    x_data = data_df[feature_cols].to_numpy()
+    y_data = data_df["y_true"].to_numpy()
+    base_metrics = score_meta_model(model, x_data, y_data, args.task)
     base_score = primary_score(base_metrics, args.task)
     groups = question_groups(feature_cols)
     rng = np.random.RandomState(args.seed)
@@ -1245,11 +1246,11 @@ def permutation_question_importance(model, val_df, feature_cols, args):
         indices = [col_to_idx[c] for c in cols]
         drops = []
         for _ in range(args.permutation_repeats):
-            x_perm = x_val.copy()
+            x_perm = x_data.copy()
             shuffled = x_perm[:, indices].copy()
             rng.shuffle(shuffled)
             x_perm[:, indices] = shuffled
-            m = score_meta_model(model, x_perm, y_val, args.task)
+            m = score_meta_model(model, x_perm, y_data, args.task)
             perm_score = primary_score(m, args.task)
             drops.append(base_score - perm_score)
         rows.append({
@@ -1497,6 +1498,199 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         "best_k": best_k,
         "best_val_primary_score": best_val_score,
         "test_metrics": test_metrics
+    }
+
+
+def train_meta_model_with_cv_selection(
+    train_features, val_features, test_features, feature_cols, args, out_dir: Path
+):
+    """Train meta-model with CV-based K selection, then evaluate on test set."""
+    
+    # Combine train and val for CV-based selection
+    trainval_features = pd.concat([train_features, val_features], ignore_index=True)
+    
+    # Create CV splits based on speakers
+    speakers = trainval_features.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers, speakers["label"]))
+    else:
+        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers))
+    
+    # Calculate question importance using all training+validation data
+    print("\nCalculating question importance on full training+validation data...")
+    base_model = make_meta_model(args)
+    base_model.fit(trainval_features[feature_cols].to_numpy(), trainval_features["y_true"].to_numpy())
+    
+    if args.importance == "shap":
+        importance_df = shap_question_importance(
+            base_model, trainval_features, trainval_features, feature_cols, args
+        )
+    elif args.importance == "hybrid":
+        importance_df = permutation_question_importance_shap_hybrid(
+            base_model, trainval_features, trainval_features, feature_cols, args
+        )
+    else:  # permutation
+        # Need to create a wrapper for permutation that works without val set
+        importance_df = permutation_question_importance(
+            base_model, trainval_features, feature_cols, args
+        )
+    
+    importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
+    questions_ranked = importance_df["question_id"].tolist()
+    
+    # Cross-validation to find best K
+    print(f"\n{'='*60}")
+    print(f"Cross-validating to find best K (using {args.n_cv_folds} folds)")
+    print(f"{'='*60}")
+    
+    ks = list(range(1, len(questions_ranked) + 1))
+    if args.top_k and 0 < args.top_k < len(questions_ranked):
+        ks = sorted(set(ks + [args.top_k]))
+    
+    # Store CV results for each K
+    cv_results_by_k = {k: [] for k in ks}
+    
+    for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
+        train_speakers = speakers.iloc[train_speaker_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_speaker_idx]["speaker_id"].values
+        
+        fold_train = trainval_features[trainval_features["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val = trainval_features[trainval_features["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        print(f"\nFold {fold_idx + 1}/{args.n_cv_folds}: Train={len(fold_train)}, Val={len(fold_val)}")
+        
+        for k in ks:
+            selected_qs = questions_ranked[:k]
+            selected_cols = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs)]
+            
+            if not selected_cols:
+                cv_results_by_k[k].append(float('-inf'))
+                continue
+            
+            # Train on fold training data
+            model = make_meta_model(args)
+            model.fit(fold_train[selected_cols].to_numpy(), fold_train["y_true"].to_numpy())
+            
+            # Evaluate on fold validation data
+            metrics = score_meta_model(
+                model,
+                fold_val[selected_cols].to_numpy(),
+                fold_val["y_true"].to_numpy(),
+                args.task
+            )
+            
+            score = primary_score(metrics, args.task)
+            cv_results_by_k[k].append(score)
+            print(f"  K={k}: score={score:.4f}")
+    
+    # Find best K based on mean CV score
+    best_k = None
+    best_mean_score = -float('inf')
+    k_scores = {}
+    
+    for k, scores in cv_results_by_k.items():
+        if scores and not all(s == float('-inf') for s in scores):
+            mean_score = np.mean(scores)
+            std_score = np.std(scores)
+            k_scores[k] = {"mean": mean_score, "std": std_score, "all_scores": scores}
+            
+            print(f"\nK={k}: mean CV score={mean_score:.4f} (+/- {std_score:.4f})")
+            
+            if mean_score > best_mean_score:
+                best_mean_score = mean_score
+                best_k = k
+    
+    if best_k is None:
+        print("Warning: Could not determine best K, using K=1")
+        best_k = 1
+    
+    print(f"\n{'='*60}")
+    print(f"BEST K SELECTED: {best_k} (CV mean score: {best_mean_score:.4f})")
+    print(f"{'='*60}")
+    
+    # Save CV results
+    cv_summary = []
+    for k, info in k_scores.items():
+        cv_summary.append({
+            "k": k,
+            "mean_cv_score": info["mean"],
+            "std_cv_score": info["std"],
+            "is_best": k == best_k
+        })
+    pd.DataFrame(cv_summary).to_csv(out_dir / "cv_k_selection_results.csv", index=False)
+    
+    # Now train final model on ALL training+validation data with best_k
+    selected_qs_final = questions_ranked[:best_k]
+    selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
+    
+    print(f"\nTraining final model on all training+validation data with K={best_k}")
+    print(f"Selected questions: {selected_qs_final}")
+    print(f"Number of features: {len(selected_cols_final)}")
+    
+    final_model = make_meta_model(args)
+    final_model.fit(
+        trainval_features[selected_cols_final].to_numpy(),
+        trainval_features["y_true"].to_numpy()
+    )
+    
+    # Evaluate on held-out test set
+    test_metrics = score_meta_model(
+        final_model,
+        test_features[selected_cols_final].to_numpy(),
+        test_features["y_true"].to_numpy(),
+        args.task
+    )
+    
+    print("\nFinal test metrics:")
+    print(json.dumps(test_metrics, indent=2))
+    
+    # Save results
+    out_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_model, out_dir / "meta_model.joblib")
+    pd.DataFrame({"question_id": selected_qs_final}).to_csv(out_dir / "selected_questions.csv", index=False)
+    pd.DataFrame({"feature": selected_cols_final}).to_csv(out_dir / "selected_embedding_features.csv", index=False)
+    with open(out_dir / "meta_test_metrics.json", "w") as f:
+        json.dump(test_metrics, f, indent=2)
+    
+    # Save predictions
+    preds = final_model.predict(test_features[selected_cols_final].to_numpy())
+    out_df = test_features[["speaker_id", "y_true"]].copy()
+    out_df["y_pred"] = preds
+    
+    if args.task == "classification":
+        if hasattr(final_model, "predict_proba"):
+            try:
+                probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
+                classes = final_model.classes_
+                for i, cls in enumerate(classes):
+                    out_df[f"prob_{cls}"] = probs[:, i]
+            except:
+                print("Warning: Could not get probabilities")
+    
+    out_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
+    
+    # Save ensemble info if used
+    if getattr(args, 'use_ensemble', False):
+        ensemble_info = {
+            "use_ensemble": True,
+            "ensemble_models": getattr(args, 'ensemble_models', []),
+            "voting_type": "soft" if args.task == "classification" else "average",
+            "best_k": best_k,
+            "best_cv_score": best_mean_score,
+            "selected_questions": selected_qs_final
+        }
+        with open(out_dir / "ensemble_config.json", "w") as f:
+            json.dump(ensemble_info, f, indent=2)
+    
+    return {
+        "best_k": best_k,
+        "best_cv_score": best_mean_score,
+        "test_metrics": test_metrics,
+        "cv_results_by_k": k_scores
     }
 
 # ----------------------------------------------------------------------
@@ -1912,6 +2106,7 @@ def main_with_cv(args, train_features, val_features, test_features, feature_cols
         print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
         print(f"Final CV model saved to: {out_dir / 'final_cv_model.joblib'}") 
 
+
 def main():
     args = build_parser().parse_args()
     set_seed(args.seed)
@@ -2016,7 +2211,9 @@ def main():
             train_features, val_features, pd.DataFrame(), feature_cols
         )
     
-    # Choose training path based on test_frac
+    # ============================================================
+    # CHOOSE TRAINING PATH BASED ON test_frac
+    # ============================================================
     if args.test_frac == 0:
         # Cross-validation only (no held-out test set)
         main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir)
@@ -2024,11 +2221,14 @@ def main():
         # Standard training with held-out test set
         test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
         
-        # Train meta-model (single or ensemble)
-        results = train_meta_model(
+        # Train meta-model WITH CV-based K selection (UPDATED)
+        results = train_meta_model_with_cv_selection(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
         
+        # ============================================================
+        # THESE PRINT STATEMENTS ARE IN THE ELSE PART
+        # ============================================================
         print("\n===== Final Results =====")
         print(json.dumps(results, indent=2))
         
@@ -2047,7 +2247,7 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
+
 '''
 1. Multiple Meta-Model Options:
 linear - Logistic Regression (classification) / Ridge (regression)
