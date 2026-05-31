@@ -2311,4 +2311,64 @@ python train.py --use-ensemble \
 
 ✅ Default 20 trials - Faster hyperparameter search
 
+
+Pipeline Overview (with Nested Cross‑Validation)
+1. Speaker‑Level Data Splitting
+The full dataset is split into train+val (90%) and test (10%) using speaker‑level stratification (StratifiedShuffleSplit for classification, ShuffleSplit for regression).
+
+The test set is locked away and never used until final evaluation.
+
+From the 90% train+val portion, a further speaker‑level split creates a validation set (10% of the original) and the actual training set (80% of original). This validation set is used for early stopping and feature selection.
+
+2. Nested Cross‑Validation for Hyperparameter Optimisation (HPO)
+The pipeline uses a nested CV strategy to avoid overfitting when tuning the per‑question Transformer models:
+
+Inner CV (Optuna):
+For each trial, a K‑fold cross‑validation (default 3 folds) is performed on the train+val data (90% of the original).
+
+Each fold respects speaker‑level grouping.
+
+The model is trained on fold_train and evaluated on fold_val for all questions simultaneously.
+
+The primary metric (macro F1 for classification, negative RMSE for regression) is averaged across folds and questions.
+
+This average guides the Optuna sampler (TPE) to propose new hyperparameter sets.
+
+The search yields optimal hyperparameters (learning rate, batch size, epochs, etc.) without ever touching the final test set.
+
+No outer CV on the test set:
+The test set is only used once at the very end for final evaluation, ensuring unbiased generalisation estimates.
+
+3. Per‑Question Model Training (with Best Hyperparameters)
+Using the optimal hyperparameters from Step 2, a separate Transformer model is trained for each question on the training portion (80% of original) and validated on the validation set (10% of original).
+
+Early stopping prevents overfitting.
+
+For each trained model, embeddings are extracted from the last hidden layer (mean‑pooled over tokens) for all splits (train, val, test).
+
+4. Meta‑Model Feature Construction
+For each speaker, embeddings from each question are averaged, producing a feature vector:
+[Q1_emb1, Q1_emb2, …, Q2_emb1, …] plus a present flag per question.
+
+The resulting tables for train, val, and test are merged and aligned.
+
+5. Meta‑Model Training with Embedded Feature Selection
+A base meta‑model (e.g., Logistic Regression, Random Forest, or an ensemble) is trained on the train features to compute permutation importance per question.
+
+Questions are ranked by importance, and a top‑k selection is performed using the validation set – the k that maximises the primary score on the validation set is chosen.
+
+Finally, the meta‑model is retrained on the combined train+val features (90% of original data) using only the selected top‑k question embeddings.
+
+6. Final Evaluation on the Held‑Out Test Set
+The final meta‑model is evaluated once on the test features (10% of original data).
+
+Metrics are saved, and predictions (with probabilities for classification) are written to disk.
+
+Why Nested Cross‑Validation?
+Level   Purpose Data Used
+Inner CV    Tune per‑question Transformer hyperparameters   Train+val (90%) – cross‑validation splits
+Validation set  Select top‑k questions and early stop   Separate validation set (10% of original)
+Test set    Final, unbiased performance estimate    Held‑out 10% – used only once
+This design prevents any information from the test set leaking into model selection or hyperparameter tuning, giving you a trustworthy estimate of real‑world performance.
+
 '''
