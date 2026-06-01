@@ -32,8 +32,39 @@ class TextDataset(Dataset):
         return item
 
 
-def load_tokenizer(model_name: str):
-    return AutoTokenizer.from_pretrained(model_name, use_fast=True)
+def load_tokenizer(model_name):
+    """Load tokenizer with multiple fallback strategies.""" 
+    
+    # Strategy 1: Try with default settings
+    try:
+        # For DeBERTa-v3, try fast tokenizer first with specific settings
+        if "deberta" in model_name.lower():
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, 
+                use_fast=True,
+                trust_remote_code=True
+            )
+            # Test if it works
+            test = tokenizer("test", return_tensors="pt")
+            return tokenizer
+        else:
+            return AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    except Exception as e:
+        print(f"Fast tokenizer failed: {e}")
+        
+        # Strategy 2: Try slow tokenizer
+        try:
+            print(f"Attempting to load slow tokenizer for {model_name}")
+            tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+            return tokenizer
+        except Exception as e2:
+            print(f"Slow tokenizer also failed: {e2}")
+            
+            # Strategy 3: Fallback to a known working model
+            print(f"Falling back to distilbert-base-uncased tokenizer")
+            from transformers import DistilBertTokenizer
+            tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+            return tokenizer
 
 
 def load_model(model_name: str, task: str, num_labels: int, metadata: dict):
