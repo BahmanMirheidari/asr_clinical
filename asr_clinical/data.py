@@ -46,7 +46,7 @@ def parse_utterance_id(utterance_id: str) -> tuple[str, str, str]:
 
     return speaker_id, session_id, question_id    
 
-def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = False) -> pd.DataFrame:
+def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = False, verbose: bool = False) -> pd.DataFrame:
     """
     Read ASR transcript file with flexible delimiter support.
     
@@ -75,16 +75,19 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                 
                 # Skip empty rows
                 if not row:
-                    print(f"Line {line_count}: Empty row, skipping")
+                    if verbose:
+                        print(f"Line {line_count}: Empty row, skipping")
                     continue
                 
                 # Skip header if requested
                 if has_header and line_count == 1:
-                    print(f"Line {line_count}: Skipping header: {row}")
+                    if verbose:
+                        print(f"Line {line_count}: Skipping header: {row}")
                     continue
                 
                 if len(row) < 2:
-                    print(f"Line {line_count}: Not enough columns ({len(row)}), skipping: {row}")
+                    if verbose:
+                        print(f"Line {line_count}: Not enough columns ({len(row)}), skipping: {row}")
                     continue
                 
                 utt_id = row[0].strip()
@@ -92,10 +95,11 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                 
                 # Skip header-like IDs
                 if utt_id.lower() in {"utt_id", "utterance_id", "id"}:
-                    print(f"Line {line_count}: Skipping header-like ID: {utt_id}")
+                    if verbose:
+                        print(f"Line {line_count}: Skipping header-like ID: {utt_id}")
                     continue
-                
-                print(f"Line {line_count}: Processing ID='{utt_id}', Text='{text[:50]}...'")
+                if verbose:
+                    print(f"Line {line_count}: Processing ID='{utt_id}', Text='{text[:50]}...'")
                 
                 try:
                     speaker_id, session_id, question_id = parse_utterance_id(utt_id)
@@ -106,7 +110,8 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                         "question_id": question_id,
                         "text": text,
                     })
-                    print(f"Added row {rows[-1]}...'")
+                    if verbose:
+                        print(f"Added row {rows[-1]}...'")
                 except Exception as e:
                     print(f"Line {line_count}: Error parsing ID '{utt_id}': {e}")
                     continue
@@ -119,12 +124,14 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                 
                 # Skip empty lines
                 if not line:
-                    print(f"Line {line_count}: Empty line, skipping")
+                    if verbose:
+                        print(f"Line {line_count}: Empty line, skipping")
                     continue
                 
                 # Skip header if requested
                 if has_header and line_count == 1:
-                    print(f"Line {line_count}: Skipping header: {line}")
+                    if verbose:
+                        print(f"Line {line_count}: Skipping header: {line}")
                     continue
                 
                 # Split on the first occurrence of the delimiter
@@ -142,7 +149,8 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                         parts = line.split(":", 1)
                 
                 if len(parts) < 2:
-                    print(f"Line {line_count}: Could not split line: {line[:100]}")
+                    if verbose:
+                        print(f"Line {line_count}: Could not split line: {line[:100]}")
                     continue
                 
                 utt_id = parts[0].strip()
@@ -150,10 +158,11 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                 
                 # Skip header-like IDs
                 if utt_id.lower() in {"utt_id", "utterance_id", "id"}:
-                    print(f"Line {line_count}: Skipping header-like ID: {utt_id}")
+                    if verbose:
+                        print(f"Line {line_count}: Skipping header-like ID: {utt_id}")
                     continue
-                
-                print(f"Line {line_count}: Processing ID='{utt_id}', Text='{text[:50]}...'")
+                if verbose:            
+                    print(f"Line {line_count}: Processing ID='{utt_id}', Text='{text[:50]}...'")
                 
                 try:
                     speaker_id, session_id, question_id = parse_utterance_id(utt_id)
@@ -164,7 +173,8 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
                         "question_id": question_id,
                         "text": text,
                     })
-                    print(f"Added row {rows[-1]}...'")
+                    if verbose:
+                        print(f"Added row {rows[-1]}...'")
                 except Exception as e:
                     print(f"Line {line_count}: Error parsing ID '{utt_id}': {e}")
                     continue
