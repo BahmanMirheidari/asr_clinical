@@ -1500,11 +1500,99 @@ def train_meta_model(train_features, val_features, test_features, feature_cols, 
         "test_metrics": test_metrics
     }
 
-
 def train_meta_model_with_cv_selection(
     train_features, val_features, test_features, feature_cols, args, out_dir: Path
 ):
     """Train meta-model with CV-based K selection, then evaluate on test set."""
+    
+    # Check if CV results already exist
+    cv_results_file = out_dir / "cv_k_selection_results.csv"
+    selected_questions_file = out_dir / "selected_questions.csv"
+    meta_model_file = out_dir / "meta_model.joblib"
+    
+    if cv_results_file.exists() and selected_questions_file.exists() and meta_model_file.exists() and not args.force_hpo:
+        print(f"\n{'='*60}")
+        print("Loading existing CV k-selection results...")
+        print(f"{'='*60}")
+        
+        # Load existing results
+        cv_results = pd.read_csv(cv_results_file)
+        selected_questions_df = pd.read_csv(selected_questions_file)
+        selected_qs_final = selected_questions_df["question_id"].tolist()
+        
+        # Load the best_k value
+        best_k_row = cv_results[cv_results["is_best"] == True]
+        if not best_k_row.empty:
+            best_k = int(best_k_row.iloc[0]["k"])
+            best_mean_score = best_k_row.iloc[0]["mean_cv_score"]
+        else:
+            # If no best marked, take the one with highest mean score
+            best_k = int(cv_results.loc[cv_results["mean_cv_score"].idxmax(), "k"])
+            best_mean_score = cv_results["mean_cv_score"].max()
+        
+        print(f"Loaded best K: {best_k} (CV mean score: {best_mean_score:.4f})")
+        print(f"Loaded {len(selected_qs_final)} selected questions")
+        
+        # Build selected feature columns
+        selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
+        
+        # Check if we need to retrain the final model
+        if not meta_model_file.exists() or args.force_hpo:
+            print("Retraining final model...")
+            # Combine train and val
+            trainval_features = pd.concat([train_features, val_features], ignore_index=True)
+            
+            final_model = make_meta_model(args)
+            final_model.fit(
+                trainval_features[selected_cols_final].to_numpy(),
+                trainval_features["y_true"].to_numpy()
+            )
+            joblib.dump(final_model, meta_model_file)
+        else:
+            print("Loading existing final model...")
+            final_model = joblib.load(meta_model_file)
+        
+        # Evaluate on held-out test set
+        test_metrics = score_meta_model(
+            final_model,
+            test_features[selected_cols_final].to_numpy(),
+            test_features["y_true"].to_numpy(),
+            args.task
+        )
+        
+        print("\nFinal test metrics (loaded from existing model):")
+        print(json.dumps(test_metrics, indent=2))
+        
+        # Save predictions if they don't exist
+        predictions_file = out_dir / "meta_test_predictions.csv"
+        if not predictions_file.exists():
+            preds = final_model.predict(test_features[selected_cols_final].to_numpy())
+            out_df = test_features[["speaker_id", "y_true"]].copy()
+            out_df["y_pred"] = preds
+            
+            if args.task == "classification":
+                if hasattr(final_model, "predict_proba"):
+                    try:
+                        probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
+                        classes = final_model.classes_
+                        for i, cls in enumerate(classes):
+                            out_df[f"prob_{cls}"] = probs[:, i]
+                    except:
+                        print("Warning: Could not get probabilities")
+            
+            out_df.to_csv(predictions_file, index=False)
+        
+        return {
+            "best_k": best_k,
+            "best_cv_score": best_mean_score,
+            "test_metrics": test_metrics,
+            "loaded_from_cache": True
+        }
+    
+    # If results don't exist, run the full CV selection
+    print(f"\n{'='*60}")
+    print("No existing CV results found. Running CV k-selection...")
+    print(f"{'='*60}")
     
     # Combine train and val for CV-based selection
     trainval_features = pd.concat([train_features, val_features], ignore_index=True)
@@ -1534,7 +1622,6 @@ def train_meta_model_with_cv_selection(
             base_model, trainval_features, trainval_features, feature_cols, args
         )
     else:  # permutation
-        # Need to create a wrapper for permutation that works without val set
         importance_df = permutation_question_importance(
             base_model, trainval_features, feature_cols, args
         )
@@ -1690,7 +1777,8 @@ def train_meta_model_with_cv_selection(
         "best_k": best_k,
         "best_cv_score": best_mean_score,
         "test_metrics": test_metrics,
-        "cv_results_by_k": k_scores
+        "cv_results_by_k": k_scores,
+        "loaded_from_cache": False
     }
 
 # ----------------------------------------------------------------------
