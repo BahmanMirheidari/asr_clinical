@@ -46,7 +46,7 @@ def parse_utterance_id(utterance_id: str) -> tuple[str, str, str]:
 
     return speaker_id, session_id, question_id    
 
-def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = False, verbose: bool = False) -> pd.DataFrame:
+def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = True, verbose: bool = False) -> pd.DataFrame:
     """
     Read ASR transcript file with flexible delimiter support.
     
@@ -54,7 +54,7 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Fal
         path: Path to the transcript file
         delimiter: Delimiter between utterance ID and text. 
                    If not ";", assumes space " " as delimiter.
-        has_header: Whether the file has a header row. Default: False
+        has_header: Whether the file has a header row. Default: True
     """
     rows: list[dict[str, str]] = []
     line_count = 0
