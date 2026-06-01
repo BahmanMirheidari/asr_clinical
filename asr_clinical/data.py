@@ -17,81 +17,34 @@ from sklearn.model_selection import (
 QUESTION_RE = re.compile(r"_(Q\d+)$", re.IGNORECASE)
 SPLIT_FILE_RE = re.compile(r"fold(\d+)_(train|val|test)\.csv$", re.IGNORECASE)
 
-
 def parse_utterance_id(utterance_id: str) -> tuple[str, str, str]:
-    """
-    Parse utterance ID into speaker_id, session_id, and question_id.
-    
-    Returns:
-        tuple: (speaker_id, session_id, question_id)
-        - If no session info, session_id defaults to speaker_id
-        - question_id is extracted from the last part
-    """
-    utterance_id = utterance_id.strip()
-    
-    if '_' in utterance_id:
+    if '_' in utterance_id: 
         parts = utterance_id.strip().split("_")
-        
-        if len(parts) == 2:
-            # Case: "p004_Qs"
-            speaker_id = parts[0]
-            # Use speaker_id as session_id when no session info
-            session_id = speaker_id  # Changed: use speaker_id instead of None
-            question_id = parts[1].upper()
-            
-            # Only set to UNK if QUESTION_RE is defined AND doesn't match
-            if QUESTION_RE is not None and not QUESTION_RE.search(question_id):
-                # But "Qs" should match - check your QUESTION_RE pattern
-                print(f"Warning: Question ID '{question_id}' didn't match pattern")
-                question_id = question_id  # Keep original instead of "UNK"
-            
-            return speaker_id, session_id, question_id
-            
-        elif len(parts) >= 3:
-            # Case: "p004_001_Qs"
-            speaker_id = parts[0]
-            session_id = "_".join(parts[:-1])  # e.g., "p004_001"
+        if len(parts) < 3:
+            if len(parts) == 2:
+                speaker_id = parts[0]
+                # Use speaker_id as session_id when no session info
+                session_id = speaker_id  # Changed: use speaker_id instead of None
+                question_id = parts[1].upper()
+            else: 
+                raise ValueError(f"Cannot parse utterance id: {utterance_id}") 
+        else:  
+            speaker_id = "_".join(parts[:2])
             question_id = parts[-1].upper()
-            
-            if QUESTION_RE is not None and not QUESTION_RE.search(question_id):
-                question_id = question_id  # Keep original
-            
-            return speaker_id, session_id, question_id
-        else:
-            raise ValueError(f"Cannot parse utterance id: {utterance_id}")
-    
-    elif '-' in utterance_id:
-        parts = utterance_id.split("-")
-        
-        if len(parts) == 2:
-            speaker_id = parts[0]
-            session_id = speaker_id  # Use speaker_id as session_id
-            question_id = parts[1].upper()
-            
-            if QUESTION_RE is not None and not QUESTION_RE.search(question_id):
-                question_id = question_id
-            
-            return speaker_id, session_id, question_id
-            
-        elif len(parts) >= 3:
-            speaker_id = parts[0]
-            session_id = "-".join(parts[:-1])
-            question_id = parts[-1].upper()
-            
-            if QUESTION_RE is not None and not QUESTION_RE.search(question_id):
-                question_id = question_id
-            
-            return speaker_id, session_id, question_id
-        else:
-            raise ValueError(f"Cannot parse utterance id: {utterance_id}")
-    
+            if not QUESTION_RE.search(utterance_id):
+                question_id = "UNK"
+            session_id = "_".join(parts[:-1])  
     else:
-        # No delimiter - treat as speaker_id only
-        speaker_id = utterance_id
-        session_id = speaker_id  # Use speaker_id as session_id
-        question_id = "UNK"
-        return speaker_id, session_id, question_id
+        parts = utterance_id.strip().split("-")
+        if len(parts) < 3:
+            raise ValueError(f"Cannot parse utterance id: {utterance_id}")
+        speaker_id = parts[0].split(".")[0]
+        question_id = parts[-1].upper()
+        if not QUESTION_RE.search(utterance_id):
+            question_id = "UNK"
+        session_id = "-".join(parts[:-1])
 
+    return speaker_id, session_id, question_id    
 
 def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = False) -> pd.DataFrame:
     """
