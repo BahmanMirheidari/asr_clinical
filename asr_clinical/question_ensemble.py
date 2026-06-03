@@ -2201,6 +2201,52 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
+
+    if args.test_frac == 0:
+        # For CV-only mode, check for CV summary report
+        cv_summary_file = out_dir / "cv_summary_report.txt"
+        cv_results_file = out_dir / "cv_results.json"
+        
+        if cv_summary_file.exists() and cv_results_file.exists() and not args.force_hpo:
+            print("\n" + "="*60)
+            print("FINAL CV SUMMARY ALREADY EXISTS")
+            print("="*60)
+            print(f"Found existing CV results at:")
+            print(f"  - {cv_summary_file}")
+            print(f"  - {cv_results_file}")
+            print(f"\nSkipping all processing.")
+            print(f"To re-run, either:")
+            print(f"  1. Delete {out_dir} directory, or")
+            print(f"  2. Use --force-hpo flag")
+            print("="*60 + "\n")
+            return
+    else:
+        # For standard mode with test set, check for test metrics file
+        test_metrics_file = out_dir / "meta_test_metrics.json"
+        selected_questions_file = out_dir / "selected_questions.csv"
+        
+        if test_metrics_file.exists() and selected_questions_file.exists() and not args.force_hpo:
+            print("\n" + "="*60)
+            print("FINAL MODEL ALREADY EXISTS")
+            print("="*60)
+            print(f"Found existing final model results at:")
+            print(f"  - {test_metrics_file}")
+            print(f"  - {selected_questions_file}")
+            print(f"\nSkipping all processing.")
+            print(f"To re-run, either:")
+            print(f"  1. Delete {out_dir} directory, or")
+            print(f"  2. Use --force-hpo flag")
+            print("="*60 + "\n")
+            
+            # Optionally load and display existing results
+            if test_metrics_file.exists():
+                import json
+                with open(test_metrics_file, 'r') as f:
+                    existing_metrics = json.load(f)
+                print("Existing test metrics:")
+                print(json.dumps(existing_metrics, indent=2))
+            return
+    
     
     cleanup_old_splits(splits_dir)
     
