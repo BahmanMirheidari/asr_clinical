@@ -1909,7 +1909,6 @@ def train_meta_model_cv(
             importance_df = shap_question_importance(
                 base_model, fold_train, fold_val, feature_cols, args
             )
-
         elif args.importance == "hybrid":
             importance_df = permutation_question_importance_shap_hybrid(
                 base_model, fold_train, fold_val, feature_cols, args
@@ -2022,7 +2021,6 @@ def train_meta_model_cv(
     all_predictions.to_csv(out_dir / "cv_all_predictions.csv", index=False)
     
     # Calculate aggregate metrics using the stored predictions
-    # Don't pass a model, pass the predictions directly
     aggregate_metrics = score_meta_model(
         None,  # No model needed
         all_predictions["y_pred"].values,  # Pass predictions as x
@@ -2077,6 +2075,65 @@ def train_meta_model_cv(
     
     print(f"Selected {len(top_questions)} top questions: {top_questions}")
     
+    # ===== NEW: Save selected_questions.csv for consistency with test_frac>0 mode =====
+    selected_questions_df = pd.DataFrame({"question_id": top_questions})
+    selected_questions_df.to_csv(out_dir / "selected_questions.csv", index=False)
+    print(f"\n✓ Saved selected_questions.csv with {len(top_questions)} questions")
+    
+    # ===== NEW: Save cv_k_selection_results.csv for consistency =====
+    cv_k_results = []
+    for fold_idx in range(args.n_cv_folds):
+        fold_best_k = fold_summary_df[fold_summary_df['fold'] == fold_idx]['best_k'].values
+        if len(fold_best_k) > 0:
+            fold_score = fold_summary_df[fold_summary_df['fold'] == fold_idx]['primary_score'].values[0]
+            cv_k_results.append({
+                "k": int(fold_best_k[0]),
+                "mean_cv_score": fold_score,
+                "std_cv_score": 0.0,  # Single fold, no std
+                "is_best": fold_best_k[0] == avg_best_k,
+                "fold": fold_idx
+            })
+    
+    # Add the average as a summary row
+    cv_k_results.append({
+        "k": avg_best_k,
+        "mean_cv_score": fold_summary_df['primary_score'].mean(),
+        "std_cv_score": fold_summary_df['primary_score'].std(),
+        "is_best": True,
+        "fold": -1  # -1 indicates this is the aggregate row
+    })
+    
+    cv_k_results_df = pd.DataFrame(cv_k_results)
+    cv_k_results_df.to_csv(out_dir / "cv_k_selection_results.csv", index=False)
+    print(f"✓ Saved cv_k_selection_results.csv with {len(cv_k_results)} entries")
+    
+    # ===== NEW: Save meta_test_metrics.json (CV metrics instead of test metrics) =====
+    cv_metrics_for_json = {
+        "cv_aggregate_metrics": aggregate_metrics,
+        "mean_cv_score": float(fold_summary_df['primary_score'].mean()),
+        "std_cv_score": float(fold_summary_df['primary_score'].std()),
+        "avg_best_k": avg_best_k,
+        "per_fold_scores": fold_summary_df['primary_score'].tolist(),
+        "per_fold_best_k": fold_summary_df['best_k'].tolist(),
+        "note": "These are cross-validation metrics (no held-out test set because test_frac=0)",
+        "n_folds": args.n_cv_folds,
+        "total_samples": len(all_trainval)
+    }
+    
+    # Add classification or regression specific metrics
+    if args.task == "classification":
+        cv_metrics_for_json["macro_f1"] = aggregate_metrics.get("macro_f1", 0.0)
+        cv_metrics_for_json["weighted_f1"] = aggregate_metrics.get("weighted_f1", 0.0)
+        cv_metrics_for_json["balanced_accuracy"] = aggregate_metrics.get("balanced_accuracy", 0.0)
+    else:
+        cv_metrics_for_json["rmse"] = aggregate_metrics.get("rmse", float('inf'))
+        cv_metrics_for_json["mae"] = aggregate_metrics.get("mae", float('inf'))
+        cv_metrics_for_json["r2"] = aggregate_metrics.get("r2", 0.0)
+    
+    with open(out_dir / "meta_test_metrics.json", "w") as f:
+        json.dump(cv_metrics_for_json, f, indent=2)
+    print(f"✓ Saved meta_test_metrics.json with CV aggregate metrics")
+    
     # Train final ensemble model on all data using top K questions
     print("\n" + "="*60)
     print("TRAINING FINAL MODEL ON ALL DATA WITH TOP K QUESTIONS")
@@ -2119,7 +2176,8 @@ def train_meta_model_cv(
         
         f.write(f"Number of folds: {args.n_cv_folds}\n")
         f.write(f"Task: {args.task}\n")
-        f.write(f"Total samples: {len(all_trainval)}\n\n")
+        f.write(f"Total samples: {len(all_trainval)}\n")
+        f.write(f"Average best K: {avg_best_k}\n\n")
         
         f.write("Per-fold Results:\n")
         f.write("-"*40 + "\n")
@@ -2151,12 +2209,24 @@ def train_meta_model_cv(
         for i, q in enumerate(top_questions, 1):
             f.write(f"  {i}. {q}\n")
     
-    print(f"\nResults saved to {out_dir}")
+    print(f"\n✓ Results saved to {out_dir}")
+    print(f"  - selected_questions.csv: Top {len(top_questions)} questions selected")
+    print(f"  - cv_k_selection_results.csv: K selection results from CV")
+    print(f"  - meta_test_metrics.json: CV aggregate metrics")
+    print(f"  - final_cv_model.joblib: Final model trained on all data")
     print(f"  - cv_all_predictions.csv: All fold predictions")
     print(f"  - cv_results.json: Aggregate results")
     print(f"  - cv_summary_report.txt: Detailed summary report")
-    print(f"  - final_cv_model.joblib: Final model trained on all data")
     print(f"  - aggregated_question_importance.csv: Question importance across folds")
+    
+    # Print ensemble info if used
+    if args.use_ensemble:
+        print("\n" + "=" * 50)
+        print("ENSEMBLE SUMMARY")
+        print("=" * 50)
+        print(f"Models in ensemble: {args.ensemble_models}")
+        print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
+        print(f"Final CV model saved to: {out_dir / 'final_cv_model.joblib'}")
     
     return {
         "cv_folds": args.n_cv_folds,
@@ -2164,9 +2234,10 @@ def train_meta_model_cv(
         "per_fold_metrics": fold_summaries,
         "avg_best_k": avg_best_k,
         "selected_questions": top_questions,
-        "question_importance": question_importance_agg.to_dict()
+        "question_importance": question_importance_agg.to_dict(),
+        "cv_k_selection_results": cv_k_results,
+        "cv_metrics": cv_metrics_for_json
     }
-
 def main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir):
     """Run CV-only training when test_frac == 0"""
     
@@ -2194,7 +2265,6 @@ def main_with_cv(args, train_features, val_features, test_features, feature_cols
         print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
         print(f"Final CV model saved to: {out_dir / 'final_cv_model.joblib'}") 
 
-
 def main():
     args = build_parser().parse_args()
     set_seed(args.seed)
@@ -2202,51 +2272,46 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
 
-    if args.test_frac == 0:
-        # For CV-only mode, check for CV summary report
-        cv_summary_file = out_dir / "cv_summary_report.txt"
-        cv_results_file = out_dir / "cv_results.json"
-        
-        if cv_summary_file.exists() and cv_results_file.exists() and not args.force_hpo:
-            print("\n" + "="*60)
-            print("FINAL CV SUMMARY ALREADY EXISTS")
-            print("="*60)
-            print(f"Found existing CV results at:")
-            print(f"  - {cv_summary_file}")
-            print(f"  - {cv_results_file}")
-            print(f"\nSkipping all processing.")
-            print(f"To re-run, either:")
-            print(f"  1. Delete {out_dir} directory, or")
-            print(f"  2. Use --force-hpo flag")
-            print("="*60 + "\n")
-            return
-    else:
-        # For standard mode with test set, check for test metrics file
-        test_metrics_file = out_dir / "meta_test_metrics.json"
-        selected_questions_file = out_dir / "selected_questions.csv"
-        
-        if test_metrics_file.exists() and selected_questions_file.exists() and not args.force_hpo:
-            print("\n" + "="*60)
-            print("FINAL MODEL ALREADY EXISTS")
-            print("="*60)
-            print(f"Found existing final model results at:")
-            print(f"  - {test_metrics_file}")
-            print(f"  - {selected_questions_file}")
-            print(f"\nSkipping all processing.")
-            print(f"To re-run, either:")
-            print(f"  1. Delete {out_dir} directory, or")
-            print(f"  2. Use --force-hpo flag")
-            print("="*60 + "\n")
-            
-            # Optionally load and display existing results
-            if test_metrics_file.exists():
-                import json
-                with open(test_metrics_file, 'r') as f:
-                    existing_metrics = json.load(f)
-                print("Existing test metrics:")
-                print(json.dumps(existing_metrics, indent=2))
-            return
+    # Check for existing results - NOW BOTH MODES PRODUCE THE SAME FILES
+    selected_questions_file = out_dir / "selected_questions.csv"
+    cv_k_results_file = out_dir / "cv_k_selection_results.csv"
+    test_metrics_file = out_dir / "meta_test_metrics.json"
     
+    # Both modes now create these three files:
+    # - selected_questions.csv (top K questions)
+    # - cv_k_selection_results.csv (K selection results from CV)
+    # - meta_test_metrics.json (either test metrics or CV aggregate metrics)
+    
+    if selected_questions_file.exists() and cv_k_results_file.exists() and test_metrics_file.exists() and not args.force_hpo:
+        print("\n" + "="*60)
+        print("FINAL RESULTS ALREADY EXIST")
+        print("="*60)
+        print(f"Found existing results at:")
+        print(f"  - {selected_questions_file}")
+        print(f"  - {cv_k_results_file}")
+        print(f"  - {test_metrics_file}")
+        print(f"\nSkipping all processing.")
+        print(f"To re-run, either:")
+        print(f"  1. Delete {out_dir} directory, or")
+        print(f"  2. Use --force-hpo flag")
+        print("="*60 + "\n")
+        
+        with open(test_metrics_file, 'r') as f:
+            existing_metrics = json.load(f)
+        
+        print("Existing results summary:")
+        print(json.dumps(existing_metrics, indent=2))
+        
+        # Also show selected questions
+        selected_df = pd.read_csv(selected_questions_file)
+        print(f"\nSelected {len(selected_df)} questions: {selected_df['question_id'].tolist()[:10]}...")
+        
+        return
+    
+    # If we get here, we need to run the full pipeline
+    print("\n" + "="*60)
+    print("STARTING FULL PIPELINE")
+    print("="*60)
     
     cleanup_old_splits(splits_dir)
     
@@ -2272,7 +2337,7 @@ def main():
     final_train, final_val, final_test = split_mgr.get_final_splits(df)
     print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
     
-    # Define best_hparams_path BEFORE using it
+    # Define best_hparams_path
     best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
     
     # Hyperparameter search on ALL questions
@@ -2350,34 +2415,54 @@ def main():
     # ============================================================
     if args.test_frac == 0:
         # Cross-validation only (no held-out test set)
-        main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir)
+        results = train_meta_model_cv(
+            train_features, val_features, test_features, feature_cols, args, out_dir
+        )
+        
+        print("\n" + "="*60)
+        print("CROSS-VALIDATION COMPLETE (test_frac=0)")
+        print("="*60)
+        print(f"Results saved to {out_dir}")
+        print(f"  - selected_questions.csv: Top {results['avg_best_k']} questions selected")
+        print(f"  - cv_k_selection_results.csv: K selection results")
+        print(f"  - meta_test_metrics.json: CV aggregate metrics")
+        print(f"  - final_cv_model.joblib: Final model trained on all data")
+        print(f"  - cv_summary_report.txt: Detailed CV report")
+        
     else: 
         # Standard training with held-out test set
         test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
         
-        # Train meta-model WITH CV-based K selection (UPDATED)
+        # Train meta-model WITH CV-based K selection
         results = train_meta_model_with_cv_selection(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
         
-        # ============================================================
-        # THESE PRINT STATEMENTS ARE IN THE ELSE PART
-        # ============================================================
-        print("\n===== Final Results =====")
-        print(json.dumps(results, indent=2))
-        
-        # Cleanup
-        cleanup_temp_dirs(out_dir)
-        
-        # Print ensemble info if used
-        if args.use_ensemble:
-            print("\n" + "=" * 50)
-            print("ENSEMBLE SUMMARY")
-            print("=" * 50)
-            print(f"Models in ensemble: {args.ensemble_models}")
-            print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
-            print(f"Ensemble saved to: {out_dir / 'meta_model.joblib'}")
-
+        print("\n" + "="*60)
+        print("HELD-OUT TEST EVALUATION COMPLETE (test_frac > 0)")
+        print("="*60)
+        print(f"Results saved to {out_dir}")
+        print(f"  - selected_questions.csv: Top {results['best_k']} questions selected")
+        print(f"  - cv_k_selection_results.csv: K selection results from CV")
+        print(f"  - meta_test_metrics.json: Held-out test metrics")
+        print(f"  - meta_model.joblib: Final meta-model")
+        print(f"\nTest Metrics:")
+        print(json.dumps(results['test_metrics'], indent=2))
+    
+    # Cleanup temporary directories
+    cleanup_temp_dirs(out_dir)
+    
+    # Print ensemble info if used
+    if args.use_ensemble:
+        print("\n" + "=" * 50)
+        print("ENSEMBLE SUMMARY")
+        print("=" * 50)
+        print(f"Models in ensemble: {args.ensemble_models}")
+        print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
+        if args.test_frac == 0:
+            print(f"Final CV model: {out_dir / 'final_cv_model.joblib'}")
+        else:
+            print(f"Final model: {out_dir / 'meta_model.joblib'}")
 
 if __name__ == "__main__":
     main()
@@ -2504,5 +2589,77 @@ Inner CV    Tune per‑question Transformer hyperparameters   Train+val (90%) �
 Validation set  Select top‑k questions and early stop   Separate validation set (10% of original)
 Test set    Final, unbiased performance estimate    Held‑out 10% – used only once
 This design prevents any information from the test set leaking into model selection or hyperparameter tuning, giving you a trustworthy estimate of real‑world performance.
+
+
+
+
+
+
+Calculate CV-based K selection using cross-validation
+
+Save the same three core files:
+
+selected_questions.csv - Top K questions based on importance
+
+cv_k_selection_results.csv - Detailed CV results for each K value
+
+meta_test_metrics.json - Final metrics (CV aggregate or held-out test)
+
+Key Improvements Made:
+For test_frac=0 mode:
+Uses train_meta_model_cv() which now saves all three core files
+
+Performs proper cross-validation to find optimal K
+
+Saves CV aggregate metrics in meta_test_metrics.json (with a note that there's no held-out test set)
+
+For test_frac>0 mode:
+Uses train_meta_model_with_cv_selection()
+
+Already saved the three core files
+
+Now includes proper early exit checking with unified file set
+
+Main function improvements:
+Unified early exit - Checks same 3 files regardless of mode
+
+Clear output - Different summaries for each mode but consistent file structure
+
+No redundant computation - Skips processing if results already exist
+
+What each mode produces:
+When test_frac=0:
+text
+output_dir/
+├── selected_questions.csv          # Top K questions
+├── cv_k_selection_results.csv      # CV results per K value
+├── meta_test_metrics.json          # CV aggregate metrics
+├── final_cv_model.joblib           # Final model trained on all data
+├── cv_summary_report.txt           # Detailed CV report
+├── cv_all_predictions.csv          # Predictions across all folds
+├── aggregated_question_importance.csv
+└── fold_summary.csv
+When test_frac>0:
+text
+output_dir/
+├── selected_questions.csv          # Top K questions
+├── cv_k_selection_results.csv      # CV results per K value
+├── meta_test_metrics.json          # Held-out test metrics
+├── meta_model.joblib               # Final model
+├── meta_test_predictions.csv       # Predictions on test set
+├── question_embedding_importance.csv
+└── selected_embedding_features.csv
+Benefits of this unified approach:
+Consistent interface - Same output files regardless of mode
+
+Reproducibility - Both modes use CV for K selection
+
+No redundant computation - Proper caching with unified file checking
+
+Flexibility - Easy to switch between modes without changing analysis code
+
+Clear documentation - The note field in meta_test_metrics.json clearly indicates whether metrics are from CV or held-out test
+
+This is a robust solution that maintains scientific rigor (using CV for model selection) while providing flexibility in evaluation (CV-only or held-out test set).
 
 '''
