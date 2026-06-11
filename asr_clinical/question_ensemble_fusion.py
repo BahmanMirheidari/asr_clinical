@@ -1493,9 +1493,8 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
         min_text_chars=args.min_text_chars,
     )
 
-
 def train_question_models(train_df, val_df, test_df, metadata, args, best_hparams, out_dir: Path):
-    """Train per-question models."""
+    """Train per-question models with caching."""
     embedding_files = {"train": {}, "val": {}, "test": {}}
     summaries = []
     
@@ -1523,14 +1522,31 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         train_emb = q_dir / "embeddings_train.csv"
         val_emb = q_dir / "embeddings_val.csv"
         test_emb = q_dir / "embeddings_test.csv"
-
+        
+        # Also check for cached embeddings in a global cache directory
+        global_cache_dir = out_dir.parent / "cache" / "embeddings"
+        global_cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create a hash of the data to use as cache key
+        data_hash = hash((question, len(q_train), len(q_val), best_hparams.get("max_length", 256)))
+        cached_train_emb = global_cache_dir / f"{question}_train_{data_hash}.csv"
+        cached_val_emb = global_cache_dir / f"{question}_val_{data_hash}.csv"
+        
         # Check if we need to train the model
         model_exists = model_dir.exists() and saved_model_exists(model_dir)
-        embeddings_exist = train_emb.exists() and val_emb.exists()
+        embeddings_exist = (train_emb.exists() and val_emb.exists()) or (cached_train_emb.exists() and cached_val_emb.exists())
         test_embeddings_exist = is_test_empty or test_emb.exists()
         
         if (model_exists and embeddings_exist and test_embeddings_exist):
             print(f"{question}: model and embeddings already exist, loading.")
+            
+            # Load from cache if available
+            if cached_train_emb.exists() and cached_val_emb.exists():
+                # Copy from cache to expected location
+                import shutil
+                shutil.copy2(cached_train_emb, train_emb)
+                shutil.copy2(cached_val_emb, val_emb)
+                print(f"  Loaded embeddings from cache")
         else:
             print(f"{question}: training model on {len(q_train)} examples, val on {len(q_val)}")
             q_cfg = make_question_cfg(args, question, q_dir, best_hparams)
@@ -1541,16 +1557,14 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             
             extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
             extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
+            
+            # Cache embeddings for future runs
+            shutil.copy2(train_emb, cached_train_emb)
+            shutil.copy2(val_emb, cached_val_emb)
+            print(f"  Cached embeddings to {global_cache_dir}")
+            
             if not is_test_empty and not q_test.empty:
                 extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
-            elif not is_test_empty:
-                # Create empty test embeddings file with correct structure
-                print(f"{question}: No test examples, creating empty test embeddings placeholder")
-                # Create empty DataFrame with expected columns from training embeddings
-                if train_emb.exists():
-                    sample_emb = pd.read_csv(train_emb, nrows=1)
-                    empty_test_emb = pd.DataFrame(columns=sample_emb.columns)
-                    empty_test_emb.to_csv(test_emb, index=False)
 
         embedding_files["train"][question] = train_emb
         embedding_files["val"][question] = val_emb
@@ -1564,8 +1578,7 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         })
     
     pd.DataFrame(summaries).to_csv(out_dir / "question_model_summary.csv", index=False)
-    return embedding_files
-
+    return embedding_files 
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     """Build feature table from embeddings."""
@@ -2825,10 +2838,10 @@ def train_meta_model_cv(
         "cv_metrics": cv_metrics_for_json
     }
 
-
 def load_acoustic_features(args, df):
     """
     Load or extract acoustic features based on arguments.
+    Features are cached to avoid re-extraction.
     
     Returns:
         DataFrame with acoustic features per speaker, or None if not using fusion
@@ -2842,24 +2855,43 @@ def load_acoustic_features(args, df):
     
     acoustic_df = None
     
-    if args.acoustic_csv:
-        # Load from pre-extracted CSV
-        print(f"Loading acoustic features from CSV: {args.acoustic_csv}")
-        acoustic_df = pd.read_csv(args.acoustic_csv)
+    # Check for cached features in output directory
+    cache_path = Path(args.output_dir) / f"acoustic_features_{args.acoustic_feature_type}.csv"
+    
+    if cache_path.exists():
+        print(f"✓ Found cached acoustic features: {cache_path}")
+        acoustic_df = pd.read_csv(cache_path)
         
         # Ensure speaker_id column exists
         if "speaker_id" not in acoustic_df.columns:
-            raise ValueError("Acoustic CSV must contain 'speaker_id' column")
+            raise ValueError("Cached acoustic CSV must contain 'speaker_id' column")
         
-        # Add prefix to feature columns
-        feature_cols = [c for c in acoustic_df.columns if c != "speaker_id"]
-        rename_dict = {c: f"acoustic_{args.acoustic_feature_type}__{c}" for c in feature_cols}
-        acoustic_df = acoustic_df.rename(columns=rename_dict)
-        
-        print(f"  Loaded {len(acoustic_df)} speakers with {len(feature_cols)} acoustic features")
-        
-    elif args.acoustic_audio_dir:
-        # Extract from audio files
+        print(f"  Loaded {len(acoustic_df)} speakers with {len(acoustic_df.columns) - 1} acoustic features")
+        return acoustic_df
+    
+    # If not in cache, try user-provided CSV
+    if args.acoustic_csv:
+        csv_path = Path(args.acoustic_csv)
+        if csv_path.exists():
+            print(f"Loading acoustic features from CSV: {args.acoustic_csv}")
+            acoustic_df = pd.read_csv(args.acoustic_csv)
+            
+            # Ensure speaker_id column exists
+            if "speaker_id" not in acoustic_df.columns:
+                raise ValueError("Acoustic CSV must contain 'speaker_id' column")
+            
+            print(f"  Loaded {len(acoustic_df)} speakers with {len(acoustic_df.columns) - 1} acoustic features")
+            
+            # Cache for future use
+            acoustic_df.to_csv(cache_path, index=False)
+            print(f"  ✓ Cached to: {cache_path}")
+            
+            return acoustic_df
+        else:
+            print(f"Warning: Acoustic CSV not found: {args.acoustic_csv}")
+    
+    # If not in cache and no CSV provided, extract from audio directory
+    if args.acoustic_audio_dir:
         if not LIBROSA_AVAILABLE:
             print("Error: librosa is required for audio extraction. Install with: pip install librosa")
             return None
@@ -2867,7 +2899,6 @@ def load_acoustic_features(args, df):
         print(f"Extracting acoustic features from audio directory: {args.acoustic_audio_dir}")
         
         # Build mapping from speaker_id to audio files
-        # Use speakers from the main dataset
         speakers = df["speaker_id"].unique()
         speaker_to_audio = {}
         
@@ -2905,12 +2936,16 @@ def load_acoustic_features(args, df):
         if not acoustic_df.empty:
             print(f"  Extracted features for {len(acoustic_df)} speakers")
             print(f"  Features: {len([c for c in acoustic_df.columns if c != 'speaker_id'])}")
+            
+            # Cache the extracted features
+            acoustic_df.to_csv(cache_path, index=False)
+            print(f"  ✓ Cached extracted features to: {cache_path}")
         else:
             print("  Warning: No features extracted. Disabling acoustic fusion.")
             return None
     
-    else:
-        print("No acoustic source specified. Disabling acoustic fusion.")
+    if acoustic_df is None:
+        print("No acoustic source specified or found. Disabling acoustic fusion.")
         return None
     
     return acoustic_df
