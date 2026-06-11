@@ -8,6 +8,7 @@ import os
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Generate plots from model predictions')
     parser.add_argument('--predictions', type=str, required=True,
@@ -146,49 +147,102 @@ def regression_plot_3_fold_comparison(df, output_path):
     plt.close()
 
 def regression_plot_4_class_comparison(df, output_path):
-    """Plot 4: Performance comparison by speaker class"""
+    """Plot 4: Performance comparison by speaker class (using RMSE and Bias)"""
     if 'class' not in df.columns or df['class'].isna().all():
         return
     
-    df['abs_error'] = np.abs(df['y_pred'] - df['y_true'])
     df['error'] = df['y_pred'] - df['y_true']
+    df['squared_error'] = df['error'] ** 2
     
-    class_metrics = df.groupby('class').agg({
-        'abs_error': ['mean', 'std'],
-        'error': ['mean', 'std']
-    }).round(4)
+    # Calculate RMSE and Bias by class
+    class_rmse = np.sqrt(df.groupby('class')['squared_error'].mean())
+    class_bias = df.groupby('class')['error'].mean()
+    class_bias_std = df.groupby('class')['error'].std()
+    
+    classes = class_rmse.index
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
-    classes = class_metrics.index
-    mae_means = class_metrics['abs_error']['mean']
-    mae_stds = class_metrics['abs_error']['std']
-    
-    axes[0].bar(classes, mae_means, yerr=mae_stds, capsize=5,
-                color=['#FF9999', '#66B2FF'], edgecolor='black')
+    # Plot 1: RMSE by class
+    bars1 = axes[0].bar(classes, class_rmse.values, 
+                        color=['#FF9999', '#66B2FF'], edgecolor='black')
     axes[0].set_xlabel('Speaker Class', fontsize=12)
-    axes[0].set_ylabel('Mean Absolute Error', fontsize=12)
-    axes[0].set_title('MAE by Speaker Class', fontsize=14)
+    axes[0].set_ylabel('Root Mean Square Error (RMSE)', fontsize=12)
+    axes[0].set_title('RMSE by Speaker Class', fontsize=14)
     axes[0].grid(True, alpha=0.3, axis='y')
     
-    bias_means = class_metrics['error']['mean']
-    bias_stds = class_metrics['error']['std']
+    # Add value labels on bars
+    for bar in bars1:
+        height = bar.get_height()
+        axes[0].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{height:.3f}', ha='center', va='bottom', fontsize=10)
     
-    axes[1].bar(classes, bias_means, yerr=bias_stds, capsize=5,
-                color=['#99CC99', '#FFCC99'], edgecolor='black')
-    axes[1].axhline(y=0, color='r', linestyle='--', linewidth=2)
+    # Plot 2: Bias by class (with error bars)
+    bars2 = axes[1].bar(classes, class_bias.values, yerr=class_bias_std.values, 
+                        capsize=5, color=['#99CC99', '#FFCC99'], edgecolor='black')
+    axes[1].axhline(y=0, color='r', linestyle='--', linewidth=2, label='Zero Bias')
     axes[1].set_xlabel('Speaker Class', fontsize=12)
     axes[1].set_ylabel('Mean Bias (Pred - Actual)', fontsize=12)
     axes[1].set_title('Prediction Bias by Speaker Class', fontsize=14)
+    axes[1].legend()
     axes[1].grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bias bars
+    for bar in bars2:
+        height = bar.get_height()
+        axes[1].text(bar.get_x() + bar.get_width()/2., height + (0.05 if height >= 0 else -0.1),
+                    f'{height:.3f}', ha='center', va='bottom' if height >= 0 else 'top', fontsize=10)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_path, 'regression_4_class_comparison.png'), dpi=300)
     plt.close()
     
+    # Return metrics
+    class_metrics = pd.DataFrame({
+        'RMSE': class_rmse,
+        'Bias': class_bias,
+        'Bias_Std': class_bias_std
+    })
+    
     return class_metrics
 
 # ============ CLASSIFICATION PLOTS ============
+
+def classification_plot_probability_distributions(df, classes, output_path, class_names=None):
+    """Plot 7: Probability distributions for each class"""
+    prob_cols = [col for col in df.columns if col.startswith('prob_')]
+    
+    if len(prob_cols) != len(classes):
+        print(f"  ℹ Skipping probability distribution plot (expected {len(classes)} prob columns, found {len(prob_cols)})")
+        return
+    
+    display_labels = class_names if class_names else [str(c) for c in classes]
+    n_classes = len(classes)
+    
+    fig, axes = plt.subplots(1, n_classes, figsize=(5*n_classes, 5))
+    if n_classes == 1:
+        axes = [axes]
+    
+    for i, (cls, prob_col, label) in enumerate(zip(classes, prob_cols, display_labels)):
+        # Get probabilities for samples that truly belong to this class
+        true_class_probs = df[df['y_true_int'] == cls][prob_col]
+        false_class_probs = df[df['y_true_int'] != cls][prob_col]
+        
+        # Plot histograms
+        axes[i].hist(true_class_probs, bins=20, alpha=0.7, label=f'True Class {label}', 
+                    color='green', edgecolor='black', density=True)
+        axes[i].hist(false_class_probs, bins=20, alpha=0.7, label=f'Other Classes', 
+                    color='red', edgecolor='black', density=True)
+        
+        axes[i].set_xlabel(f'Probability of being {label}', fontsize=10)
+        axes[i].set_ylabel('Density', fontsize=10)
+        axes[i].set_title(f'Probability Distribution - Class {label}', fontsize=12)
+        axes[i].legend()
+        axes[i].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_path, 'classification_7_probability_distributions.png'), dpi=300)
+    plt.close()
 
 def classification_plot_confusion_matrix(df, classes, output_path, class_names=None):
     """Plot 1: Confusion Matrix"""
@@ -253,47 +307,118 @@ def classification_plot_metrics_per_class(df, classes, output_path, class_names=
     return precision, recall, f1, support
 
 def classification_plot_roc_curves(df, classes, output_path, class_names=None):
-    """Plot 3: ROC Curves (for multi-class)"""
-    from sklearn.metrics import roc_curve, auc
-    from sklearn.preprocessing import label_binarize
+    """Plot 3: ROC Curves (using probability columns if available)"""
     
     n_classes = len(classes)
     
-    # Check if we have probabilities (y_pred might be class indices or probabilities)
-    # If y_pred contains class indices, we can't do ROC
-    if df['y_pred'].dtype in ['int64', 'int32'] or df['y_pred'].nunique() <= n_classes:
-        print("  ℹ Skipping ROC curves (predicted classes are discrete, need probabilities)")
-        return None
+    # Check if we have probability columns (prob_0, prob_1, etc.)
+    prob_cols = [col for col in df.columns if col.startswith('prob_')]
     
-    # Try to interpret y_pred as probabilities
-    # For multi-class, we need one probability per class
-    if n_classes > 2:
-        # Assume y_pred contains class probabilities (might be comma-separated?)
-        print("  ⚠ Multi-class ROC requires probability outputs. Skipping.")
-        return None
+    if len(prob_cols) == n_classes:
+        print(f"  ✓ Found probability columns: {prob_cols}")
+        # Use probability columns
+        y_scores = df[prob_cols].values
+        
+        # For binary classification
+        if n_classes == 2:
+            # Use probability of positive class (class 1)
+            positive_class_idx = 1 if 1 in classes else 0
+            y_true_bin = (df['y_true_int'] == classes[positive_class_idx]).astype(int)
+            y_score = y_scores[:, positive_class_idx]
+            
+            fpr, tpr, _ = roc_curve(y_true_bin, y_score)
+            roc_auc = auc(fpr, tpr)
+            
+            plt.figure(figsize=(8, 8))
+            plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=12)
+            plt.ylabel('True Positive Rate', fontsize=12)
+            plt.title('Receiver Operating Characteristic (ROC) Curve', fontsize=14)
+            plt.legend(loc="lower right")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_path, 'classification_3_roc_curve.png'), dpi=300)
+            plt.close()
+            
+            return roc_auc
+        
+        # For multi-class classification
+        else:
+            # Binarize the true labels
+            y_true_bin = label_binarize(df['y_true_int'], classes=classes)
+            
+            # Compute ROC curve and ROC area for each class
+            fpr = dict()
+            tpr = dict()
+            roc_auc = dict()
+            
+            for i in range(n_classes):
+                fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_scores[:, i])
+                roc_auc[i] = auc(fpr[i], tpr[i])
+            
+            # Plot all ROC curves
+            plt.figure(figsize=(10, 8))
+            colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
+            display_labels = class_names if class_names else [str(c) for c in classes]
+            
+            for i, color in enumerate(colors):
+                plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                        label=f'Class {display_labels[i]} (AUC = {roc_auc[i]:.3f})')
+            
+            plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Random Classifier')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=12)
+            plt.ylabel('True Positive Rate', fontsize=12)
+            plt.title('Multi-class ROC Curves', fontsize=14)
+            plt.legend(loc="lower right")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_path, 'classification_3_roc_curves.png'), dpi=300)
+            plt.close()
+            
+            # Also plot macro-average ROC curve
+            # Aggregate all false positive rates
+            all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+            
+            # Interpolate all ROC curves at these points
+            mean_tpr = np.zeros_like(all_fpr)
+            for i in range(n_classes):
+                mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+            
+            # Average it
+            mean_tpr /= n_classes
+            
+            # Compute macro-average AUC
+            macro_auc = auc(all_fpr, mean_tpr)
+            
+            # Plot macro-average ROC
+            plt.figure(figsize=(8, 8))
+            plt.plot(all_fpr, mean_tpr, color='darkorange', lw=2,
+                    label=f'Macro-average ROC (AUC = {macro_auc:.3f})')
+            plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Random Classifier')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=12)
+            plt.ylabel('True Positive Rate', fontsize=12)
+            plt.title('Macro-average ROC Curve', fontsize=14)
+            plt.legend(loc="lower right")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_path, 'classification_3_roc_curve_macro_avg.png'), dpi=300)
+            plt.close()
+            
+            return roc_auc, macro_auc
     
-    # Binary classification ROC
-    y_true_bin = label_binarize(df['y_true_int'], classes=classes)
-    if n_classes == 2:
-        fpr, tpr, _ = roc_curve(y_true_bin, df['y_pred'])
-        roc_auc = auc(fpr, tpr)
-        
-        plt.figure(figsize=(8, 8))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate', fontsize=12)
-        plt.ylabel('True Positive Rate', fontsize=12)
-        plt.title('Receiver Operating Characteristic (ROC) Curve', fontsize=14)
-        plt.legend(loc="lower right")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_path, 'classification_3_roc_curve.png'), dpi=300)
-        plt.close()
-        
-        return roc_auc
-    return None
+    else:
+        # No probability columns found, check if we can use y_pred as probabilities
+        print(f"  ℹ No probability columns found. Expected {n_classes} columns (prob_0, prob_1, ...)")
+        print(f"  ℹ Found columns: {prob_cols if prob_cols else 'None'}")
+        print(f"  ℹ Skipping ROC curves (need probability outputs)")
+        return None
 
 def classification_plot_accuracy_by_fold(df, output_path):
     """Plot 4: Accuracy by fold"""
@@ -353,18 +478,19 @@ def classification_plot_misclassification_analysis(df, classes, output_path, cla
     """Plot 6: Misclassification analysis heatmap"""
     # Calculate misclassification matrix
     misclass_matrix = np.zeros((len(classes), len(classes)))
-    for true_class in classes:
-        for pred_class in classes:
+    for i, true_class in enumerate(classes):
+        for j, pred_class in enumerate(classes):
             if true_class != pred_class:
-                misclass_matrix[classes.index(true_class), classes.index(pred_class)] = \
-                    len(df[(df['y_true_int'] == true_class) & (df['y_pred_int'] == pred_class)])
+                count = len(df[(df['y_true_int'] == true_class) & (df['y_pred_int'] == pred_class)])
+                misclass_matrix[i, j] = count
     
     # Only plot if there are misclassifications
     if misclass_matrix.sum() > 0:
         display_labels = class_names if class_names else [str(c) for c in classes]
         
         plt.figure(figsize=(10, 8))
-        sns.heatmap(misclass_matrix, annot=True, fmt='d', cmap='YlOrRd',
+        # Use 'g' for general format (handles both ints and floats) or '.0f' for integer formatting
+        sns.heatmap(misclass_matrix, annot=True, fmt='.0f', cmap='YlOrRd',
                     xticklabels=display_labels, yticklabels=display_labels)
         plt.xlabel('Predicted Class', fontsize=12)
         plt.ylabel('True Class', fontsize=12)
@@ -529,7 +655,7 @@ def main():
         print("\n📈 Overall Performance Metrics:")
         for metric, value in metrics.items():
             print(f"  {metric}: {value:.4f}")
-    
+     
     else:  # classification
         print("\n" + "="*50)
         print("Generating CLASSIFICATION plots...")
@@ -558,8 +684,11 @@ def main():
         )
         print("  ✓ Plot 2: Per-class metrics (Precision, Recall, F1)")
         
-        classification_plot_roc_curves(df, classes, args.output, class_names)
-        print("  ✓ Plot 3: ROC Curve (if applicable)")
+        roc_result = classification_plot_roc_curves(df, classes, args.output, class_names)
+        if roc_result:
+            print("  ✓ Plot 3: ROC Curves")
+        else:
+            print("  ℹ Plot 3: ROC Curves (skipped - need probability columns)")
         
         classification_plot_accuracy_by_fold(df, args.output)
         print("  ✓ Plot 4: Accuracy by fold")
@@ -570,6 +699,12 @@ def main():
         classification_plot_misclassification_analysis(df, classes, args.output, class_names)
         print("  ✓ Plot 6: Misclassification heatmap")
         
+        # Add probability distribution plot if probability columns exist
+        prob_cols = [col for col in df.columns if col.startswith('prob_')]
+        if len(prob_cols) == n_classes:
+            classification_plot_probability_distributions(df, classes, args.output, class_names)
+            print("  ✓ Plot 7: Probability distributions")
+        
         save_classification_report(df, classes, class_names, precision, recall, f1, support, cm, args.output)
         print("  ✓ Summary report saved")
         
@@ -577,6 +712,12 @@ def main():
         from sklearn.metrics import accuracy_score
         accuracy = accuracy_score(df['y_true_int'], df['y_pred_int'])
         print(f"\n📈 Overall Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        
+        # Print AUC if available
+        if roc_result and n_classes == 2:
+            print(f"📈 AUC Score: {roc_result:.4f}")
+        elif roc_result and isinstance(roc_result, tuple):
+            print(f"📈 Macro-average AUC: {roc_result[1]:.4f}") 
     
     print(f"\n✅ All plots and reports saved to: {args.output}")
     print("\nGenerated files:")
