@@ -1542,8 +1542,7 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             
             # Load from cache if available
             if cached_train_emb.exists() and cached_val_emb.exists():
-                # Copy from cache to expected location
-                import shutil
+                # Copy from cache to expected location 
                 shutil.copy2(cached_train_emb, train_emb)
                 shutil.copy2(cached_val_emb, val_emb)
                 print(f"  Loaded embeddings from cache")
