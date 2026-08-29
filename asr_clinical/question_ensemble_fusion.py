@@ -47,413 +47,10 @@ from sklearn.base import ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
-
-# Audio feature extraction libraries
-try:
-    import opensmile
-    SMILE_AVAILABLE = True
-except ImportError:
-    SMILE_AVAILABLE = False
-    print("Warning: opensmile not available. Install with: pip install opensmile")
-
-try:
-    import librosa
-    LIBROSA_AVAILABLE = True
-except ImportError:
-    LIBROSA_AVAILABLE = False
-    print("Warning: librosa not available. Install with: pip install librosa")
-
 # Also add a cache directory to avoid redownloading
 import os
 os.environ['HF_HOME'] = '/home/bahman/.cache/huggingface'
 os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers'
-
-
-# ----------------------------------------------------------------------
-#  Acoustic Feature Extraction
-# ----------------------------------------------------------------------
-
-class AcousticFeatureExtractor:
-    """Extract acoustic features from audio files."""
-    
-    def __init__(self, feature_type="egemaps", sample_rate=16000):
-        """
-        Initialize acoustic feature extractor.
-        
-        Args:
-            feature_type: "egemaps", "emo", "temporal", or "all"
-            sample_rate: Target sample rate for audio
-        """
-        self.feature_type = feature_type
-        self.sample_rate = sample_rate
-        
-        # Initialize feature extractors based on type
-        if feature_type in ["egemaps", "all"] and SMILE_AVAILABLE:
-            self.egemaps_extractor = opensmile.Smile(
-                feature_set=opensmile.FeatureSet.eGeMAPSv02,
-                feature_level=opensmile.FeatureLevel.Functionals,
-            )
-        else:
-            self.egemaps_extractor = None
-            
-        if feature_type in ["emo", "all"] and SMILE_AVAILABLE:
-            # Emotional features (ComParE 2016)
-            self.emo_extractor = opensmile.Smile(
-                feature_set=opensmile.FeatureSet.ComParE_2016,
-                feature_level=opensmile.FeatureLevel.Functionals,
-            )
-        else:
-            self.emo_extractor = None
-    
-    def extract_from_directory(self, audio_root_dir: Path, speaker_to_audio_files: dict = None):
-        """
-        Extract acoustic features from a directory structure.
-        
-        Expected structure: 
-            audio_root_dir/
-                p001/
-                    file1.wav
-                    file2.wav
-                p002/
-                    ...
-        
-        Args:
-            audio_root_dir: Root directory containing speaker subfolders
-            speaker_to_audio_files: Optional mapping from speaker_id to list of audio files
-            
-        Returns:
-            DataFrame with acoustic features per speaker
-        """
-        if not LIBROSA_AVAILABLE:
-            print("Error: librosa is required for audio extraction. Install with: pip install librosa")
-            return pd.DataFrame()
-            
-        audio_root_dir = Path(audio_root_dir)
-        
-        if not audio_root_dir.exists():
-            print(f"Warning: Audio directory {audio_root_dir} does not exist")
-            return pd.DataFrame()
-        
-        all_features = []
-        
-        # Collect speaker directories
-        if speaker_to_audio_files is None:
-            speaker_dirs = [d for d in audio_root_dir.iterdir() if d.is_dir()]
-            for speaker_dir in speaker_dirs:
-                speaker_id = speaker_dir.name
-                audio_files = list(speaker_dir.glob("*.wav")) + list(speaker_dir.glob("*.mp3"))
-                if audio_files:
-                    features = self.extract_for_speaker(speaker_id, audio_files)
-                    if features is not None:
-                        all_features.append(features)
-        else:
-            for speaker_id, audio_files in speaker_to_audio_files.items():
-                features = self.extract_for_speaker(speaker_id, audio_files)
-                if features is not None:
-                    all_features.append(features)
-        
-        if not all_features:
-            return pd.DataFrame()
-        
-        # Combine all speaker features
-        feature_df = pd.concat(all_features, ignore_index=True)
-        
-        # Add prefix to feature names
-        feature_cols = [c for c in feature_df.columns if c not in ["speaker_id"]]
-        rename_dict = {c: f"acoustic_{self.feature_type}__{c}" for c in feature_cols}
-        feature_df = feature_df.rename(columns=rename_dict)
-        
-        return feature_df
-    
-    def extract_from_csv(self, csv_path: Path):
-        """
-        Load pre-extracted acoustic features from CSV file.
-        
-        Expected CSV format:
-            speaker_id, feature1, feature2, ...
-        
-        Args:
-            csv_path: Path to CSV file with acoustic features
-            
-        Returns:
-            DataFrame with acoustic features
-        """
-        if not csv_path.exists():
-            print(f"Warning: Acoustic features CSV {csv_path} does not exist")
-            return pd.DataFrame()
-        
-        feature_df = pd.read_csv(csv_path)
-        
-        # Ensure speaker_id column exists
-        if "speaker_id" not in feature_df.columns:
-            raise ValueError("CSV must contain 'speaker_id' column")
-        
-        # Add prefix to feature names (except speaker_id)
-        feature_cols = [c for c in feature_df.columns if c != "speaker_id"]
-        rename_dict = {c: f"acoustic_{self.feature_type}__{c}" for c in feature_cols}
-        feature_df = feature_df.rename(columns=rename_dict)
-        
-        return feature_df
-    
-    def extract_for_speaker(self, speaker_id: str, audio_files: list):
-        """
-        Extract acoustic features for a single speaker from multiple audio files.
-        
-        Args:
-            speaker_id: Speaker identifier
-            audio_files: List of audio file paths
-            
-        Returns:
-            DataFrame row with aggregated features for the speaker
-        """
-        all_file_features = []
-        
-        for audio_file in audio_files:
-            try:
-                features = self._extract_from_file(audio_file)
-                if features:
-                    all_file_features.append(features)
-            except Exception as e:
-                print(f"Warning: Failed to extract features from {audio_file}: {e}")
-                continue
-        
-        if not all_file_features:
-            return None
-        
-        # Aggregate features across files (mean)
-        aggregated = pd.DataFrame(all_file_features).mean().to_frame().T
-        aggregated["speaker_id"] = speaker_id
-        
-        return aggregated
-    
-    def _extract_from_file(self, audio_file: Path):
-        """Extract features from a single audio file."""
-        features = {}
-        
-        # Load audio
-        try:
-            audio, sr = librosa.load(audio_file, sr=self.sample_rate)
-        except Exception as e:
-            print(f"Error loading {audio_file}: {e}")
-            return None
-        
-        if len(audio) == 0:
-            return None
-        
-        # Extract based on feature type
-        if self.feature_type == "egemaps" and self.egemaps_extractor:
-            features.update(self._extract_egemaps(audio, sr))
-        elif self.feature_type == "emo" and self.emo_extractor:
-            features.update(self._extract_emotion_features(audio, sr))
-        elif self.feature_type == "temporal":
-            features.update(self._extract_temporal_features(audio, sr))
-        elif self.feature_type == "all":
-            features.update(self._extract_egemaps(audio, sr))
-            features.update(self._extract_emotion_features(audio, sr))
-            features.update(self._extract_temporal_features(audio, sr))
-        
-        return features
-    
-    def _extract_egemaps(self, audio, sr):
-        """Extract eGeMAPS features."""
-        try:
-            features = self.egemaps_extractor.process_signal(audio, sr)
-            return features.iloc[0].to_dict()
-        except Exception as e:
-            print(f"eGeMAPS extraction failed: {e}")
-            return {}
-    
-    def _extract_emotion_features(self, audio, sr):
-        """Extract emotional/acoustic features."""
-        try:
-            features = self.emo_extractor.process_signal(audio, sr)
-            return features.iloc[0].to_dict()
-        except Exception as e:
-            print(f"Emotion feature extraction failed: {e}")
-            return {}
-    
-    def _extract_temporal_features(self, audio, sr):
-        """Extract temporal acoustic features (pitch, energy, etc. over time)."""
-        features = {}
-        
-        # Basic acoustic features
-        features['duration'] = len(audio) / sr
-        
-        # Energy features
-        energy = librosa.feature.rms(y=audio)[0]
-        features['energy_mean'] = np.mean(energy)
-        features['energy_std'] = np.std(energy)
-        features['energy_max'] = np.max(energy)
-        features['energy_min'] = np.min(energy)
-        
-        # Pitch features (using librosa)
-        pitches, magnitudes = librosa.piptrack(y=audio, sr=sr)
-        pitch_values = pitches[magnitudes > np.median(magnitudes)]
-        if len(pitch_values) > 0:
-            features['pitch_mean'] = np.mean(pitch_values)
-            features['pitch_std'] = np.std(pitch_values)
-            features['pitch_max'] = np.max(pitch_values)
-            features['pitch_min'] = np.min(pitch_values)
-        else:
-            features['pitch_mean'] = features['pitch_std'] = features['pitch_max'] = features['pitch_min'] = 0
-        
-        # Spectral features
-        spectral_centroids = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
-        features['spectral_centroid_mean'] = np.mean(spectral_centroids)
-        features['spectral_centroid_std'] = np.std(spectral_centroids)
-        
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr)[0]
-        features['spectral_rolloff_mean'] = np.mean(spectral_rolloff)
-        features['spectral_rolloff_std'] = np.std(spectral_rolloff)
-        
-        # Zero crossing rate
-        zcr = librosa.feature.zero_crossing_rate(audio)[0]
-        features['zcr_mean'] = np.mean(zcr)
-        features['zcr_std'] = np.std(zcr)
-        
-        # MFCCs
-        mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
-        for i in range(13):
-            features[f'mfcc_{i+1}_mean'] = np.mean(mfccs[i])
-            features[f'mfcc_{i+1}_std'] = np.std(mfccs[i])
-        
-        return features
-
-
-# ----------------------------------------------------------------------
-#  Fusion Strategies
-# ----------------------------------------------------------------------
-
-class FusionStrategy:
-    """Base class for fusion strategies."""
-    
-    def __init__(self, fusion_type="early", acoustic_features=None):
-        """
-        Args:
-            fusion_type: "early", "late", "hybrid", or "llm_finetune"
-            acoustic_features: DataFrame with acoustic features
-        """
-        self.fusion_type = fusion_type
-        self.acoustic_features = acoustic_features
-        self.llm_model = None  # For LLM-based fusion
-    
-    def fuse_with_embeddings(self, embeddings_df, feature_cols, task=None, args=None):
-        """
-        Fuse acoustic features with text embeddings.
-        
-        Args:
-            embeddings_df: DataFrame with text embeddings
-            feature_cols: List of embedding feature columns
-            task: "classification" or "regression"
-            args: Command line arguments
-            
-        Returns:
-            Fused DataFrame, updated feature columns
-        """
-        if self.acoustic_features is None or self.acoustic_features.empty:
-            print("No acoustic features provided. Using only text embeddings.")
-            return embeddings_df, feature_cols
-        
-        if self.fusion_type == "early":
-            return self._early_fusion(embeddings_df, feature_cols)
-        elif self.fusion_type == "late":
-            return self._late_fusion(embeddings_df, feature_cols, task, args)
-        elif self.fusion_type == "hybrid":
-            return self._hybrid_fusion(embeddings_df, feature_cols, task, args)
-        elif self.fusion_type == "llm_finetune":
-            return self._llm_fusion(embeddings_df, feature_cols, task, args)
-        else:
-            print(f"Unknown fusion type {self.fusion_type}. Using early fusion.")
-            return self._early_fusion(embeddings_df, feature_cols)
-    
-    def _early_fusion(self, embeddings_df, feature_cols):
-        """Early fusion: Concatenate acoustic features with embeddings."""
-        print("Using EARLY fusion: Concatenating acoustic features with text embeddings")
-        
-        # Merge acoustic features with embeddings
-        fused_df = embeddings_df.merge(
-            self.acoustic_features, 
-            on="speaker_id", 
-            how="left"
-        )
-        
-        # Fill missing acoustic features with 0
-        acoustic_cols = [c for c in self.acoustic_features.columns if c != "speaker_id"]
-        for col in acoustic_cols:
-            if col not in fused_df.columns:
-                fused_df[col] = 0.0
-            fused_df[col] = fused_df[col].fillna(0.0)
-        
-        # Update feature columns
-        all_feature_cols = feature_cols + acoustic_cols
-        
-        print(f"  Original features: {len(feature_cols)}")
-        print(f"  Acoustic features: {len(acoustic_cols)}")
-        print(f"  Total features: {len(all_feature_cols)}")
-        
-        return fused_df, all_feature_cols
-    
-    def _late_fusion(self, embeddings_df, feature_cols, task, args):
-        """Late fusion: Train separate models on text and acoustic, then combine predictions."""
-        print("Using LATE fusion: Combining predictions from text and acoustic models")
-        
-        # This is handled separately in train_meta_model_with_fusion
-        # Here we just prepare the data with both feature sets
-        fused_df = embeddings_df.merge(
-            self.acoustic_features,
-            on="speaker_id",
-            how="left"
-        )
-        
-        acoustic_cols = [c for c in self.acoustic_features.columns if c != "speaker_id"]
-        for col in acoustic_cols:
-            if col not in fused_df.columns:
-                fused_df[col] = 0.0
-            fused_df[col] = fused_df[col].fillna(0.0)
-        
-        # For late fusion, we keep features separate
-        return fused_df, {"text": feature_cols, "acoustic": acoustic_cols}
-    
-    def _hybrid_fusion(self, embeddings_df, feature_cols, task, args):
-        """Hybrid fusion: Early fusion at feature level + late fusion at prediction level."""
-        print("Using HYBRID fusion: Early feature concatenation + late prediction fusion")
-        
-        # First do early fusion
-        fused_df, all_features = self._early_fusion(embeddings_df, feature_cols)
-        
-        # Return with indicator that this is hybrid (will be handled in training)
-        return fused_df, {"hybrid_features": all_features, "mode": "hybrid"}
-    
-    def _llm_fusion(self, embeddings_df, feature_cols, task, args):
-        """LLM-based fusion: Fine-tune LLM with acoustic features as additional inputs."""
-        print("Using LLM FUSION: Fine-tuning LLM with acoustic features")
-        
-        # For LLM fusion, we need to incorporate acoustic features into the LLM
-        # This can be done by:
-        # 1. Adding acoustic features as special tokens
-        # 2. Using adapter layers that take acoustic features
-        # 3. Concatenating acoustic features with LLM embeddings
-        
-        # Prepare data with acoustic features
-        fused_df = embeddings_df.merge(
-            self.acoustic_features,
-            on="speaker_id",
-            how="left"
-        )
-        
-        acoustic_cols = [c for c in self.acoustic_features.columns if c != "speaker_id"]
-        for col in acoustic_cols:
-            if col not in fused_df.columns:
-                fused_df[col] = 0.0
-            fused_df[col] = fused_df[col].fillna(0.0)
-        
-        all_features = feature_cols + acoustic_cols
-        
-        print(f"  LLM fusion prepared with {len(feature_cols)} text features + {len(acoustic_cols)} acoustic features")
-        print(f"  Note: LLM fine-tuning with acoustic features requires custom model architecture")
-        
-        return fused_df, all_features
-
 
 # ----------------------------------------------------------------------
 #  Utility Functions
@@ -665,6 +262,7 @@ class SplitManager:
         
         return folds
 
+
     def _create_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
         """Create K folds from the final training set."""
         print(f"Creating {self.n_folds} folds from final training set.")
@@ -744,6 +342,105 @@ class SplitManager:
         test_idx = df_work[df_work["speaker_id"].isin(test_speakers)].index.to_numpy()
         return train_idx, test_idx
 
+def save_per_question_validation_scores(
+    train_features, val_features, feature_cols, 
+    questions_ranked, args, out_dir: Path, 
+    prefix: str = ""
+):
+    """
+    Calculate and save validation score for each question individually.
+    
+    Args:
+        train_features: Training features DataFrame
+        val_features: Validation features DataFrame
+        feature_cols: All feature columns
+        questions_ranked: List of questions in ranked order
+        args: Command line arguments
+        out_dir: Output directory
+        prefix: Optional prefix for filename
+    """
+    print("\n" + "="*60)
+    print("CALCULATING PER-QUESTION VALIDATION SCORES")
+    print("="*60)
+    
+    per_question_scores = []
+    
+    # For each question, train a model using only that question's features
+    for idx, q in enumerate(questions_ranked):
+        # Get features for this question
+        q_cols = [c for c in feature_cols if c.split("__", 1)[0] == q]
+        
+        if not q_cols:
+            print(f"  Skipping {q}: no features found")
+            continue
+        
+        print(f"  Evaluating {q} (rank {idx+1}/{len(questions_ranked)}) with {len(q_cols)} features...")
+        
+        # Train a simple model on just this question
+        model = make_meta_model(args)
+        
+        try:
+            model.fit(
+                train_features[q_cols].to_numpy(), 
+                train_features["y_true"].to_numpy()
+            )
+            
+            # Evaluate on validation set
+            metrics = score_meta_model(
+                model,
+                val_features[q_cols].to_numpy(),
+                val_features["y_true"].to_numpy(),
+                args.task
+            )
+            
+            score = primary_score(metrics, args.task)
+            
+            # Get additional metrics
+            additional_metrics = {}
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)) and k not in ['primary_score']:
+                    additional_metrics[k] = v
+            
+            per_question_scores.append({
+                "question_id": q,
+                "rank": idx + 1,
+                "validation_score": score,
+                "n_features": len(q_cols),
+                **additional_metrics
+            })
+            
+        except Exception as e:
+            print(f"    Error evaluating {q}: {e}")
+            continue
+    
+    # Save to CSV
+    df = pd.DataFrame(per_question_scores)
+    if not df.empty:
+        df = df.sort_values("validation_score", ascending=False)
+        df['rank_by_score'] = range(1, len(df) + 1)
+        
+        filename = f"{prefix}_per_question_validation_scores.csv" if prefix else "per_question_validation_scores.csv"
+        df.to_csv(out_dir / filename, index=False)
+        
+        print(f"\n✓ Saved per-question validation scores to: {out_dir / filename}")
+        print(f"\nTop 10 questions by validation score:")
+        print(df.head(10)[["question_id", "validation_score", "rank", "rank_by_score"]].to_string(index=False))
+        
+        # Also save a summary of score distribution
+        summary = {
+            "mean_score": df['validation_score'].mean(),
+            "std_score": df['validation_score'].std(),
+            "min_score": df['validation_score'].min(),
+            "max_score": df['validation_score'].max(),
+            "n_questions": len(df)
+        }
+        with open(out_dir / f"{prefix}_per_question_score_summary.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        return df
+    else:
+        print("  No valid question scores could be calculated")
+        return None
 
 # ----------------------------------------------------------------------
 #  Primary Score Function
@@ -1494,14 +1191,15 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
     )
 
 def train_question_models(train_df, val_df, test_df, metadata, args, best_hparams, out_dir: Path):
-    """Train per-question models with caching."""
+    """Train per-question models."""
     embedding_files = {"train": {}, "val": {}, "test": {}}
     summaries = []
     
     questions = [q.upper() for q in args.questions]
-    
-    # Check if test_df is empty (test_frac=0 case)
     is_test_empty = test_df is None or test_df.empty
+    
+    # Initialize validation_scores dictionary at the START of the function
+    validation_scores = {}
     
     for question in questions:
         q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
@@ -1522,30 +1220,23 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         train_emb = q_dir / "embeddings_train.csv"
         val_emb = q_dir / "embeddings_val.csv"
         test_emb = q_dir / "embeddings_test.csv"
-        
-        # Also check for cached embeddings in a global cache directory
-        global_cache_dir = out_dir.parent / "cache" / "embeddings"
-        global_cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create a hash of the data to use as cache key
-        data_hash = hash((question, len(q_train), len(q_val), best_hparams.get("max_length", 256)))
-        cached_train_emb = global_cache_dir / f"{question}_train_{data_hash}.csv"
-        cached_val_emb = global_cache_dir / f"{question}_val_{data_hash}.csv"
-        
+
         # Check if we need to train the model
         model_exists = model_dir.exists() and saved_model_exists(model_dir)
-        embeddings_exist = (train_emb.exists() and val_emb.exists()) or (cached_train_emb.exists() and cached_val_emb.exists())
+        embeddings_exist = train_emb.exists() and val_emb.exists()
         test_embeddings_exist = is_test_empty or test_emb.exists()
         
         if (model_exists and embeddings_exist and test_embeddings_exist):
             print(f"{question}: model and embeddings already exist, loading.")
             
-            # Load from cache if available
-            if cached_train_emb.exists() and cached_val_emb.exists():
-                # Copy from cache to expected location 
-                shutil.copy2(cached_train_emb, train_emb)
-                shutil.copy2(cached_val_emb, val_emb)
-                print(f"  Loaded embeddings from cache")
+            # Load existing validation score from summary if available
+            summary_path = out_dir / "question_model_summary.csv"
+            if summary_path.exists():
+                summary_df = pd.read_csv(summary_path)
+                if not summary_df.empty and 'val_score' in summary_df.columns:
+                    row = summary_df[summary_df['question_id'] == question]
+                    if not row.empty and not pd.isna(row['val_score'].iloc[0]):
+                        validation_scores[question] = row['val_score'].iloc[0]
         else:
             print(f"{question}: training model on {len(q_train)} examples, val on {len(q_val)}")
             q_cfg = make_question_cfg(args, question, q_dir, best_hparams)
@@ -1557,13 +1248,71 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
             extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
             
-            # Cache embeddings for future runs
-            shutil.copy2(train_emb, cached_train_emb)
-            shutil.copy2(val_emb, cached_val_emb)
-            print(f"  Cached embeddings to {global_cache_dir}")
+            # ===== Calculate and store validation score =====
+            try:
+                device = choose_device()
+                tokenizer = load_tokenizer(str(model_dir))
+                model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+                model.eval()
+                
+                texts = q_val["text"].tolist()
+                labels = q_val["label"].values
+                preds = []
+                batch_size = min(best_hparams.get("batch_size", getattr(args, 'batch_size', 8)), len(texts))
+                
+                with torch.no_grad():
+                    for start in range(0, len(texts), batch_size):
+                        batch_texts = texts[start:start+batch_size]
+                        enc = tokenizer(
+                            batch_texts,
+                            truncation=True,
+                            padding=True,
+                            max_length=best_hparams.get("max_length", getattr(args, 'max_length', 256)),
+                            return_tensors="pt",
+                        )
+                        enc = {k: v.to(device) for k, v in enc.items()}
+                        outputs = model(**enc)
+                        logits = outputs.logits.cpu().numpy()
+                        
+                        if args.task == "classification":
+                            batch_preds = np.argmax(logits, axis=1)
+                            preds.extend(batch_preds)
+                        else:
+                            if logits.ndim == 2 and logits.shape[1] == 1:
+                                batch_preds = logits[:, 0]
+                            else:
+                                batch_preds = logits.flatten()
+                            preds.extend(batch_preds.tolist())
+                
+                preds = np.array(preds)
+                labels = np.array(labels)
+                
+                if len(preds) > 0 and len(labels) > 0:
+                    if args.task == "classification":
+                        val_score = f1_score(labels, preds, average="macro", zero_division=0)
+                    else:
+                        val_score = np.sqrt(mean_squared_error(labels, preds))
+                    
+                    validation_scores[question] = val_score
+                    print(f"  {question} validation score: {val_score:.4f}")
+                else:
+                    print(f"  {question}: No predictions or labels to evaluate")
+                    validation_scores[question] = None
+                
+            except Exception as e:
+                print(f"  Could not calculate validation score for {question}: {e}")
+                validation_scores[question] = None
             
+            # Handle test embeddings
             if not is_test_empty and not q_test.empty:
                 extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
+            elif not is_test_empty:
+                # Create empty test embeddings file with correct structure
+                print(f"{question}: No test examples, creating empty test embeddings placeholder")
+                if train_emb.exists():
+                    sample_emb = pd.read_csv(train_emb, nrows=1)
+                    empty_test_emb = pd.DataFrame(columns=sample_emb.columns)
+                    empty_test_emb.to_csv(test_emb, index=False)
 
         embedding_files["train"][question] = train_emb
         embedding_files["val"][question] = val_emb
@@ -1573,11 +1322,37 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             "train_examples": len(q_train),
             "val_examples": len(q_val),
             "test_examples": len(q_test) if not is_test_empty else 0,
+            "val_score": validation_scores.get(question, None),
             "model_dir": str(model_dir)
         })
     
+    # ===== Save validation scores with proper error handling =====
+    if validation_scores:
+        # Filter out None values
+        valid_scores = {q: s for q, s in validation_scores.items() if s is not None}
+        
+        if valid_scores:
+            scores_df = pd.DataFrame([
+                {"question_id": q, "validation_score": s}
+                for q, s in valid_scores.items()
+            ])
+            
+            if not scores_df.empty:
+                scores_df = scores_df.sort_values("validation_score", ascending=False)
+                scores_df.to_csv(out_dir / "per_question_model_validation_scores.csv", index=False)
+                print(f"\n✓ Per-question model validation scores saved to: {out_dir / 'per_question_model_validation_scores.csv'}")
+                print(f"  Questions evaluated: {len(scores_df)}")
+                print(scores_df.to_string(index=False))
+            else:
+                print(f"\n⚠️ No valid scores to save (empty DataFrame)")
+        else:
+            print(f"\n⚠️ No valid scores to save (all scores are None)")
+    else:
+        print(f"\n⚠️ No validation scores collected")
+    
+    # Save summaries even if no scores
     pd.DataFrame(summaries).to_csv(out_dir / "question_model_summary.csv", index=False)
-    return embedding_files 
+    return embedding_files
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     """Build feature table from embeddings."""
@@ -1622,61 +1397,6 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
     return merged, feature_cols
 
-
-def build_feature_table_with_fusion(embedding_paths, questions, acoustic_df, fusion_strategy):
-    """Build feature table with optional acoustic fusion."""
-    
-    # Build base feature table from embeddings
-    tables = []
-    for q in questions:
-        path = embedding_paths.get(q)
-        if path is None or not Path(path).exists():
-            print(f"Warning: No embeddings found for question {q}, skipping")
-            continue
-        try:
-            emb_df = pd.read_csv(path)
-            if emb_df.empty:
-                print(f"Warning: Empty embeddings for question {q}, skipping")
-                continue
-                
-            emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
-            if not emb_cols:
-                print(f"Warning: No embedding columns found for question {q}, skipping")
-                continue
-                
-            grouped = emb_df.groupby("speaker_id", as_index=True).agg(
-                y_true=("y_true", "first"),
-                **{col: (col, "mean") for col in emb_cols},
-            )
-            grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
-            grouped[f"{q}__present"] = 1.0
-            tables.append(grouped)
-        except Exception as e:
-            print(f"Error processing embeddings for question {q}: {e}")
-            continue
-    
-    if not tables:
-        raise ValueError("No embedding tables available.")
-    
-    merged = tables[0]
-    for t in tables[1:]:
-        merged = merged.join(t.drop(columns=["y_true"]), how="outer")
-        merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
-    
-    merged = merged.reset_index()
-    feature_cols = [c for c in merged.columns if "__" in c]
-    merged[feature_cols] = merged[feature_cols].fillna(0.0)
-    
-    # Apply fusion strategy if acoustic features are available
-    if acoustic_df is not None and not acoustic_df.empty and fusion_strategy:
-        print(f"\nApplying {fusion_strategy.fusion_type.upper()} fusion with acoustic features")
-        merged, feature_cols = fusion_strategy.fuse_with_embeddings(
-            merged, feature_cols, None, None
-        )
-    
-    return merged, feature_cols
-
-
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
     """Align feature columns across splits."""
     for df in [val_df, test_df]:
@@ -1689,7 +1409,6 @@ def align_feature_tables(train_df, val_df, test_df, feature_cols):
                 df.drop(columns=extra, inplace=True)
     return train_df, val_df, test_df
 
-
 def question_groups(feature_cols):
     """Group features by question."""
     groups = {}
@@ -1697,7 +1416,6 @@ def question_groups(feature_cols):
         q = c.split("__", 1)[0]
         groups.setdefault(q, []).append(c)
     return groups
-
 
 def permutation_question_importance(model, data_df, feature_cols, args):
     """Calculate feature importance by permuting all features from each question."""
@@ -1858,325 +1576,486 @@ def score_meta_model(model, x, y, task):
         }
 
 
-def train_with_fusion(train_features, val_features, test_features, feature_info, args, out_dir):
+# =======================================================================
+# NEW: Audio feature loading and fusion utilities
+# =======================================================================
+
+def load_audio_features(csv_path: str, speaker_col: str = "speaker_id",
+                        exclude_cols: list = None) -> pd.DataFrame:
     """
-    Train meta-model with fusion strategies.
-    
-    Args:
-        train_features: Training features DataFrame
-        val_features: Validation features DataFrame
-        test_features: Test features DataFrame
-        feature_info: Either list of feature columns or dict with separate feature sets
-        args: Command line arguments
-        out_dir: Output directory
+    Load audio features from CSV and prepare them for fusion.
+    Assumes the CSV has a speaker_id column and numeric feature columns.
     """
+    if not Path(csv_path).exists():
+        raise FileNotFoundError(f"Audio features CSV not found: {csv_path}")
     
-    if args.fusion_type == "late" and isinstance(feature_info, dict):
-        return train_late_fusion(train_features, val_features, test_features, feature_info, args, out_dir)
-    elif args.fusion_type == "hybrid":
-        return train_hybrid_fusion(train_features, val_features, test_features, feature_info, args, out_dir)
-    elif args.fusion_type == "llm_finetune":
-        return train_llm_fusion(train_features, val_features, test_features, feature_info, args, out_dir)
+    audio_df = pd.read_csv(csv_path)
+    
+    # Ensure speaker column exists
+    if speaker_col not in audio_df.columns:
+        raise ValueError(f"Speaker column '{speaker_col}' not found in audio CSV. Available: {audio_df.columns.tolist()}")
+    
+    # Determine feature columns: all numeric columns except identifier columns
+    exclude = exclude_cols or [speaker_col, 'session_id', 'utterance_id', 'question_id', 'label', 'y_true']
+    numeric_cols = audio_df.select_dtypes(include=[np.number]).columns.tolist()
+    audio_feature_cols = [c for c in numeric_cols if c not in exclude]
+    
+    if not audio_feature_cols:
+        raise ValueError("No numeric feature columns found in audio CSV. Check exclude_cols.")
+    
+    # Keep only speaker and feature columns
+    keep_cols = [speaker_col] + audio_feature_cols
+    audio_df = audio_df[keep_cols].copy()
+    
+    # Ensure no duplicate speakers
+    if audio_df.duplicated(subset=[speaker_col]).any():
+        # Aggregate by speaker (mean) if duplicates exist
+        audio_df = audio_df.groupby(speaker_col).mean().reset_index()
+    
+    # Rename speaker column to match our pipeline
+    if speaker_col != 'speaker_id':
+        audio_df.rename(columns={speaker_col: 'speaker_id'}, inplace=True)
+    
+    print(f"Loaded audio features: {len(audio_df)} speakers, {len(audio_feature_cols)} features")
+    return audio_df
+
+
+def merge_audio_features(feature_df: pd.DataFrame, audio_df: pd.DataFrame,
+                         how: str = 'left') -> pd.DataFrame:
+    """
+    Merge speaker-level feature table with audio features.
+    feature_df must have 'speaker_id' column.
+    audio_df must have 'speaker_id' column.
+    """
+    merged = feature_df.merge(audio_df, on='speaker_id', how=how)
+    if how == 'left':
+        # Fill missing audio features with 0
+        audio_cols = [c for c in audio_df.columns if c != 'speaker_id']
+        for col in audio_cols:
+            if col in merged.columns:
+                merged[col] = merged[col].fillna(0.0)
+    return merged
+
+
+def get_audio_feature_cols(audio_df: pd.DataFrame) -> list:
+    """Return list of audio feature column names (excludes speaker_id)."""
+    return [c for c in audio_df.columns if c != 'speaker_id']
+
+
+def train_meta_model_on_features(train_features, val_features, test_features,
+                                 feature_cols, args, out_dir: Path,
+                                 model_name_suffix: str = ""):
+    """
+    Train a meta-model on the given feature set, with CV-based K selection.
+    This is a wrapper around train_meta_model_with_cv_selection.
+    """
+    # We need to call the existing training function; but we need to make sure
+    # it uses the provided feature_cols. Since the original function computes
+    # importance inside, we'll adapt by passing feature_cols.
+    # We'll create a wrapper that mimics the original.
+    # Instead of duplicating, we'll use the same function but we need to
+    # ensure it doesn't recompute feature_cols from embedding files.
+    # The original train_meta_model_with_cv_selection expects train_features,
+    # val_features, test_features, feature_cols, args, out_dir.
+    # So we can just call it.
+    if args.test_frac == 0:
+        # If no test set, use CV-only mode
+        return train_meta_model_cv(
+            train_features, val_features, test_features, feature_cols, args, out_dir
+        )
     else:
-        # Early fusion or standard training
-        if isinstance(feature_info, dict):
-            # If feature_info is a dict but we're not doing late fusion, extract features
-            if "hybrid_features" in feature_info:
-                feature_cols = feature_info["hybrid_features"]
-            elif "text" in feature_info:
-                feature_cols = feature_info["text"] + feature_info.get("acoustic", [])
-            else:
-                feature_cols = []
-        else:
-            feature_cols = feature_info
-        
         return train_meta_model_with_cv_selection(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
 
 
-def train_late_fusion(train_features, val_features, test_features, feature_sets, args, out_dir):
+def combine_predictions(preds_list, task, weights=None):
     """
-    Train with late fusion (separate models for each modality).
-    
-    feature_sets: dict with keys like "text", "acoustic"
+    Combine predictions from multiple models.
+    For classification: soft voting (average probabilities) if probabilities provided,
+    else majority vote.
+    For regression: average.
     """
-    print("\n" + "="*60)
-    print("TRAINING WITH LATE FUSION")
-    print("="*60)
-    
-    # Train separate models for each feature set
-    models = {}
-    predictions = {}
-    
-    for modality, feat_cols in feature_sets.items():
-        print(f"\nTraining {modality} model...")
-        print(f"  Features: {len(feat_cols)}")
-        
-        # Create output directory for this modality
-        modality_dir = out_dir / f"late_fusion_{modality}"
-        modality_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Train model for this modality
-        result = train_meta_model_with_cv_selection(
-            train_features, val_features, test_features, feat_cols, args, modality_dir
-        )
-        
-        models[modality] = result
-        predictions[modality] = pd.read_csv(modality_dir / "meta_test_predictions.csv")
-    
-    # Combine predictions using voting/averaging
-    print("\n" + "="*60)
-    print("COMBINING MODALITY PREDICTIONS")
-    print("="*60)
-    
-    # Get base predictions
-    test_df = test_features.copy()
-    test_df["y_true"] = test_features["y_true"]
-    
-    # Combine predictions
-    for modality, pred_df in predictions.items():
-        test_df[f"pred_{modality}"] = pred_df["y_pred"]
-    
-    # Weighted average of predictions
-    if args.fusion_weights:
-        weights = args.fusion_weights
-    else:
-        weights = [1.0 / len(models)] * len(models)
-    
-    # Combine predictions
-    if args.task == "classification":
-        # For classification, use majority voting or probability averaging
-        pred_cols = [f"pred_{m}" for m in models.keys()]
-        
-        if args.fusion_voting == "soft":
-            # Need probabilities for soft voting
-            print("Soft voting requires probabilities. Falling back to hard voting.")
-            args.fusion_voting = "hard"
-        
-        if args.fusion_voting == "hard":
-            # Majority voting
-            pred_matrix = test_df[pred_cols].to_numpy()
-            final_preds = np.apply_along_axis(
-                lambda x: np.bincount(x.astype(int)).argmax(), 
-                axis=1, 
-                arr=pred_matrix
-            )
+    if task == "classification":
+        # Assuming preds_list contains dictionaries with 'y_pred' and optionally 'probs'
+        # If all have 'probs', average them; else use y_pred for majority vote.
+        probs_available = all('probs' in p for p in preds_list)
+        if probs_available:
+            # Average probabilities
+            avg_probs = np.mean([p['probs'] for p in preds_list], axis=0)
+            y_comb = np.argmax(avg_probs, axis=1)
+            # Also return averaged probs
+            return {"y_pred": y_comb, "probs": avg_probs}
         else:
-            # Weighted voting
-            final_preds = np.zeros(len(test_df))
-            for modality, weight in zip(models.keys(), weights):
-                final_preds += weight * test_df[f"pred_{modality}"].values
-            final_preds = np.round(final_preds).astype(int)
+            # Majority vote
+            y_preds = np.array([p['y_pred'] for p in preds_list])
+            y_comb = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0, arr=y_preds)
+            return {"y_pred": y_comb}
     else:
-        # For regression, weighted average
-        pred_cols = [f"pred_{m}" for m in models.keys()]
-        final_preds = np.zeros(len(test_df))
-        for modality, weight in zip(models.keys(), weights):
-            final_preds += weight * test_df[f"pred_{modality}"].values
+        # Average predictions
+        y_preds = np.array([p['y_pred'] for p in preds_list])
+        y_comb = np.mean(y_preds, axis=0)
+        return {"y_pred": y_comb}
+
+
+def train_model_based_fusion(text_model, audio_model, train_preds, val_preds, test_preds,
+                             task, args):
+    """
+    Train a second-level meta-model on the predictions of text and audio models.
+    train_preds, val_preds, test_preds are DataFrames with columns for each modality's predictions.
+    For classification, we use probabilities; for regression, raw predictions.
+    """
+    from sklearn.linear_model import LogisticRegression, Ridge
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
     
-    # Evaluate combined predictions
-    test_metrics = score_meta_model(
-        None,  # No model, using combined predictions directly
-        final_preds,
-        test_df["y_true"].values,
-        args.task
+    # Prepare training data: features = concatenated predictions
+    X_train = np.column_stack([train_preds['text_y_pred'], train_preds['audio_y_pred']])
+    y_train = train_preds['y_true'].values
+    X_val = np.column_stack([val_preds['text_y_pred'], val_preds['audio_y_pred']])
+    y_val = val_preds['y_true'].values
+    X_test = np.column_stack([test_preds['text_y_pred'], test_preds['audio_y_pred']])
+    y_test = test_preds['y_true'].values
+    
+    if task == "classification":
+        # Use logistic regression with balanced class weights
+        meta_model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
+        ])
+    else:
+        meta_model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", Ridge(alpha=1.0))
+        ])
+    
+    meta_model.fit(X_train, y_train)
+    y_pred = meta_model.predict(X_test)
+    metrics = score_meta_model(None, y_pred, y_test, task)
+    return meta_model, metrics, y_pred
+
+
+def run_fusion_experiments(train_features, val_features, test_features,
+                           feature_cols_text, audio_df, args, out_dir: Path):
+    """
+    Run various fusion strategies: early, model-based, late, and baselines.
+    Saves results in a subfolder 'fusion_results'.
+    """
+    fusion_out = out_dir / "fusion_results"
+    fusion_out.mkdir(parents=True, exist_ok=True)
+    
+    audio_feature_cols = get_audio_feature_cols(audio_df)
+    print(f"\nRunning fusion experiments with {len(feature_cols_text)} text features and {len(audio_feature_cols)} audio features.")
+    print(f"Results will be saved to: {fusion_out}")
+    
+    # Merge audio features into train/val/test feature tables
+    train_with_audio = merge_audio_features(train_features, audio_df, how='left')
+    val_with_audio = merge_audio_features(val_features, audio_df, how='left')
+    test_with_audio = merge_audio_features(test_features, audio_df, how='left') if test_features is not None and not test_features.empty else None
+    
+    # Prepare dictionaries to store results
+    results = {}
+    
+    # ------------------------------------------------------------------
+    # 1. Baseline: Text only (already done by main pipeline, but we'll re-run for consistency)
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("BASELINE: TEXT ONLY")
+    print("="*60)
+    text_out = fusion_out / "text_only"
+    text_out.mkdir(parents=True, exist_ok=True)
+    text_result = train_meta_model_on_features(
+        train_features, val_features, test_features,
+        feature_cols_text, args, text_out
     )
+    results['text_only'] = text_result
+    # Save metrics
+    with open(text_out / "fusion_metrics.json", "w") as f:
+        json.dump(text_result, f, indent=2)
     
-    print("\nLate Fusion Test Metrics:")
-    print(json.dumps(test_metrics, indent=2))
-    
-    # Save results
-    out_df = test_df[["speaker_id", "y_true"]].copy()
-    out_df["y_pred"] = final_preds
-    out_df.to_csv(out_dir / "late_fusion_predictions.csv", index=False)
-    
-    with open(out_dir / "late_fusion_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
-    
-    # Save fusion configuration
-    fusion_config = {
-        "fusion_type": "late",
-        "modalities": list(models.keys()),
-        "weights": weights,
-        "voting": args.fusion_voting if args.task == "classification" else "average"
-    }
-    with open(out_dir / "fusion_config.json", "w") as f:
-        json.dump(fusion_config, f, indent=2)
-    
-    return {
-        "test_metrics": test_metrics,
-        "modality_models": models,
-        "fusion_type": "late"
-    }
-
-
-def train_hybrid_fusion(train_features, val_features, test_features, feature_info, args, out_dir):
-    """Train with hybrid fusion (early + late combination)."""
+    # ------------------------------------------------------------------
+    # 2. Baseline: Audio only
+    # ------------------------------------------------------------------
     print("\n" + "="*60)
-    print("TRAINING WITH HYBRID FUSION")
+    print("BASELINE: AUDIO ONLY")
     print("="*60)
+    audio_out = fusion_out / "audio_only"
+    audio_out.mkdir(parents=True, exist_ok=True)
+    # Train meta-model on audio features only
+    audio_result = train_meta_model_on_features(
+        train_with_audio, val_with_audio, test_with_audio,
+        audio_feature_cols, args, audio_out
+    )
+    results['audio_only'] = audio_result
+    with open(audio_out / "fusion_metrics.json", "w") as f:
+        json.dump(audio_result, f, indent=2)
     
-    if isinstance(feature_info, dict) and "hybrid_features" in feature_info:
-        # Use early fusion features for base model
-        feature_cols = feature_info["hybrid_features"]
-        
-        # Train base model with early fusion
-        base_result = train_meta_model_with_cv_selection(
-            train_features, val_features, test_features, feature_cols, args, out_dir / "early_fusion"
-        )
-        
-        # For hybrid, we could also add late fusion with other modalities
-        # This is a simplified hybrid approach
-        
-        return base_result
-    else:
-        print("Hybrid fusion requires feature_info dict. Falling back to early fusion.")
-        return train_early_fusion(train_features, val_features, test_features, feature_info, args, out_dir)
-
-
-def train_llm_fusion(train_features, val_features, test_features, feature_cols, args, out_dir):
-    """Train with LLM fine-tuning incorporating acoustic features."""
+    # ------------------------------------------------------------------
+    # 3. Early Fusion: concatenate text and audio features
+    # ------------------------------------------------------------------
     print("\n" + "="*60)
-    print("TRAINING WITH LLM FUSION")
+    print("EARLY FUSION (concat text + audio)")
     print("="*60)
+    early_out = fusion_out / "early_fusion"
+    early_out.mkdir(parents=True, exist_ok=True)
+    early_feature_cols = feature_cols_text + audio_feature_cols
+    early_result = train_meta_model_on_features(
+        train_with_audio, val_with_audio, test_with_audio,
+        early_feature_cols, args, early_out
+    )
+    results['early_fusion'] = early_result
+    with open(early_out / "fusion_metrics.json", "w") as f:
+        json.dump(early_result, f, indent=2)
     
-    # For LLM fusion, we need to modify the per-question model training
-    # to include acoustic features as additional inputs to the LLM
+    # ------------------------------------------------------------------
+    # 4. Late Fusion: combine predictions from text and audio models
+    #    We need to get predictions from both models on the same test set.
+    #    We'll use the models trained in the baseline experiments.
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("LATE FUSION (average / soft vote of text and audio predictions)")
+    print("="*60)
+    late_out = fusion_out / "late_fusion"
+    late_out.mkdir(parents=True, exist_ok=True)
     
-    # Store acoustic feature information for use in per-question models
-    if isinstance(feature_cols, list):
-        acoustic_feature_cols = [c for c in feature_cols if c.startswith("acoustic_")]
-        text_feature_cols = [c for c in feature_cols if not c.startswith("acoustic_")]
-        
-        print(f"  Text features: {len(text_feature_cols)}")
-        print(f"  Acoustic features: {len(acoustic_feature_cols)}")
-    
-    # For now, we'll use early fusion as a simplified LLM fusion
-    # A true implementation would modify the transformer model to accept acoustic features
-    print("  Note: Full LLM fusion requires custom model architecture.")
-    print("  Using early fusion as approximation.")
-    
-    if isinstance(feature_cols, list):
-        return train_meta_model_with_cv_selection(
-            train_features, val_features, test_features, feature_cols, args, out_dir
-        )
+    # Load the best models from text_only and audio_only
+    if args.test_frac == 0:
+        # For CV mode, we have final_cv_model.joblib
+        text_model_path = text_out / "final_cv_model.joblib"
+        audio_model_path = audio_out / "final_cv_model.joblib"
+        # For CV mode, we don't have a single test set; we need to combine fold predictions.
+        # We'll use the aggregate predictions from CV.
+        # Instead, we can use the per-fold models and combine predictions.
+        # Let's implement a simple approach: use the final models trained on all data (which are saved).
+        # For late fusion in CV, we can average the predictions of the two models on each fold.
+        # But since we don't have per-fold predictions easily, we'll use the final models on the full data
+        # and compute metrics by cross-validation? That's messy.
+        # For simplicity, we'll skip late fusion for test_frac==0? Or we can compute fold-level fusion.
+        # We'll implement a simpler version: we'll use the existing per-fold predictions from the CV.
+        # The train_meta_model_cv function saves cv_all_predictions.csv.
+        # We can load those and combine.
+        # But we need to align folds between text and audio.
+        # Instead, we can re-run CV for each modality and get predictions, then combine.
+        # This is getting complex; we'll implement a generic function that trains both models via CV
+        # and then combines predictions at fold level.
+        # To keep code manageable, we'll implement a dedicated late fusion CV function.
+        # For now, we'll print a note and skip late fusion for CV mode.
+        print("Late fusion not implemented for test_frac==0 (CV mode) in this version.")
+        print("Skipping late fusion.")
+        results['late_fusion'] = None
     else:
-        return train_meta_model_with_cv_selection(
-            train_features, val_features, test_features, feature_cols.get("text", []) + feature_cols.get("acoustic", []), args, out_dir
-        )
-
-
-def train_meta_model(train_features, val_features, test_features, feature_cols, args, out_dir: Path):
-    """Train meta-model with top-k feature selection."""
-    
-    # Create meta-model (single or ensemble)
-    base_model = make_meta_model(args)
-    base_model.fit(train_features[feature_cols].to_numpy(), train_features["y_true"].to_numpy())
-    
-    # Calculate feature importance
-    importance_df = permutation_question_importance(base_model, val_features, feature_cols, args)
-    importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
-
-    questions_ranked = importance_df["question_id"].tolist()
-    if not questions_ranked:
-        raise ValueError("No ranked questions.")
-
-    max_k = len(questions_ranked)
-    ks = list(range(1, max_k + 1))
-    if args.top_k and 0 < args.top_k < max_k:
-        ks = sorted(set(ks + [args.top_k]))
-
-    val_metrics = {}
-    best_val_score = -float("inf")
-    best_k = 1
-    
-    for k in ks:
-        selected_qs = questions_ranked[:k]
-        selected_cols = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs)]
-        model = make_meta_model(args)
-        model.fit(train_features[selected_cols].to_numpy(), train_features["y_true"].to_numpy())
-        m = score_meta_model(model, val_features[selected_cols].to_numpy(), val_features["y_true"].to_numpy(), args.task)
-        val_metrics[k] = m
-        
-        score = primary_score(m, args.task)
-        if score > best_val_score:
-            best_val_score = score
-            best_k = k
+        # Load models from text_only and audio_only
+        text_model_path = text_out / "meta_model.joblib"
+        audio_model_path = audio_out / "meta_model.joblib"
+        if text_model_path.exists() and audio_model_path.exists():
+            text_model = joblib.load(text_model_path)
+            audio_model = joblib.load(audio_model_path)
             
-    print(f"Best k on validation set: {best_k} (primary_score: {best_val_score:.4f})")
-
-    # Train final model on train+val with best k
-    trainval_features = pd.concat([train_features, val_features], ignore_index=True)
-    selected_qs_final = questions_ranked[:best_k]
-    selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
-    final_model = make_meta_model(args)
-    final_model.fit(trainval_features[selected_cols_final].to_numpy(), trainval_features["y_true"].to_numpy())
-
-    test_metrics = score_meta_model(
-        final_model,
-        test_features[selected_cols_final].to_numpy(),
-        test_features["y_true"].to_numpy(),
-        args.task
-    )
-    print("\nFinal test metrics:")
-    print(json.dumps(test_metrics, indent=2))
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump(final_model, out_dir / "meta_model.joblib")
-    pd.DataFrame({"question_id": selected_qs_final}).to_csv(out_dir / "selected_questions.csv", index=False)
-    pd.DataFrame({"feature": selected_cols_final}).to_csv(out_dir / "selected_embedding_features.csv", index=False)
-    with open(out_dir / "meta_test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
-
-    preds = final_model.predict(test_features[selected_cols_final].to_numpy())
-    out_df = test_features[["speaker_id", "y_true"]].copy()
-    out_df["y_pred"] = preds
-    
-    # Get probabilities for classification
-    if args.task == "classification":
-        if hasattr(final_model, "predict_proba"):
-            probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
-            classes = final_model.classes_
-            for i, cls in enumerate(classes):
-                out_df[f"prob_{cls}"] = probs[:, i]
-        elif hasattr(final_model, "named_estimators_"):
-            # For voting classifier, get probabilities from individual estimators
-            try:
-                probs = final_model.predict_proba(test_features[selected_cols_final].to_numpy())
-                classes = final_model.classes_
+            # Load selected features for each
+            text_selected = pd.read_csv(text_out / "selected_embedding_features.csv")["feature"].tolist()
+            audio_selected = pd.read_csv(audio_out / "selected_embedding_features.csv")["feature"].tolist()
+            
+            # Get predictions on test set
+            test_text_X = test_features[text_selected].to_numpy()
+            test_audio_X = test_with_audio[audio_selected].to_numpy()
+            
+            text_preds = text_model.predict(test_text_X)
+            audio_preds = audio_model.predict(test_audio_X)
+            
+            # Combine by averaging (regression) or soft voting (classification)
+            if args.task == "classification":
+                # Get probabilities if available
+                if hasattr(text_model, "predict_proba"):
+                    text_probs = text_model.predict_proba(test_text_X)
+                else:
+                    text_probs = None
+                if hasattr(audio_model, "predict_proba"):
+                    audio_probs = audio_model.predict_proba(test_audio_X)
+                else:
+                    audio_probs = None
+                
+                if text_probs is not None and audio_probs is not None:
+                    # Average probabilities
+                    combined_probs = (text_probs + audio_probs) / 2.0
+                    combined_preds = np.argmax(combined_probs, axis=1)
+                else:
+                    # Majority vote
+                    combined_preds = np.apply_along_axis(
+                        lambda x: np.bincount(x).argmax(),
+                        axis=0,
+                        arr=np.array([text_preds, audio_preds])
+                    )
+            else:
+                # Regression: average
+                combined_preds = (text_preds + audio_preds) / 2.0
+            
+            y_true = test_features["y_true"].to_numpy()
+            metrics = score_meta_model(None, combined_preds, y_true, args.task)
+            
+            # Save results
+            late_result = {
+                "fusion_method": "late_fusion",
+                "metrics": metrics,
+                "predictions": combined_preds.tolist()
+            }
+            with open(late_out / "fusion_metrics.json", "w") as f:
+                json.dump(metrics, f, indent=2)
+            
+            # Save predictions
+            pred_df = test_features[["speaker_id", "y_true"]].copy()
+            pred_df["y_pred"] = combined_preds
+            if args.task == "classification" and combined_probs is not None:
+                classes = text_model.classes_
                 for i, cls in enumerate(classes):
-                    out_df[f"prob_{cls}"] = probs[:, i]
-            except:
-                print("Warning: Could not get probabilities from ensemble")
+                    pred_df[f"prob_{cls}"] = combined_probs[:, i]
+            pred_df.to_csv(late_out / "predictions.csv", index=False)
+            
+            results['late_fusion'] = metrics
+        else:
+            print("Missing models for late fusion. Skipping.")
+            results['late_fusion'] = None
     
-    out_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
+    # ------------------------------------------------------------------
+    # 5. Model-based Fusion: train a second-level model on text and audio predictions
+    #    (Only for test_frac > 0 case)
+    # ------------------------------------------------------------------
+    if args.test_frac > 0:
+        print("\n" + "="*60)
+        print("MODEL-BASED FUSION (meta-model on text + audio predictions)")
+        print("="*60)
+        model_based_out = fusion_out / "model_based_fusion"
+        model_based_out.mkdir(parents=True, exist_ok=True)
+        
+        # We need to get predictions on train, val, and test from both text and audio models.
+        # We'll use the best models (with selected features) from text_only and audio_only.
+        text_model_path = text_out / "meta_model.joblib"
+        audio_model_path = audio_out / "meta_model.joblib"
+        if text_model_path.exists() and audio_model_path.exists():
+            text_model = joblib.load(text_model_path)
+            audio_model = joblib.load(audio_model_path)
+            
+            text_selected = pd.read_csv(text_out / "selected_embedding_features.csv")["feature"].tolist()
+            audio_selected = pd.read_csv(audio_out / "selected_embedding_features.csv")["feature"].tolist()
+            
+            # Prepare predictions on train, val, test
+            train_text_X = train_features[text_selected].to_numpy()
+            train_audio_X = train_with_audio[audio_selected].to_numpy()
+            val_text_X = val_features[text_selected].to_numpy()
+            val_audio_X = val_with_audio[audio_selected].to_numpy()
+            test_text_X = test_features[text_selected].to_numpy()
+            test_audio_X = test_with_audio[audio_selected].to_numpy()
+            
+            # Predict
+            train_preds_text = text_model.predict(train_text_X)
+            val_preds_text = text_model.predict(val_text_X)
+            test_preds_text = text_model.predict(test_text_X)
+            
+            train_preds_audio = audio_model.predict(train_audio_X)
+            val_preds_audio = audio_model.predict(val_audio_X)
+            test_preds_audio = audio_model.predict(test_audio_X)
+            
+            # For classification, we might want probabilities for better fusion
+            if args.task == "classification":
+                if hasattr(text_model, "predict_proba"):
+                    train_probs_text = text_model.predict_proba(train_text_X)
+                    val_probs_text = text_model.predict_proba(val_text_X)
+                    test_probs_text = text_model.predict_proba(test_text_X)
+                else:
+                    # fallback: one-hot of predictions
+                    n_classes = len(np.unique(train_features["y_true"]))
+                    train_probs_text = np.eye(n_classes)[train_preds_text.astype(int)]
+                    val_probs_text = np.eye(n_classes)[val_preds_text.astype(int)]
+                    test_probs_text = np.eye(n_classes)[test_preds_text.astype(int)]
+                
+                if hasattr(audio_model, "predict_proba"):
+                    train_probs_audio = audio_model.predict_proba(train_audio_X)
+                    val_probs_audio = audio_model.predict_proba(val_audio_X)
+                    test_probs_audio = audio_model.predict_proba(test_audio_X)
+                else:
+                    n_classes = len(np.unique(train_features["y_true"]))
+                    train_probs_audio = np.eye(n_classes)[train_preds_audio.astype(int)]
+                    val_probs_audio = np.eye(n_classes)[val_preds_audio.astype(int)]
+                    test_probs_audio = np.eye(n_classes)[test_preds_audio.astype(int)]
+                
+                # Stack probabilities as features for meta-model
+                X_train_meta = np.concatenate([train_probs_text, train_probs_audio], axis=1)
+                X_val_meta = np.concatenate([val_probs_text, val_probs_audio], axis=1)
+                X_test_meta = np.concatenate([test_probs_text, test_probs_audio], axis=1)
+            else:
+                # Regression: use predictions directly
+                X_train_meta = np.column_stack([train_preds_text, train_preds_audio])
+                X_val_meta = np.column_stack([val_preds_text, val_preds_audio])
+                X_test_meta = np.column_stack([test_preds_text, test_preds_audio])
+            
+            y_train = train_features["y_true"].to_numpy()
+            y_val = val_features["y_true"].to_numpy()
+            y_test = test_features["y_true"].to_numpy()
+            
+            # Train meta-model (logistic regression for classification, Ridge for regression)
+            if args.task == "classification":
+                meta_model = Pipeline([
+                    ("scaler", StandardScaler()),
+                    ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
+                ])
+            else:
+                meta_model = Pipeline([
+                    ("scaler", StandardScaler()),
+                    ("model", Ridge(alpha=1.0))
+                ])
+            
+            meta_model.fit(X_train_meta, y_train)
+            y_pred = meta_model.predict(X_test_meta)
+            metrics = score_meta_model(None, y_pred, y_test, args.task)
+            
+            # Save results
+            with open(model_based_out / "fusion_metrics.json", "w") as f:
+                json.dump(metrics, f, indent=2)
+            
+            pred_df = test_features[["speaker_id", "y_true"]].copy()
+            pred_df["y_pred"] = y_pred
+            if args.task == "classification":
+                if hasattr(meta_model, "predict_proba"):
+                    probs = meta_model.predict_proba(X_test_meta)
+                    classes = meta_model.classes_
+                    for i, cls in enumerate(classes):
+                        pred_df[f"prob_{cls}"] = probs[:, i]
+            pred_df.to_csv(model_based_out / "predictions.csv", index=False)
+            
+            results['model_based_fusion'] = metrics
+        else:
+            print("Missing models for model-based fusion. Skipping.")
+            results['model_based_fusion'] = None
+    else:
+        print("\nModel-based fusion skipped for test_frac==0 (CV mode).")
+        results['model_based_fusion'] = None
+    
+    # ------------------------------------------------------------------
+    # Summarize all fusion results
+    # ------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("FUSION EXPERIMENTS SUMMARY")
+    print("="*60)
+    summary_rows = []
+    for name, result in results.items():
+        if result is None:
+            continue
+        if args.task == "classification":
+            score = result.get("macro_f1", result.get("test_metrics", {}).get("macro_f1", 0.0))
+        else:
+            score = -result.get("rmse", result.get("test_metrics", {}).get("rmse", float('inf')))
+        summary_rows.append({
+            "fusion_method": name,
+            "primary_score": score,
+            "details": result
+        })
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(fusion_out / "fusion_summary.csv", index=False)
+    print(summary_df.to_string(index=False))
+    
+    return results
 
-    # Save ensemble details if applicable
-    if getattr(args, 'use_ensemble', False):
-        ensemble_info = {
-            "use_ensemble": True,
-            "ensemble_models": getattr(args, 'ensemble_models', ['linear', 'random_forest', 'hist_gradient_boosting']),
-            "voting_type": "soft" if args.task == "classification" else "average"
-        }
-        with open(out_dir / "ensemble_config.json", "w") as f:
-            json.dump(ensemble_info, f, indent=2)
-
-    val_summary = []
-    for k, m in val_metrics.items():
-        row = {"top_k": k, "questions": ",".join(questions_ranked[:k])}
-        row["primary_score"] = primary_score(m, args.task)
-        for k2, v2 in m.items():
-            if isinstance(v2, (int, float)):
-                row[k2] = v2
-        val_summary.append(row)
-    pd.DataFrame(val_summary).to_csv(out_dir / "topk_val_metrics.csv", index=False)
-
-    return {
-        "best_k": best_k,
-        "best_val_primary_score": best_val_score,
-        "test_metrics": test_metrics
-    }
+# End of new fusion functions
+# =======================================================================
 
 
 def train_meta_model_with_cv_selection(
@@ -2307,6 +2186,13 @@ def train_meta_model_with_cv_selection(
     
     importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
     questions_ranked = importance_df["question_id"].tolist()
+
+    # ===== NEW: Save per-question validation scores =====
+    per_question_scores = save_per_question_validation_scores(
+        train_features, val_features, feature_cols, 
+        questions_ranked, args, out_dir, 
+        prefix="initial"
+    )
     
     # Cross-validation to find best K
     print(f"\n{'='*60}")
@@ -2460,6 +2346,101 @@ def train_meta_model_with_cv_selection(
         "loaded_from_cache": False
     }
 
+# ----------------------------------------------------------------------
+#  Parser Setup
+# ----------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(description="Train per‑question models with ensemble meta-model and audio fusion")
+    parser.add_argument("--asr-file", required=True)
+    parser.add_argument("--demo-file", required=True)
+    parser.add_argument("--target-column", required=True)
+    parser.add_argument("--task", choices=["classification", "regression"], required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--splits-dir", required=True)
+    parser.add_argument("--model-name", default="distilroberta-base")
+    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 15)])
+    parser.add_argument("--train-frac", type=float, default=0.8)
+    parser.add_argument("--val-frac", type=float, default=0.1)
+    parser.add_argument("--test-frac", type=float, default=0.1)
+    parser.add_argument("--n-cv-folds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    
+    # Hyperparameters
+    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-ratio", type=float, default=0.06)
+    
+    # HPO settings
+    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
+    parser.add_argument("--hpo-n-trials", type=int, default=20)  # Changed to 20
+    parser.add_argument("--hpo-timeout", type=int, default=None)
+    parser.add_argument("--hpo-folds", type=int, default=3)
+    parser.add_argument("--force-hpo", action="store_true")
+    
+    # Meta-model settings - SINGLE MODEL
+    parser.add_argument("--meta-model", 
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
+                                "ridge", "lasso", "elasticnet"],
+                        default="linear",
+                        help="Single meta-model to use (ignored if --use-ensemble is set)")
+    
+    # Ensemble settings
+    parser.add_argument("--use-ensemble", action="store_true",
+                        help="Use ensemble of multiple meta-models with voting/averaging")
+    parser.add_argument("--ensemble-models", nargs="+",
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
+                                "ridge", "lasso", "elasticnet"],
+                        default=["linear", "random_forest", "hist_gradient_boosting"],
+                        help="Models to include in ensemble")
+    parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None,
+                        help="Custom weights for ensemble members (default: equal weights)")
+    
+    # Model hyperparameters
+    parser.add_argument("--n-estimators", type=int, default=500)
+    parser.add_argument("--max-depth", type=int, default=None)
+    parser.add_argument("--logreg-C", type=float, default=1.0)
+    parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument("--svm-kernel", choices=["linear", "rbf", "poly", "sigmoid"], default="rbf")
+    parser.add_argument("--importance", choices=["shap", "permutation", "hybrid"], default="permutation")
+    parser.add_argument("--svm-C", type=float, default=1.0)
+    parser.add_argument("--svm-gamma", default="scale")
+    parser.add_argument("--svm-epsilon", type=float, default=0.1)
+    parser.add_argument("--xgb-lr", type=float, default=0.1)
+    parser.add_argument("--knn-neighbors", type=int, default=5)
+    parser.add_argument("--elasticnet-alpha", type=float, default=1.0)
+    parser.add_argument("--elasticnet-l1-ratio", type=float, default=0.5)
+    
+    # Other settings
+    parser.add_argument("--eval-batch-size", type=int, default=16)
+    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--class-weights", choices=["none", "balanced"], default="balanced")
+    parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--min-text-chars", type=int, default=1)
+    parser.add_argument("--permutation-repeats", type=int, default=5)
+    parser.add_argument("--embedding-batch-size", type=int, default=32)
+    parser.add_argument("--force-embeddings", action="store_true")
+    parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--delimiter", default=";")
+    
+    # NEW: Audio features and fusion
+    parser.add_argument("--audio-features-csv", type=str, default=None,
+                        help="Path to CSV file with speaker-level audio features")
+    parser.add_argument("--audio-feature-cols", nargs="+", default=None,
+                        help="List of audio feature column names to use; if not provided, all numeric columns except speaker_id are used")
+    parser.add_argument("--fusion-methods", nargs="+", 
+                        choices=["early", "late", "model_based", "all"],
+                        default=["all"],
+                        help="Fusion methods to try. 'all' runs all applicable methods.")
+    parser.add_argument("--audio-meta-model", 
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn"],
+                        default="linear",
+                        help="Meta-model to use for audio-only and fusion models")
+    
+    return parser
 
 def train_meta_model_cv(
     train_features, val_features, test_features, feature_cols, args, out_dir: Path
@@ -2484,6 +2465,9 @@ def train_meta_model_cv(
     all_fold_predictions = []
     fold_importance_dfs = []
     best_k_per_fold = []
+
+    # After getting questions_ranked for each fold, accumulate scores
+    all_per_question_scores = []
     
     for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
         print(f"\n{'='*50}")
@@ -2522,6 +2506,16 @@ def train_meta_model_cv(
         questions_ranked = importance_df["question_id"].tolist()
         if not questions_ranked:
             questions_ranked = [c.split("__", 1)[0] for c in feature_cols]
+
+        # ===== NEW: Calculate per-question scores for this fold =====
+        fold_scores = save_per_question_validation_scores(
+            fold_train, fold_val, feature_cols, 
+            questions_ranked, args, out_dir, 
+            prefix=f"fold{fold_idx}"
+        )
+        if fold_scores is not None:
+            fold_scores['fold'] = fold_idx
+            all_per_question_scores.append(fold_scores)
         
         max_k = len(questions_ranked)
         ks = list(range(1, max_k + 1))
@@ -2609,6 +2603,26 @@ def train_meta_model_cv(
             fold_model_dir / "selected_questions.csv", index=False
         )
     
+    # ===== NEW: Aggregate per-question scores across folds =====
+    if all_per_question_scores:
+        combined_scores = pd.concat(all_per_question_scores, ignore_index=True)
+        
+        # Calculate mean and std across folds
+        agg_scores = combined_scores.groupby('question_id').agg({
+            'validation_score': ['mean', 'std', 'count'],
+            'rank': 'mean',
+            'rank_by_score': 'mean'
+        }).round(4)
+        agg_scores.columns = ['mean_score', 'std_score', 'n_folds', 'mean_rank', 'mean_rank_by_score']
+        agg_scores = agg_scores.sort_values('mean_score', ascending=False)
+        agg_scores.to_csv(out_dir / "aggregated_per_question_validation_scores.csv")
+        
+        print("\n" + "="*60)
+        print("AGGREGATED PER-QUESTION VALIDATION SCORES ACROSS FOLDS")
+        print("="*60)
+        print("\nTop 10 questions by mean validation score:")
+        print(agg_scores.head(10)[['mean_score', 'std_score', 'n_folds']].to_string())
+
     # Aggregate results across folds
     print("\n" + "="*60)
     print("AGGREGATED RESULTS ACROSS FOLDS")
@@ -2837,233 +2851,49 @@ def train_meta_model_cv(
         "cv_metrics": cv_metrics_for_json
     }
 
-def load_acoustic_features(args, df):
-    """
-    Load or extract acoustic features based on arguments.
-    Features are cached to avoid re-extraction.
+def main_with_cv(args, train_features, val_features, test_features, feature_cols, out_dir):
+    """Run CV-only training when test_frac == 0"""
     
-    Returns:
-        DataFrame with acoustic features per speaker, or None if not using fusion
-    """
-    if not args.use_acoustic_fusion:
-        return None
+    # Check if test_features is empty (which it will be when test_frac=0)
+    if test_features is not None and not test_features.empty:
+        print(f"Warning: test_features is not empty but test_frac=0. This shouldn't happen.")
     
-    print("\n" + "="*60)
-    print("LOADING ACOUSTIC FEATURES")
-    print("="*60)
+    # Train meta-model with CV (since test_frac=0)
+    results = train_meta_model_cv(
+        train_features, val_features, test_features, feature_cols, args, out_dir
+    )
     
-    acoustic_df = None
+    print("\n===== Final CV Results =====")
+    print(json.dumps(results, indent=2))
     
-    # Check for cached features in output directory
-    cache_path = Path(args.output_dir) / f"acoustic_features_{args.acoustic_feature_type}.csv"
+    # Cleanup
+    cleanup_temp_dirs(out_dir)
     
-    if cache_path.exists():
-        print(f"✓ Found cached acoustic features: {cache_path}")
-        acoustic_df = pd.read_csv(cache_path)
-        
-        # Ensure speaker_id column exists
-        if "speaker_id" not in acoustic_df.columns:
-            raise ValueError("Cached acoustic CSV must contain 'speaker_id' column")
-        
-        print(f"  Loaded {len(acoustic_df)} speakers with {len(acoustic_df.columns) - 1} acoustic features")
-        return acoustic_df
-    
-    # If not in cache, try user-provided CSV
-    if args.acoustic_csv:
-        csv_path = Path(args.acoustic_csv)
-        if csv_path.exists():
-            print(f"Loading acoustic features from CSV: {args.acoustic_csv}")
-            acoustic_df = pd.read_csv(args.acoustic_csv)
-            
-            # Ensure speaker_id column exists
-            if "speaker_id" not in acoustic_df.columns:
-                raise ValueError("Acoustic CSV must contain 'speaker_id' column")
-            
-            print(f"  Loaded {len(acoustic_df)} speakers with {len(acoustic_df.columns) - 1} acoustic features")
-            
-            # Cache for future use
-            acoustic_df.to_csv(cache_path, index=False)
-            print(f"  ✓ Cached to: {cache_path}")
-            
-            return acoustic_df
-        else:
-            print(f"Warning: Acoustic CSV not found: {args.acoustic_csv}")
-    
-    # If not in cache and no CSV provided, extract from audio directory
-    if args.acoustic_audio_dir:
-        if not LIBROSA_AVAILABLE:
-            print("Error: librosa is required for audio extraction. Install with: pip install librosa")
-            return None
-            
-        print(f"Extracting acoustic features from audio directory: {args.acoustic_audio_dir}")
-        
-        # Build mapping from speaker_id to audio files
-        speakers = df["speaker_id"].unique()
-        speaker_to_audio = {}
-        
-        audio_dir = Path(args.acoustic_audio_dir)
-        
-        for speaker in speakers:
-            # Look for speaker subfolder
-            speaker_dir = audio_dir / speaker
-            if speaker_dir.exists():
-                audio_files = list(speaker_dir.glob("*.wav")) + list(speaker_dir.glob("*.mp3"))
-                if audio_files:
-                    speaker_to_audio[speaker] = audio_files
-                else:
-                    print(f"  Warning: No audio files found for speaker {speaker} in {speaker_dir}")
-            else:
-                # Try without full path
-                audio_files = list(audio_dir.glob(f"*{speaker}*.wav")) + list(audio_dir.glob(f"*{speaker}*.mp3"))
-                if audio_files:
-                    speaker_to_audio[speaker] = audio_files
-                else:
-                    print(f"  Warning: No audio files found for speaker {speaker}")
-        
-        if not speaker_to_audio:
-            print("  Warning: No audio files found. Disabling acoustic fusion.")
-            return None
-        
-        # Extract features
-        extractor = AcousticFeatureExtractor(
-            feature_type=args.acoustic_feature_type,
-            sample_rate=args.acoustic_sample_rate
-        )
-        
-        acoustic_df = extractor.extract_from_directory(audio_dir, speaker_to_audio)
-        
-        if not acoustic_df.empty:
-            print(f"  Extracted features for {len(acoustic_df)} speakers")
-            print(f"  Features: {len([c for c in acoustic_df.columns if c != 'speaker_id'])}")
-            
-            # Cache the extracted features
-            acoustic_df.to_csv(cache_path, index=False)
-            print(f"  ✓ Cached extracted features to: {cache_path}")
-        else:
-            print("  Warning: No features extracted. Disabling acoustic fusion.")
-            return None
-    
-    if acoustic_df is None:
-        print("No acoustic source specified or found. Disabling acoustic fusion.")
-        return None
-    
-    return acoustic_df
+    # Print ensemble info if used
+    if args.use_ensemble:
+        print("\n" + "=" * 50)
+        print("ENSEMBLE SUMMARY")
+        print("=" * 50)
+        print(f"Models in ensemble: {args.ensemble_models}")
+        print(f"Voting type: {'soft (probability averaging)' if args.task == 'classification' else 'average'}")
+        print(f"Final CV model saved to: {out_dir / 'final_cv_model.joblib'}") 
 
-
-# ----------------------------------------------------------------------
-#  Parser Setup
-# ----------------------------------------------------------------------
-def build_parser():
-    parser = argparse.ArgumentParser(description="Train per‑question models with ensemble meta-model")
-    parser.add_argument("--asr-file", required=True)
-    parser.add_argument("--demo-file", required=True)
-    parser.add_argument("--target-column", required=True)
-    parser.add_argument("--task", choices=["classification", "regression"], required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--splits-dir", required=True)
-    parser.add_argument("--model-name", default="distilroberta-base")
-    parser.add_argument("--questions", nargs="+", default=[f"Q{i}" for i in range(1, 15)])
-    parser.add_argument("--train-frac", type=float, default=0.8)
-    parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--test-frac", type=float, default=0.1)
-    parser.add_argument("--n-cv-folds", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=42)
-    
-    # Hyperparameters
-    parser.add_argument("--max-length", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.06)
-    
-    # HPO settings
-    parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
-    parser.add_argument("--hpo-n-trials", type=int, default=20)  # Changed to 20
-    parser.add_argument("--hpo-timeout", type=int, default=None)
-    parser.add_argument("--hpo-folds", type=int, default=3)
-    parser.add_argument("--force-hpo", action="store_true")
-    
-    # Meta-model settings - SINGLE MODEL
-    parser.add_argument("--meta-model", 
-                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
-                                "ridge", "lasso", "elasticnet"],
-                        default="linear",
-                        help="Single meta-model to use (ignored if --use-ensemble is set)")
-    
-    # Ensemble settings
-    parser.add_argument("--use-ensemble", action="store_true",
-                        help="Use ensemble of multiple meta-models with voting/averaging")
-    parser.add_argument("--ensemble-models", nargs="+",
-                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
-                                "ridge", "lasso", "elasticnet"],
-                        default=["linear", "random_forest", "hist_gradient_boosting"],
-                        help="Models to include in ensemble")
-    parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None,
-                        help="Custom weights for ensemble members (default: equal weights)")
-    
-    # ========== Acoustic Fusion Settings ==========
-    parser.add_argument("--use-acoustic-fusion", action="store_true",
-                        help="Enable acoustic feature fusion")
-    parser.add_argument("--fusion-type", choices=["early", "late", "hybrid", "llm_finetune"], default="early",
-                        help="Fusion strategy: early (concat features), late (separate models), hybrid (both), llm_finetune")
-    parser.add_argument("--acoustic-csv", type=str, default=None,
-                        help="Path to CSV file with pre-extracted acoustic features")
-    parser.add_argument("--acoustic-audio-dir", type=str, default=None,
-                        help="Directory containing audio files for acoustic feature extraction")
-    parser.add_argument("--acoustic-feature-type", choices=["egemaps", "emo", "temporal", "all"], default="egemaps",
-                        help="Type of acoustic features to extract")
-    parser.add_argument("--acoustic-sample-rate", type=int, default=16000,
-                        help="Sample rate for audio processing")
-    parser.add_argument("--fusion-weights", nargs="+", type=float, default=None,
-                        help="Weights for late fusion modalities")
-    parser.add_argument("--fusion-voting", choices=["hard", "soft", "weighted"], default="hard",
-                        help="Voting strategy for late fusion classification")
-    
-    # Model hyperparameters
-    parser.add_argument("--n-estimators", type=int, default=500)
-    parser.add_argument("--max-depth", type=int, default=None)
-    parser.add_argument("--logreg-C", type=float, default=1.0)
-    parser.add_argument("--ridge-alpha", type=float, default=1.0)
-    parser.add_argument("--svm-kernel", choices=["linear", "rbf", "poly", "sigmoid"], default="rbf")
-    parser.add_argument("--importance", choices=["shap", "permutation", "hybrid"], default="permutation")
-    parser.add_argument("--svm-C", type=float, default=1.0)
-    parser.add_argument("--svm-gamma", default="scale")
-    parser.add_argument("--svm-epsilon", type=float, default=0.1)
-    parser.add_argument("--xgb-lr", type=float, default=0.1)
-    parser.add_argument("--knn-neighbors", type=int, default=5)
-    parser.add_argument("--elasticnet-alpha", type=float, default=1.0)
-    parser.add_argument("--elasticnet-l1-ratio", type=float, default=0.5)
-    
-    # Other settings
-    parser.add_argument("--eval-batch-size", type=int, default=16)
-    parser.add_argument("--patience", type=int, default=2)
-    parser.add_argument("--class-weights", choices=["none", "balanced"], default="balanced")
-    parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
-    parser.add_argument("--focal-gamma", type=float, default=2.0)
-    parser.add_argument("--min-text-chars", type=int, default=1)
-    parser.add_argument("--permutation-repeats", type=int, default=5)
-    parser.add_argument("--embedding-batch-size", type=int, default=32)
-    parser.add_argument("--force-embeddings", action="store_true")
-    parser.add_argument("--top-k", type=int, default=0)
-    parser.add_argument("--delimiter", default=";")
-    
-    return parser
-
-
-def main_with_fusion():
-    """Modified main function with acoustic fusion support."""
-    parser = build_parser()
-    args = parser.parse_args()
+def main():
+    args = build_parser().parse_args()
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
 
-    # Check for existing results
+    # Check for existing results - NOW BOTH MODES PRODUCE THE SAME FILES
     selected_questions_file = out_dir / "selected_questions.csv"
     cv_k_results_file = out_dir / "cv_k_selection_results.csv"
     test_metrics_file = out_dir / "meta_test_metrics.json"
+    
+    # Both modes now create these three files:
+    # - selected_questions.csv (top K questions)
+    # - cv_k_selection_results.csv (K selection results from CV)
+    # - meta_test_metrics.json (either test metrics or CV aggregate metrics)
     
     if selected_questions_file.exists() and cv_k_results_file.exists() and test_metrics_file.exists() and not args.force_hpo:
         print("\n" + "="*60)
@@ -3074,7 +2904,9 @@ def main_with_fusion():
         print(f"  - {cv_k_results_file}")
         print(f"  - {test_metrics_file}")
         print(f"\nSkipping all processing.")
-        print(f"To re-run, either delete {out_dir} or use --force-hpo")
+        print(f"To re-run, either:")
+        print(f"  1. Delete {out_dir} directory, or")
+        print(f"  2. Use --force-hpo flag")
         print("="*60 + "\n")
         
         with open(test_metrics_file, 'r') as f:
@@ -3082,7 +2914,17 @@ def main_with_fusion():
         
         print("Existing results summary:")
         print(json.dumps(existing_metrics, indent=2))
+        
+        # Also show selected questions
+        selected_df = pd.read_csv(selected_questions_file)
+        print(f"\nSelected {len(selected_df)} questions: {selected_df['question_id'].tolist()[:10]}...")
+        
         return
+    
+    # If we get here, we need to run the full pipeline
+    print("\n" + "="*60)
+    print("STARTING FULL PIPELINE")
+    print("="*60)
     
     cleanup_old_splits(splits_dir)
     
@@ -3099,14 +2941,6 @@ def main_with_fusion():
     
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     
-    # Load acoustic features if enabled
-    acoustic_df = load_acoustic_features(args, df)
-    
-    if acoustic_df is not None and not acoustic_df.empty:
-        print(f"\nAcoustic features loaded: {len(acoustic_df)} speakers")
-        # Save acoustic features for reference
-        acoustic_df.to_csv(out_dir / "acoustic_features.csv", index=False)
-    
     # Manage splits
     split_mgr = SplitManager(
         splits_dir, args.task,
@@ -3116,9 +2950,10 @@ def main_with_fusion():
     final_train, final_val, final_test = split_mgr.get_final_splits(df)
     print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
     
-    # Hyperparameter search on ALL questions
+    # Define best_hparams_path
     best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
     
+    # Hyperparameter search on ALL questions
     if best_hparams_path.exists() and not args.force_hpo:
         best_hparams = json.loads(best_hparams_path.read_text())
         print(f"Loaded best hyperparameters from {best_hparams_path}")
@@ -3156,39 +2991,20 @@ def main_with_fusion():
         final_train, final_val, final_test, metadata, args, best_hparams, out_dir
     )
     
-    # Build feature tables with fusion if enabled
+    # Build feature tables
     available_qs = list(embedding_files["train"].keys())
+    train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
+    val_features, _ = build_feature_table(embedding_files["val"], available_qs)
     
-    # Initialize fusion strategy if using acoustic features
-    fusion_strategy = None
-    if args.use_acoustic_fusion and acoustic_df is not None and not acoustic_df.empty:
-        fusion_strategy = FusionStrategy(
-            fusion_type=args.fusion_type,
-            acoustic_features=acoustic_df
-        )
-    
-    # Build feature table (with or without fusion)
-    if fusion_strategy:
-        train_features, feature_info = build_feature_table_with_fusion(
-            embedding_files["train"], available_qs, acoustic_df, fusion_strategy
-        )
-        val_features, _ = build_feature_table_with_fusion(
-            embedding_files["val"], available_qs, acoustic_df, fusion_strategy
-        )
-        
-        if args.test_frac > 0:
-            test_features, _ = build_feature_table_with_fusion(
-                embedding_files["test"], available_qs, acoustic_df, fusion_strategy
-            )
-        else:
-            test_features = pd.DataFrame()
+    # Handle test features carefully
+    test_features = None
+    if args.test_frac > 0:
+        test_features, _ = build_feature_table(embedding_files["test"], available_qs)
     else:
-        # Standard feature table without fusion
-        train_features, feature_info = build_feature_table(embedding_files["train"], available_qs)
-        val_features, _ = build_feature_table(embedding_files["val"], available_qs)
-        
-        if args.test_frac > 0:
-            test_features, _ = build_feature_table(embedding_files["test"], available_qs)
+        print("test_frac=0: No test features will be created")
+        # Create empty test_features with same structure as train_features but no rows
+        if train_features is not None and not train_features.empty:
+            test_features = pd.DataFrame(columns=train_features.columns)
         else:
             test_features = pd.DataFrame()
     
@@ -3196,60 +3012,109 @@ def main_with_fusion():
     train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
     val_features.to_csv(out_dir / "meta_val_features.csv", index=False)
     
+    # Align feature columns
     if test_features is not None and not test_features.empty:
-        test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
+        train_features, val_features, test_features = align_feature_tables(
+            train_features, val_features, test_features, feature_cols
+        )
+    else:
+        # Just align train and val
+        train_features, val_features, _ = align_feature_tables(
+            train_features, val_features, pd.DataFrame(), feature_cols
+        )
     
     # ============================================================
-    # CHOOSE TRAINING PATH BASED ON test_frac AND FUSION
+    # CHOOSE TRAINING PATH BASED ON test_frac
     # ============================================================
-    if args.use_acoustic_fusion and acoustic_df is not None and not acoustic_df.empty:
-        print("\n" + "="*60)
-        print(f"TRAINING WITH {args.fusion_type.upper()} FUSION")
-        print("="*60)
+    if args.test_frac == 0:
+        # Cross-validation only (no held-out test set)
+        results = train_meta_model_cv(
+            train_features, val_features, test_features, feature_cols, args, out_dir
+        )
         
-        if args.test_frac == 0:
-            # Cross-validation only (no held-out test set)
-            if isinstance(feature_info, dict):
-                # For late fusion with CV
-                feature_cols_for_cv = list(feature_info.get("text", [])) + list(feature_info.get("acoustic", []))
-            else:
-                feature_cols_for_cv = feature_info
-            
-            results = train_meta_model_cv(
-                train_features, val_features, test_features, feature_cols_for_cv, args, out_dir
+        print("\n" + "="*60)
+        print("CROSS-VALIDATION COMPLETE (test_frac=0)")
+        print("="*60)
+        print(f"Results saved to {out_dir}")
+        print(f"  - selected_questions.csv: Top {results['avg_best_k']} questions selected")
+        print(f"  - cv_k_selection_results.csv: K selection results")
+        print(f"  - meta_test_metrics.json: CV aggregate metrics")
+        print(f"  - final_cv_model.joblib: Final model trained on all data")
+        print(f"  - cv_summary_report.txt: Detailed CV report")
+        
+    else: 
+        # Standard training with held-out test set
+        test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
+        
+        # Train meta-model WITH CV-based K selection
+        results = train_meta_model_with_cv_selection(
+            train_features, val_features, test_features, feature_cols, args, out_dir
+        )
+        
+        print("\n" + "="*60)
+        print("HELD-OUT TEST EVALUATION COMPLETE (test_frac > 0)")
+        print("="*60)
+        print(f"Results saved to {out_dir}")
+        print(f"  - selected_questions.csv: Top {results['best_k']} questions selected")
+        print(f"  - cv_k_selection_results.csv: K selection results from CV")
+        print(f"  - meta_test_metrics.json: Held-out test metrics")
+        print(f"  - meta_model.joblib: Final meta-model")
+        print(f"\nTest Metrics:")
+        print(json.dumps(results['test_metrics'], indent=2))
+
+    # ===== NEW: Load and display per-question scores =====
+    score_files = list(out_dir.glob("*per_question_validation_scores.csv"))
+    if score_files:
+        print("\n" + "="*60)
+        print("PER-QUESTION VALIDATION SCORES SUMMARY")
+        print("="*60)
+        for score_file in score_files:
+            df = pd.read_csv(score_file)
+            print(f"\n{score_file.name}:")
+            print(f"  Questions evaluated: {len(df)}")
+            print(f"  Mean score: {df['validation_score'].mean():.4f}")
+            print(f"  Std score: {df['validation_score'].std():.4f}")
+            print(f"  Top 5 questions:")
+            print(df.head(5)[['question_id', 'validation_score']].to_string(index=False))
+    
+    # ============================================================
+    # NEW: Audio feature fusion experiments
+    # ============================================================
+    if args.audio_features_csv is not None:
+        print("\n" + "="*60)
+        print("RUNNING AUDIO FEATURE FUSION EXPERIMENTS")
+        print("="*60)
+        try:
+            # Load audio features
+            audio_df = load_audio_features(
+                args.audio_features_csv,
+                speaker_col="speaker_id",
+                exclude_cols=args.audio_feature_cols  # if provided, use them; else auto-detect
             )
             
-            print("\n" + "="*60)
-            print(f"{args.fusion_type.upper()} FUSION CV COMPLETE (test_frac=0)")
-            print("="*60)
+            # Update audio feature columns if specified
+            if args.audio_feature_cols is not None:
+                # Keep only specified columns
+                keep_cols = ["speaker_id"] + args.audio_feature_cols
+                missing = [c for c in args.audio_feature_cols if c not in audio_df.columns]
+                if missing:
+                    print(f"Warning: Some specified audio feature columns not found: {missing}")
+                audio_df = audio_df[keep_cols].copy()
             
-        else:
-            # Standard training with held-out test set
-            results = train_with_fusion(
-                train_features, val_features, test_features, feature_info, args, out_dir
+            # Run fusion experiments
+            fusion_results = run_fusion_experiments(
+                train_features, val_features, test_features,
+                feature_cols, audio_df, args, out_dir
             )
             
-            print("\n" + "="*60)
-            print(f"{args.fusion_type.upper()} FUSION COMPLETE")
-            print("="*60)
-            if 'test_metrics' in results:
-                print(json.dumps(results['test_metrics'], indent=2))
+            print("\nFusion experiments completed. Results saved in fusion_results/")
+            
+        except Exception as e:
+            print(f"Error during audio fusion: {e}")
+            import traceback
+            traceback.print_exc()
     else:
-        # Standard training without fusion
-        print("\n" + "="*60)
-        print("TRAINING WITHOUT ACOUSTIC FUSION")
-        print("="*60)
-        
-        if args.test_frac == 0:
-            # Cross-validation only (no held-out test set)
-            results = train_meta_model_cv(
-                train_features, val_features, test_features, feature_info, args, out_dir
-            )
-        else:
-            # Standard training with held-out test set
-            results = train_meta_model_with_cv_selection(
-                train_features, val_features, test_features, feature_info, args, out_dir
-            )
+        print("\nNo audio features CSV provided. Skipping fusion experiments.")
     
     # Cleanup temporary directories
     cleanup_temp_dirs(out_dir)
@@ -3265,329 +3130,29 @@ def main_with_fusion():
             print(f"Final CV model: {out_dir / 'final_cv_model.joblib'}")
         else:
             print(f"Final model: {out_dir / 'meta_model.joblib'}")
-    
-    # Print fusion info if used
-    if args.use_acoustic_fusion:
-        print("\n" + "=" * 50)
-        print("ACOUSTIC FUSION SUMMARY")
-        print("=" * 50)
-        print(f"Fusion type: {args.fusion_type}")
-        print(f"Feature type: {args.acoustic_feature_type}")
-        print(f"Results saved to: {out_dir}")
-
-
-def main():
-    main_with_fusion()
-
 
 if __name__ == "__main__":
     main()
 '''
-Scenario 1: Baseline (No Acoustic Fusion)
-Run the original pipeline without any acoustic features:
+Key additions:
+--audio-features-csv – path to a CSV with speaker-level audio features.
 
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column depression_score \
-    --task regression \
-    --output-dir results/baseline \
-    --splits-dir splits/baseline \
-    --questions Q1 Q2 Q3 Q4 Q5 \
-    --train-frac 0.8 \
-    --val-frac 0.1 \
-    --test-frac 0.1 \
-    --model-name distilroberta-base \
-    --meta-model linear \
-    --use-ensemble \
-    --ensemble-models linear random_forest svm \
-    --n-cv-folds 5 \
-    --seed 42
-Scenario 2: Early Fusion with Pre-extracted CSV
-Use pre-computed acoustic features from a CSV file:
+--audio-feature-cols – optional list of column names to use; otherwise all numeric columns except speaker_id are auto‑detected.
 
-bash
-# First, prepare your acoustic features CSV with columns: speaker_id, feature1, feature2, ...
-# Then run:
+--fusion-methods – choose early, late, model_based, or all. Results are written to fusion_results/ with per‑method subfolders.
 
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column depression_score \
-    --task regression \
-    --output-dir results/early_fusion_csv \
-    --splits-dir splits/early_fusion_csv \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 \
-    --train-frac 0.8 \
-    --val-frac 0.1 \
-    --test-frac 0.1 \
-    --use-acoustic-fusion \
-    --fusion-type early \
-    --acoustic-csv data/acoustic_features/egemaps_features.csv \
-    --acoustic-feature-type egemaps \
-    --meta-model random_forest \
-    --n-estimators 500
-Scenario 3: Early Fusion with Audio Directory (eGeMAPS features)
-Extract eGeMAPS features directly from audio files:
+--audio-meta-model – meta‑model for audio‑only and fusion experiments (default linear).
 
-bash
-# Audio directory structure:
-# data/audio/
-#   p001/
-#     session1.wav
-#     session2.wav
-#   p002/
-#     session1.wav
-#     ...
+Fusion outputs
+Each fusion method produces:
 
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column depression_label \
-    --task classification \
-    --output-dir results/early_fusion_egemaps \
-    --splits-dir splits/early_fusion_egemaps \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 \
-    --use-acoustic-fusion \
-    --fusion-type early \
-    --acoustic-audio-dir data/audio/ \
-    --acoustic-feature-type egemaps \
-    --acoustic-sample-rate 16000 \
-    --meta-model svm \
-    --svm-kernel rbf \
-    --svm-C 1.0
-Scenario 4: Early Fusion with All Acoustic Features
-Extract comprehensive acoustic features (eGeMAPS + emotional + temporal):
+fusion_metrics.json – primary metrics (macro‑F1 or RMSE) and detailed scores.
 
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column anxiety_score \
-    --task regression \
-    --output-dir results/early_fusion_all_features \
-    --splits-dir splits/early_fusion_all_features \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 \
-    --use-acoustic-fusion \
-    --fusion-type early \
-    --acoustic-audio-dir data/audio/ \
-    --acoustic-feature-type all \
-    --acoustic-sample-rate 16000 \
-    --use-ensemble \
-    --ensemble-models linear random_forest hist_gradient_boosting \
-    --n-cv-folds 5
-Scenario 5: Late Fusion with Audio Extraction
-Train separate models on text and acoustic features, then combine predictions:
+predictions.csv – per‑speaker predictions and (for classification) probabilities.
 
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column ptsd_label \
-    --task classification \
-    --output-dir results/late_fusion \
-    --splits-dir splits/late_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 \
-    --use-acoustic-fusion \
-    --fusion-type late \
-    --acoustic-audio-dir data/audio/ \
-    --acoustic-feature-type temporal \
-    --fusion-voting soft \
-    --fusion-weights 0.6 0.4 \
-    --use-ensemble \
-    --ensemble-models linear random_forest svm \
-    --n-cv-folds 5
-Scenario 6: Hybrid Fusion (Early + Late)
-Combine early feature concatenation with late prediction fusion:
+A global fusion_summary.csv compares all methods.
 
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column severity_score \
-    --task regression \
-    --output-dir results/hybrid_fusion \
-    --splits-dir splits/hybrid_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 \
-    --use-acoustic-fusion \
-    --fusion-type hybrid \
-    --acoustic-audio-dir data/audio/ \
-    --acoustic-feature-type all \
-    --meta-model gradient_boosting \
-    --use-ensemble \
-    --ensemble-models linear random_forest svm gradient_boosting \
-    --n-estimators 1000
-Scenario 7: LLM Fine-tuning Fusion (with acoustic features)
-Prepare for LLM-based fusion (simplified as early fusion):
+The rest of the pipeline (text models, HPO, CV) remains unchanged. If you provide an audio CSV, the fusion experiments run automatically after the standard meta‑model training.
 
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column emotional_score \
-    --task classification \
-    --output-dir results/llm_fusion \
-    --splits-dir splits/llm_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 \
-    --use-acoustic-fusion \
-    --fusion-type llm_finetune \
-    --acoustic-csv data/acoustic_features/emotion_features.csv \
-    --acoustic-feature-type emo \
-    --model-name roberta-base \
-    --batch-size 4 \
-    --learning-rate 2e-5 \
-    --epochs 5 \
-    --max-length 256
-Scenario 8: Cross-Validation Only (No Test Set)
-When you have no held-out test set (test_frac=0):
 
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column well_being_score \
-    --task regression \
-    --output-dir results/cv_only_fusion \
-    --splits-dir splits/cv_only_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 \
-    --train-frac 0.9 \
-    --val-frac 0.1 \
-    --test-frac 0.0 \
-    --use-acoustic-fusion \
-    --fusion-type early \
-    --acoustic-audio-dir data/audio/ \
-    --acoustic-feature-type egemaps \
-    --n-cv-folds 10 \
-    --meta-model hist_gradient_boosting
-Scenario 9: Classification with Ensemble and Late Fusion
-Multi-class classification with late fusion:
-
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column emotion_label \
-    --task classification \
-    --output-dir results/classification_late_fusion \
-    --splits-dir splits/classification_late_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 \
-    --use-acoustic-fusion \
-    --fusion-type late \
-    --acoustic-csv data/acoustic_features/all_features.csv \
-    --acoustic-feature-type all \
-    --fusion-voting weighted \
-    --use-ensemble \
-    --ensemble-models linear random_forest svm knn \
-    --class-weights balanced \
-    --loss focal \
-    --focal-gamma 2.0
-Scenario 10: Hyperparameter Search with Acoustic Features
-Use Optuna to find optimal hyperparameters including fusion settings:
-
-bash
-python ensemble.py \
-    --asr-file data/asr_transcriptions.csv \
-    --demo-file data/demographics.csv \
-    --target-column depression_severity \
-    --task regression \
-    --output-dir results/hpo_with_fusion \
-    --splits-dir splits/hpo_with_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 \
-    --use-acoustic-fusion \
-    --fusion-type early \
-    --acoustic-audio-dir data/audio/ \
-    --acoustic-feature-type temporal \
-    --hpo-backend optuna \
-    --hpo-n-trials 50 \
-    --hpo-folds 3 \
-    --force-hpo \
-    --meta-model linear \
-    --batch-size 8 \
-    --learning-rate 0.001
-Scenario 11: Quick Test with Small Dataset
-Fast testing with minimal settings:
-
-bash
-python ensemble.py \
-    --asr-file data/sample_asr.csv \
-    --demo-file data/sample_demo.csv \
-    --target-column score \
-    --task regression \
-    --output-dir results/test_run \
-    --splits-dir splits/test_run \
-    --questions Q1 Q2 Q3 \
-    --train-frac 0.7 \
-    --val-frac 0.15 \
-    --test-frac 0.15 \
-    --use-acoustic-fusion \
-    --fusion-type early \
-    --acoustic-csv data/sample_acoustic.csv \
-    --acoustic-feature-type egemaps \
-    --epochs 2 \
-    --batch-size 4 \
-    --n-cv-folds 3 \
-    --hpo-n-trials 5
-Scenario 12: High-Performance Configuration
-Optimized for large datasets with GPU:
-
-bash
-python ensemble.py \
-    --asr-file data/full_asr.csv \
-    --demo-file data/full_demographics.csv \
-    --target-column clinical_score \
-    --task regression \
-    --output-dir results/high_perf_fusion \
-    --splits-dir splits/high_perf_fusion \
-    --questions Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 \
-    --use-acoustic-fusion \
-    --fusion-type hybrid \
-    --acoustic-audio-dir data/audio_large/ \
-    --acoustic-feature-type all \
-    --use-ensemble \
-    --ensemble-models linear random_forest hist_gradient_boosting xgboost \
-    --n-estimators 1000 \
-    --n-cv-folds 10 \
-    --batch-size 16 \
-    --max-length 512 \
-    --learning-rate 3e-5 \
-    --epochs 10 \
-    --patience 3 \
-    --model-name roberta-large
-Important Notes:
-Dependencies needed:
-
-bash
-pip install opensmile librosa praat-parselmouth
-Audio directory structure (for scenarios using --acoustic-audio-dir):
-
-text
-data/audio/
-├── p001/
-│   ├── session1.wav
-│   ├── session2.wav
-│   └── session3.wav
-├── p002/
-│   ├── recording1.wav
-│   └── recording2.wav
-└── ...
-CSV format (for --acoustic-csv):
-
-csv
-speaker_id,pitch_mean,pitch_std,energy_mean,energy_std,...
-p001,125.3,15.2,0.45,0.12,...
-p002,118.7,12.8,0.52,0.15,...
-Memory considerations:
-
-all feature type extracts many features (~300+)
-
-temporal features are moderate (~50 features)
-
-egemaps has 88 features
-
-emo features have ~6373 features (use with caution)
-
-GPU usage: The code automatically uses GPU if available for LLM training
-
-Choose the scenario that best matches your data availability and computational resources!
 '''
