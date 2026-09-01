@@ -22,7 +22,8 @@ from sklearn.metrics import (
     f1_score,
     mean_absolute_error,
     mean_squared_error,
-    r2_score,
+    r2_score, 
+    roc_auc_score
 )
 from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
@@ -1567,9 +1568,19 @@ def score_meta_model(model, x, y, task):
             "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
             "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
             "balanced_accuracy": balanced_accuracy_score(y, pred),
-            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
+            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0), 
             "confusion_matrix": confusion_matrix(y, pred).tolist(),
         }
+
+        if model is not None and hasattr(model, "predict_proba"):
+            try:
+                proba = model.predict_proba(x)
+                if proba.shape[1] == 2:
+                    metrics["roc_auc"] = roc_auc_score(y, proba[:, 1])
+                else:
+                    metrics["roc_auc_ovr"] = roc_auc_score(y, proba, multi_class='ovr', average='macro')
+            except Exception:
+                pass
     else:
         rmse = np.sqrt(mean_squared_error(y, pred))
         return {
@@ -2007,9 +2018,9 @@ def build_parser():
     
     # HPO settings
     parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
-    parser.add_argument("--hpo-n-trials", type=int, default=20)  # Changed to 20
+    parser.add_argument("--hpo-n-trials", type=int, default=30)  
     parser.add_argument("--hpo-timeout", type=int, default=None)
-    parser.add_argument("--hpo-folds", type=int, default=3)
+    parser.add_argument("--hpo-folds", type=int, default=5)
     parser.add_argument("--force-hpo", action="store_true")
     
     # Meta-model settings - SINGLE MODEL
