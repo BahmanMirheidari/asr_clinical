@@ -3084,18 +3084,19 @@ def main():
     set_seed(args.seed)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Remove any old per‑question score files to avoid mismatched columns
+    splits_dir = Path(args.splits_dir)
+
+    # ----- NEW: Remove stale per‑question score files to avoid column mismatch -----
     for f in out_dir.glob("*per_question_validation_scores.csv"):
         f.unlink()
-
-    splits_dir = Path(args.splits_dir)
+        print(f"Removed stale score file: {f.name}")
 
     # If audio CSV is provided, force fusion methods to all five (ignoring user input)
     if args.audio_features_csv is not None:
         print("\nAudio features CSV provided. Running ALL fusion methods (text_only, audio_only, early, late, model_based).")
         args.fusion_methods = ['all']  # this will trigger the 'all' behaviour
 
-    # Check for existing results
+    # Check for existing results (only skip if we are NOT forcing HPO)
     selected_questions_file = out_dir / "selected_questions.csv"
     cv_k_results_file = out_dir / "cv_k_selection_results.csv"
     test_metrics_file = out_dir / "meta_test_metrics.json"
@@ -3123,10 +3124,9 @@ def main():
         # Also show selected questions
         selected_df = pd.read_csv(selected_questions_file)
         print(f"\nSelected {len(selected_df)} questions: {selected_df['question_id'].tolist()[:10]}...")
-        
         return
     
-    # If we get here, we need to run the full pipeline
+    # --- Full pipeline ---
     print("\n" + "="*60)
     print("STARTING FULL PIPELINE")
     print("="*60)
@@ -3191,7 +3191,7 @@ def main():
     args.warmup_ratio = best_hparams.get("warmup_ratio", args.warmup_ratio)
     args.max_length = best_hparams.get("max_length", args.max_length)
     
-    # Train per-question models
+    # Train per‑question models
     embedding_files = train_question_models(
         final_train, final_val, final_test, metadata, args, best_hparams, out_dir
     )
@@ -3201,13 +3201,12 @@ def main():
     train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
     val_features, _ = build_feature_table(embedding_files["val"], available_qs)
     
-    # Handle test features carefully
+    # Handle test features
     test_features = None
     if args.test_frac > 0:
         test_features, _ = build_feature_table(embedding_files["test"], available_qs)
     else:
         print("test_frac=0: No test features will be created")
-        # Create empty test_features with same structure as train_features but no rows
         if train_features is not None and not train_features.empty:
             test_features = pd.DataFrame(columns=train_features.columns)
         else:
@@ -3223,7 +3222,6 @@ def main():
             train_features, val_features, test_features, feature_cols
         )
     else:
-        # Just align train and val
         train_features, val_features, _ = align_feature_tables(
             train_features, val_features, pd.DataFrame(), feature_cols
         )
@@ -3232,13 +3230,13 @@ def main():
     # CHOOSE TRAINING PATH BASED ON test_frac
     # ============================================================
     if args.test_frac == 0:
-        # Cross-validation only (no held-out test set)
+        # Cross‑validation only (no held‑out test set)
         results = train_meta_model_cv(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
         
         print("\n" + "="*60)
-        print("CROSS-VALIDATION COMPLETE (test_frac=0)")
+        print("CROSS‑VALIDATION COMPLETE (test_frac=0)")
         print("="*60)
         print(f"Results saved to {out_dir}")
         print(f"  - selected_questions.csv: Top {results['avg_best_k']} questions selected")
@@ -3247,31 +3245,33 @@ def main():
         print(f"  - final_cv_model.joblib: Final model trained on all data")
         print(f"  - cv_summary_report.txt: Detailed CV report")
         
-    else: 
-        # Standard training with held-out test set
+    else:
+        # Standard training with held‑out test set
         test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
         
-        # Train meta-model WITH CV-based K selection
+        # Train meta‑model WITH CV‑based K selection
         results = train_meta_model_with_cv_selection(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
         
         print("\n" + "="*60)
-        print("HELD-OUT TEST EVALUATION COMPLETE (test_frac > 0)")
+        print("HELD‑OUT TEST EVALUATION COMPLETE (test_frac > 0)")
         print("="*60)
         print(f"Results saved to {out_dir}")
         print(f"  - selected_questions.csv: Top {results['best_k']} questions selected")
         print(f"  - cv_k_selection_results.csv: K selection results from CV")
-        print(f"  - meta_test_metrics.json: Held-out test metrics")
-        print(f"  - meta_model.joblib: Final meta-model")
+        print(f"  - meta_test_metrics.json: Held‑out test metrics")
+        print(f"  - meta_model.joblib: Final meta‑model")
         print(f"\nTest Metrics:")
         print(json.dumps(results['test_metrics'], indent=2))
 
-    # ===== NEW: Load and display per-question scores =====
+    # ============================================================
+    # SAFE DISPLAY OF PER‑QUESTION SCORES (with error handling)
+    # ============================================================
     score_files = list(out_dir.glob("*per_question_validation_scores.csv"))
     if score_files:
         print("\n" + "="*60)
-        print("PER-QUESTION VALIDATION SCORES SUMMARY")
+        print("PER‑QUESTION VALIDATION SCORES SUMMARY")
         print("="*60)
         for score_file in score_files:
             try:
@@ -3294,9 +3294,9 @@ def main():
             print(f"  Std score: {df['validation_score'].std():.4f}")
             print(f"  Top 5 questions:")
             print(df.head(5)[['question_id', 'validation_score']].to_string(index=False))
-    
+
     # ============================================================
-    # NEW: Audio feature fusion experiments – always runs all 5 when audio CSV is given
+    # AUDIO FEATURE FUSION EXPERIMENTS – always runs all 5 methods
     # ============================================================
     if args.audio_features_csv is not None:
         print("\n" + "="*60)
@@ -3307,19 +3307,18 @@ def main():
             audio_df = load_audio_features(
                 args.audio_features_csv,
                 speaker_col="speaker_id",
-                exclude_cols=args.audio_feature_cols  # if provided, use them; else auto-detect
+                exclude_cols=args.audio_feature_cols
             )
             
             # Update audio feature columns if specified
             if args.audio_feature_cols is not None:
-                # Keep only specified columns
                 keep_cols = ["speaker_id"] + args.audio_feature_cols
                 missing = [c for c in args.audio_feature_cols if c not in audio_df.columns]
                 if missing:
                     print(f"Warning: Some specified audio feature columns not found: {missing}")
                 audio_df = audio_df[keep_cols].copy()
             
-            # Run fusion experiments (which now always runs all 5)
+            # Run fusion experiments (now always runs all 5)
             fusion_results = run_fusion_experiments(
                 train_features, val_features, test_features,
                 feature_cols, audio_df, args, out_dir
