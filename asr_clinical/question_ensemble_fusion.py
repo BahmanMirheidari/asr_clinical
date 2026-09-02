@@ -50,6 +50,7 @@ from sklearn.base import ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.cluster import KMeans
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.decomposition import PCA
@@ -74,6 +75,24 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def create_gradient_boosting(task, args):
+    """Create Gradient Boosting model (classification or regression)"""
+    if task == "classification":
+        return GradientBoostingClassifier(
+            n_estimators=args.n_estimators,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=args.seed
+        )
+    else:
+        return GradientBoostingRegressor(
+            n_estimators=args.n_estimators,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=args.seed
+        )
 
 
 def create_hist_gradient_boosting(task, args):
@@ -1008,10 +1027,20 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
 #  META-MODEL CREATORS
 # =======================================================================
 
+# =======================================================================
+#  FIXED: Add proper function for float conversion (not lambda)
+# =======================================================================
+
+def to_float(X):
+    """Convert input to float64."""
+    return X.astype(float)
+
+
 def create_linear_model(task, args):
+    """Create linear model: LogisticRegression for classification, Ridge for regression"""
     if task == "classification":
         return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
+            ("to_float", FunctionTransformer(to_float, validate=False)),  # Use function, not lambda
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("model", LogisticRegression(
@@ -1023,29 +1052,85 @@ def create_linear_model(task, args):
         ])
     else:
         return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
+            ("to_float", FunctionTransformer(to_float, validate=False)),  # Use function, not lambda
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
         ])
 
 
+def create_svm(task, args):
+    """Create SVM model (SVC for classification, SVR for regression)"""
+    if task == "classification":
+        return Pipeline([
+            ("to_float", FunctionTransformer(to_float, validate=False)),
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", SVC(
+                kernel=getattr(args, 'svm_kernel', 'rbf'),
+                C=getattr(args, 'svm_C', 1.0),
+                gamma=getattr(args, 'svm_gamma', 'scale'),
+                probability=True,
+                class_weight="balanced",
+                random_state=args.seed
+            )),
+        ])
+    else:
+        return Pipeline([
+            ("to_float", FunctionTransformer(to_float, validate=False)),
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", SVR(
+                kernel=getattr(args, 'svm_kernel', 'rbf'),
+                C=getattr(args, 'svm_C', 1.0),
+                epsilon=getattr(args, 'svm_epsilon', 0.1)
+            )),
+        ])
+
+
+def create_knn(task, args):
+    """Create KNN model (classification or regression)"""
+    if task == "classification":
+        return Pipeline([
+            ("to_float", FunctionTransformer(to_float, validate=False)),
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsClassifier(
+                n_neighbors=getattr(args, 'knn_neighbors', 5),
+                weights='distance'
+            )),
+        ])
+    else:
+        return Pipeline([
+            ("to_float", FunctionTransformer(to_float, validate=False)),
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsRegressor(
+                n_neighbors=getattr(args, 'knn_neighbors', 5),
+                weights='distance'
+            )),
+        ])
+
+
 def create_ridge(task, args):
+    """Ridge regression (regression only) - falls back to linear for classification"""
     if task == "regression":
         return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
+            ("to_float", FunctionTransformer(to_float, validate=False)),
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
         ])
     else:
+        print("  Note: Ridge is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
 
 def create_lasso(task, args):
+    """Lasso regression (regression only) - falls back to linear for classification"""
     if task == "regression":
         return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
+            ("to_float", FunctionTransformer(to_float, validate=False)),
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("model", Lasso(
@@ -1055,13 +1140,15 @@ def create_lasso(task, args):
             )),
         ])
     else:
+        print("  Note: Lasso is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
 
 def create_elasticnet(task, args):
+    """ElasticNet regression (regression only) - falls back to linear for classification"""
     if task == "regression":
         return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
+            ("to_float", FunctionTransformer(to_float, validate=False)),
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("model", ElasticNet(
@@ -1072,10 +1159,12 @@ def create_elasticnet(task, args):
             )),
         ])
     else:
+        print("  Note: ElasticNet is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
 
 def create_random_forest(task, args):
+    """Create Random Forest model (classification or regression)"""
     if task == "classification":
         return RandomForestClassifier(
             n_estimators=args.n_estimators,
@@ -1093,74 +1182,6 @@ def create_random_forest(task, args):
             n_jobs=-1,
             max_depth=getattr(args, 'max_depth', None)
         )
-
-
-def create_svm(task, args):
-    if task == "classification":
-        return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", SVC(
-                kernel=getattr(args, 'svm_kernel', 'rbf'),
-                C=getattr(args, 'svm_C', 1.0),
-                gamma=getattr(args, 'svm_gamma', 'scale'),
-                probability=True,
-                class_weight="balanced",
-                random_state=args.seed
-            )),
-        ])
-    else:
-        return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", SVR(
-                kernel=getattr(args, 'svm_kernel', 'rbf'),
-                C=getattr(args, 'svm_C', 1.0),
-                epsilon=getattr(args, 'svm_epsilon', 0.1)
-            )),
-        ])
-
-
-def create_gradient_boosting(task, args):
-    if task == "classification":
-        return GradientBoostingClassifier(
-            n_estimators=args.n_estimators,
-            learning_rate=0.1,
-            max_depth=3,
-            random_state=args.seed
-        )
-    else:
-        return GradientBoostingRegressor(
-            n_estimators=args.n_estimators,
-            learning_rate=0.1,
-            max_depth=3,
-            random_state=args.seed
-        )
-
-
-def create_knn(task, args):
-    if task == "classification":
-        return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", KNeighborsClassifier(
-                n_neighbors=getattr(args, 'knn_neighbors', 5),
-                weights='distance'
-            )),
-        ])
-    else:
-        return Pipeline([
-            ("to_float", FunctionTransformer(lambda X: X.astype(float), validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", KNeighborsRegressor(
-                n_neighbors=getattr(args, 'knn_neighbors', 5),
-                weights='distance'
-            )),
-        ])
 
 
 def create_ensemble_model(task, args):
@@ -1702,6 +1723,7 @@ def save_per_question_validation_scores(
     questions_ranked, args, out_dir: Path, 
     prefix: str = ""
 ):
+    """Calculate and save validation score for each question individually."""
     print("\n" + "="*60)
     print("CALCULATING PER-QUESTION VALIDATION SCORES")
     print("="*60)
@@ -1720,15 +1742,22 @@ def save_per_question_validation_scores(
         model = make_meta_model(args)
         
         try:
-            model.fit(
-                train_features[q_cols].to_numpy().astype(float), 
-                train_features["y_true"].to_numpy()
-            )
+            # Convert to float before fitting to avoid dtype issues
+            X_train = train_features[q_cols].to_numpy().astype(float)
+            y_train = train_features["y_true"].to_numpy()
+            X_val = val_features[q_cols].to_numpy().astype(float)
+            y_val = val_features["y_true"].to_numpy()
+            
+            # Handle NaN/Inf
+            X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+            X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            model.fit(X_train, y_train)
             
             metrics = score_meta_model(
                 model,
-                val_features[q_cols].to_numpy().astype(float),
-                val_features["y_true"].to_numpy(),
+                X_val,
+                y_val,
                 args.task
             )
             
@@ -1777,7 +1806,6 @@ def save_per_question_validation_scores(
     else:
         print("  No valid question scores could be calculated")
         return None
-
 
 # =======================================================================
 #  AUDIO FEATURE LOADING AND FUSION UTILITIES
