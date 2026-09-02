@@ -48,19 +48,26 @@ from sklearn.base import ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
-# Also add a cache directory to avoid redownloading
+from sklearn.cluster import KMeans
+from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.decomposition import PCA
+
+# Cache directory to avoid redownloading
 import os
 os.environ['HF_HOME'] = '/home/bahman/.cache/huggingface'
 os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers'
 
-# ----------------------------------------------------------------------
-#  Utility Functions
-# ----------------------------------------------------------------------
+
+# =======================================================================
+#  UTILITY FUNCTIONS
+# =======================================================================
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def create_hist_gradient_boosting(task, args):
     """Native scikit-learn HistGradientBoosting – no version conflicts."""
@@ -72,7 +79,7 @@ def create_hist_gradient_boosting(task, args):
             random_state=args.seed,
             verbose=0
         )
-    else:  # regression
+    else:
         return HistGradientBoostingRegressor(
             max_iter=args.n_estimators,
             learning_rate=args.xgb_lr,
@@ -80,6 +87,7 @@ def create_hist_gradient_boosting(task, args):
             random_state=args.seed,
             verbose=0
         )
+
 
 def cleanup_old_splits(splits_dir: Path):
     """Delete existing split files to force regeneration with correct columns."""
@@ -114,9 +122,29 @@ def cleanup_temp_dirs(temp_dir: Path):
         print(f"  Removed {temp_optuna_dir}")
 
 
-# ----------------------------------------------------------------------
-#  Split Management
-# ----------------------------------------------------------------------
+def download_with_retry(model_name: str, max_retries: int = 5):
+    """Download model with retry logic for rate limiting."""
+    from transformers import AutoConfig
+    import time
+    
+    for retry in range(max_retries):
+        try:
+            config = AutoConfig.from_pretrained(model_name)
+            return config
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                wait_time = (retry + 1) * 10
+                print(f"Rate limited! Waiting {wait_time} seconds before retry {retry+1}/{max_retries}...")
+                time.sleep(wait_time)
+            else:
+                raise e
+    raise Exception(f"Failed to download {model_name} after {max_retries} retries")
+
+
+# =======================================================================
+#  SPLIT MANAGEMENT
+# =======================================================================
+
 class SplitManager:
     def __init__(self, splits_dir: Path, task: str, train_frac: float, val_frac: float,
                  test_frac: float, seed: int, n_folds: int = 5):
@@ -187,20 +215,16 @@ class SplitManager:
 
         print("Creating final train/val/test splits (by speaker).")
         
-        # Handle test_frac == 0 case
         if self.test_frac == 0:
             print("test_frac=0: No test set will be created.")
-            # Split only into train and val
             rel_val_frac = self.val_frac / (self.train_frac + self.val_frac)
             train_idx, val_idx = self._speaker_split(df, rel_val_frac, self.seed)
             train_df = df.iloc[train_idx].reset_index(drop=True)
             val_df = df.iloc[val_idx].reset_index(drop=True)
-            test_df = pd.DataFrame()  # Empty test DataFrame
+            test_df = pd.DataFrame()
             
-            # Save splits
             train_df.to_csv(train_path, index=False)
             val_df.to_csv(val_path, index=False)
-            # Create empty test file with same columns
             if len(df) > 0:
                 empty_test = pd.DataFrame(columns=df.columns)
                 empty_test.to_csv(test_path, index=False)
@@ -208,7 +232,6 @@ class SplitManager:
             print("Final splits saved (train/val only).")
             return train_df, val_df, test_df
         
-        # Normal case with test_frac > 0
         trainval_idx, test_idx = self._speaker_split(df, self.test_frac, self.seed)
         trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
         test_df = df.iloc[test_idx].reset_index(drop=True)
@@ -263,7 +286,6 @@ class SplitManager:
         
         return folds
 
-
     def _create_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
         """Create K folds from the final training set."""
         print(f"Creating {self.n_folds} folds from final training set.")
@@ -310,13 +332,10 @@ class SplitManager:
 
     def _speaker_split(self, df: pd.DataFrame, test_size: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
         """Split indices by speaker."""
-        # Handle edge cases
         if test_size <= 0:
-            # Return all indices as train, empty as test
             return np.arange(len(df)), np.array([], dtype=int)
         
         if test_size >= 1:
-            # Return empty as train, all as test
             return np.array([], dtype=int), np.arange(len(df))
         
         df_work = df.copy()
@@ -343,109 +362,11 @@ class SplitManager:
         test_idx = df_work[df_work["speaker_id"].isin(test_speakers)].index.to_numpy()
         return train_idx, test_idx
 
-def save_per_question_validation_scores(
-    train_features, val_features, feature_cols, 
-    questions_ranked, args, out_dir: Path, 
-    prefix: str = ""
-):
-    """
-    Calculate and save validation score for each question individually.
-    
-    Args:
-        train_features: Training features DataFrame
-        val_features: Validation features DataFrame
-        feature_cols: All feature columns
-        questions_ranked: List of questions in ranked order
-        args: Command line arguments
-        out_dir: Output directory
-        prefix: Optional prefix for filename
-    """
-    print("\n" + "="*60)
-    print("CALCULATING PER-QUESTION VALIDATION SCORES")
-    print("="*60)
-    
-    per_question_scores = []
-    
-    # For each question, train a model using only that question's features
-    for idx, q in enumerate(questions_ranked):
-        # Get features for this question
-        q_cols = [c for c in feature_cols if c.split("__", 1)[0] == q]
-        
-        if not q_cols:
-            print(f"  Skipping {q}: no features found")
-            continue
-        
-        print(f"  Evaluating {q} (rank {idx+1}/{len(questions_ranked)}) with {len(q_cols)} features...")
-        
-        # Train a simple model on just this question
-        model = make_meta_model(args)
-        
-        try:
-            model.fit(
-                train_features[q_cols].to_numpy(), 
-                train_features["y_true"].to_numpy()
-            )
-            
-            # Evaluate on validation set
-            metrics = score_meta_model(
-                model,
-                val_features[q_cols].to_numpy(),
-                val_features["y_true"].to_numpy(),
-                args.task
-            )
-            
-            score = primary_score(metrics, args.task)
-            
-            # Get additional metrics
-            additional_metrics = {}
-            for k, v in metrics.items():
-                if isinstance(v, (int, float)) and k not in ['primary_score']:
-                    additional_metrics[k] = v
-            
-            per_question_scores.append({
-                "question_id": q,
-                "rank": idx + 1,
-                "validation_score": score,
-                "n_features": len(q_cols),
-                **additional_metrics
-            })
-            
-        except Exception as e:
-            print(f"    Error evaluating {q}: {e}")
-            continue
-    
-    # Save to CSV
-    df = pd.DataFrame(per_question_scores)
-    if not df.empty:
-        df = df.sort_values("validation_score", ascending=False)
-        df['rank_by_score'] = range(1, len(df) + 1)
-        
-        filename = f"{prefix}_per_question_validation_scores.csv" if prefix else "per_question_validation_scores.csv"
-        df.to_csv(out_dir / filename, index=False)
-        
-        print(f"\n✓ Saved per-question validation scores to: {out_dir / filename}")
-        print(f"\nTop 10 questions by validation score:")
-        print(df.head(10)[["question_id", "validation_score", "rank", "rank_by_score"]].to_string(index=False))
-        
-        # Also save a summary of score distribution
-        summary = {
-            "mean_score": df['validation_score'].mean(),
-            "std_score": df['validation_score'].std(),
-            "min_score": df['validation_score'].min(),
-            "max_score": df['validation_score'].max(),
-            "n_questions": len(df)
-        }
-        with open(out_dir / f"{prefix}_per_question_score_summary.json", 'w') as f:
-            json.dump(summary, f, indent=2)
-        
-        return df
-    else:
-        print("  No valid question scores could be calculated")
-        return None
 
-# ----------------------------------------------------------------------
-#  Primary Score Function
-# ----------------------------------------------------------------------
+# =======================================================================
+#  PRIMARY SCORE FUNCTION
+# =======================================================================
+
 def primary_score(metrics: dict, task: str) -> float:
     if task == "classification":
         return metrics.get("macro_f1", 0.0)
@@ -453,9 +374,45 @@ def primary_score(metrics: dict, task: str) -> float:
         return -metrics.get("rmse", float('inf'))
 
 
-# ----------------------------------------------------------------------
-#  Hyperparameter Search on ALL Questions
-# ----------------------------------------------------------------------
+def score_meta_model(model, x, y, task):
+    """Score a meta-model. Computes AUC if model supports predict_proba."""
+    if model is None:
+        pred = x
+        proba = None
+    else:
+        pred = model.predict(x)
+        proba = model.predict_proba(x) if hasattr(model, "predict_proba") else None
+
+    if task == "classification":
+        metrics = {
+            "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
+            "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
+            "balanced_accuracy": balanced_accuracy_score(y, pred),
+            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
+            "confusion_matrix": confusion_matrix(y, pred).tolist(),
+        }
+        if proba is not None:
+            try:
+                if proba.shape[1] == 2:
+                    metrics["roc_auc"] = roc_auc_score(y, proba[:, 1])
+                else:
+                    metrics["roc_auc_ovr"] = roc_auc_score(y, proba, multi_class='ovr', average='macro')
+            except Exception:
+                pass
+        return metrics
+    else:
+        rmse = np.sqrt(mean_squared_error(y, pred))
+        return {
+            "rmse": rmse,
+            "mae": mean_absolute_error(y, pred),
+            "r2": r2_score(y, pred),
+        }
+
+
+# =======================================================================
+#  HYPERPARAMETER SEARCH
+# =======================================================================
+
 def hyperparameter_search_optuna_all_questions(
     train_df: pd.DataFrame,
     split_manager: SplitManager,
@@ -532,12 +489,12 @@ def objective_function_all_questions(
     """Objective function that averages performance across ALL questions."""
     
     params = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),  # Narrowed range
-        "batch_size": trial.suggest_categorical("batch_size", [4, 8]),  # Smaller batch sizes
-        "epochs": trial.suggest_int("epochs", 1, 3),  # Fewer epochs for HPO
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [4, 8]),
+        "epochs": trial.suggest_int("epochs", 1, 3),
         "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
         "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
-        "max_length": trial.suggest_categorical("max_length", [128, 256]),  # Reduced options
+        "max_length": trial.suggest_categorical("max_length", [128, 256]),
         "focal_gamma": trial.suggest_float("focal_gamma", 0.5, 5.0, log=True),
         "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.3),
         "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.1, 5.0, log=True),
@@ -555,14 +512,12 @@ def objective_function_all_questions(
             q_fold_train = fold_train[fold_train["question_id"] == question].reset_index(drop=True)
             q_fold_val = fold_val[fold_val["question_id"] == question].reset_index(drop=True)
             
-            # Need more samples for meaningful training
             if len(q_fold_train) < 10 or len(q_fold_val) < 3:
                 print(f"  Skipping {question}: train={len(q_fold_train)}, val={len(q_fold_val)} (insufficient data)")
                 continue
             
             temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}_{question}"
             
-            # Add retry logic for rate limiting
             max_retries = 3
             metrics = None
             for retry in range(max_retries):
@@ -587,7 +542,7 @@ def objective_function_all_questions(
                         learning_rate=params["learning_rate"],
                         weight_decay=params["weight_decay"],
                         warmup_ratio=params["warmup_ratio"],
-                        patience=1,  # Reduced patience for HPO
+                        patience=1,
                         class_weights=args.class_weights,
                         loss=args.loss,
                         focal_gamma=args.focal_gamma,
@@ -603,12 +558,11 @@ def objective_function_all_questions(
                     print(f"  Attempt {retry+1} failed for {question}: {e}")
                     if "429" in str(e) or "Too Many Requests" in str(e):
                         import time
-                        wait_time = (retry + 1) * 5  # 5, 10, 15 seconds
+                        wait_time = (retry + 1) * 5
                         print(f"  Rate limited! Waiting {wait_time} seconds...")
                         time.sleep(wait_time)
                     continue
                 finally:
-                    # Clean up temp directory
                     try:
                         shutil.rmtree(temp_out)
                     except:
@@ -638,26 +592,6 @@ def objective_function_all_questions(
     print(f"Trial {trial.number} final score: {final_score:.4f}")
     return final_score
 
-def download_with_retry(model_name: str, max_retries: int = 5):
-    """Download model with retry logic for rate limiting."""
-    from transformers import AutoConfig
-    import time
-    
-    for retry in range(max_retries):
-        try:
-            # Try to load the config first
-            config = AutoConfig.from_pretrained(model_name)
-            return config
-        except Exception as e:
-            if "429" in str(e) or "Too Many Requests" in str(e):
-                wait_time = (retry + 1) * 10  # 10, 20, 30, 40, 50 seconds
-                print(f"Rate limited! Waiting {wait_time} seconds before retry {retry+1}/{max_retries}...")
-                time.sleep(wait_time)
-            else:
-                raise e
-    raise Exception(f"Failed to download {model_name} after {max_retries} retries")
-
-
 
 def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict) -> dict | None:
     """Fast training and evaluation for hyperparameter search with caching."""
@@ -665,11 +599,9 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
     
-    # Create a cache key based on the data and config
     cache_key = f"{hash(frozenset(train_df['utterance_id']))}_{cfg.learning_rate}_{cfg.batch_size}_{cfg.epochs}"
     cache_path = Path(cfg.output_dir) / f"cache_{cache_key}.pkl"
     
-    # Check cache
     if cache_path.exists():
         try:
             return joblib.load(cache_path)
@@ -693,7 +625,7 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
         texts = val_df["text"].tolist()
         labels = val_df["label"].values
         preds = []
-        batch_size = min(cfg.eval_batch_size, len(texts))  # Ensure batch size doesn't exceed data size
+        batch_size = min(cfg.eval_batch_size, len(texts))
 
         with torch.no_grad():
             for start in range(0, len(texts), batch_size):
@@ -730,7 +662,6 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
         else:
             result = {"rmse": np.sqrt(mean_squared_error(labels, preds))}
         
-        # Save to cache
         joblib.dump(result, cache_path)
         return result
         
@@ -739,9 +670,10 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
         return None
 
 
-# ----------------------------------------------------------------------
-#  Individual Meta-Model Creators
-# ----------------------------------------------------------------------
+# =======================================================================
+#  META-MODEL CREATORS
+# =======================================================================
+
 def create_linear_model(task, args):
     """Create linear model: LogisticRegression for classification, Ridge for regression"""
     if task == "classification":
@@ -755,12 +687,13 @@ def create_linear_model(task, args):
                 C=getattr(args, 'logreg_C', 1.0)
             )),
         ])
-    else:  # regression
+    else:
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
             ("model", Ridge(alpha=getattr(args, 'ridge_alpha', 1.0))),
         ])
+
 
 def create_ridge(task, args):
     """Ridge regression (regression only) - falls back to linear for classification"""
@@ -773,6 +706,7 @@ def create_ridge(task, args):
     else:
         print("  Note: Ridge is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
+
 
 def create_lasso(task, args):
     """Lasso regression (regression only) - falls back to linear for classification"""
@@ -789,6 +723,7 @@ def create_lasso(task, args):
     else:
         print("  Note: Lasso is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
+
 
 def create_elasticnet(task, args):
     """ElasticNet regression (regression only) - falls back to linear for classification"""
@@ -807,6 +742,7 @@ def create_elasticnet(task, args):
         print("  Note: ElasticNet is for regression only, using Logistic Regression for classification")
         return create_linear_model(task, args)
 
+
 def create_random_forest(task, args):
     """Create Random Forest model (classification or regression)"""
     if task == "classification":
@@ -818,7 +754,7 @@ def create_random_forest(task, args):
             n_jobs=-1,
             max_depth=getattr(args, 'max_depth', None)
         )
-    else:  # regression
+    else:
         return RandomForestRegressor(
             n_estimators=args.n_estimators,
             random_state=args.seed,
@@ -826,6 +762,7 @@ def create_random_forest(task, args):
             n_jobs=-1,
             max_depth=getattr(args, 'max_depth', None)
         )
+
 
 def create_svm(task, args):
     """Create SVM model (SVC for classification, SVR for regression)"""
@@ -837,12 +774,12 @@ def create_svm(task, args):
                 kernel=getattr(args, 'svm_kernel', 'rbf'),
                 C=getattr(args, 'svm_C', 1.0),
                 gamma=getattr(args, 'svm_gamma', 'scale'),
-                probability=True,  # Required for soft voting
+                probability=True,
                 class_weight="balanced",
                 random_state=args.seed
             )),
         ])
-    else:  # regression
+    else:
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
@@ -853,6 +790,7 @@ def create_svm(task, args):
             )),
         ])
 
+
 def create_gradient_boosting(task, args):
     """Create Gradient Boosting model (classification or regression)"""
     if task == "classification":
@@ -862,13 +800,14 @@ def create_gradient_boosting(task, args):
             max_depth=3,
             random_state=args.seed
         )
-    else:  # regression
+    else:
         return GradientBoostingRegressor(
             n_estimators=args.n_estimators,
             learning_rate=0.1,
             max_depth=3,
             random_state=args.seed
         )
+
 
 def create_knn(task, args):
     """Create KNN model (classification or regression)"""
@@ -881,7 +820,7 @@ def create_knn(task, args):
                 weights='distance'
             )),
         ])
-    else:  # regression
+    else:
         return Pipeline([
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
             ("scaler", StandardScaler()),
@@ -891,44 +830,24 @@ def create_knn(task, args):
             )),
         ])
 
+
 def create_ensemble_model(task, args):
-    """
-    Create an ensemble of multiple meta-models with voting/averaging.
+    """Create an ensemble of multiple meta-models with voting/averaging."""
     
-    For classification: Uses soft voting (averages probabilities)
-    For regression: Uses averaging (averages predictions)
-    
-    Args:
-        task: "classification" or "regression"
-        args: Command line arguments with ensemble configuration
-        
-    Returns:
-        VotingClassifier or VotingRegressor ensemble
-    """
-    
-    # Get list of models to include in ensemble
     ensemble_models = getattr(args, 'ensemble_models', ['linear', 'random_forest', 'xgboost'])
     
-    # Validate that models are appropriate for the task
-    classification_only_models = []  # Models that only work for classification
-    regression_only_models = ['ridge', 'lasso', 'elasticnet']  # Models that only work for regression
+    regression_only_models = ['ridge', 'lasso', 'elasticnet']
     
     if task == "classification":
-        # Remove regression-only models from ensemble
         invalid_models = [m for m in ensemble_models if m in regression_only_models]
         if invalid_models:
             print(f"Warning: Removing regression-only models from classification ensemble: {invalid_models}")
             ensemble_models = [m for m in ensemble_models if m not in regression_only_models]
-    else:  # regression
-        # All models should have regression implementations
-        # (classification_only_models is empty, so no filtering needed)
-        pass
     
     if not ensemble_models:
         print("Error: No valid models for ensemble. Falling back to linear model.")
         return create_linear_model(task, args)
     
-    # Map model names to creator functions
     model_creators = {
         'linear': create_linear_model,
         'ridge': create_ridge,
@@ -941,7 +860,6 @@ def create_ensemble_model(task, args):
         'knn': create_knn,
     }
     
-    # Create individual models
     estimators = []
     failed_models = []
     
@@ -954,24 +872,20 @@ def create_ensemble_model(task, args):
             continue
         
         try:
-            # Create the model
             model = model_creators[model_name](task, args)
             
-            # Validate the model type matches the task
             if task == "classification":
                 from sklearn.base import ClassifierMixin
                 if not isinstance(model, ClassifierMixin):
-                    # Try to check if it's a pipeline with a classifier
                     if hasattr(model, 'named_steps'):
                         last_step = list(model.named_steps.values())[-1]
                         if not isinstance(last_step, ClassifierMixin):
                             raise ValueError(f"{model_name} is not a classifier (got {type(last_step).__name__})")
                     else:
                         raise ValueError(f"{model_name} is not a classifier (got {type(model).__name__})")
-            else:  # regression
+            else:
                 from sklearn.base import RegressorMixin
                 if not isinstance(model, RegressorMixin):
-                    # Try to check if it's a pipeline with a regressor
                     if hasattr(model, 'named_steps'):
                         last_step = list(model.named_steps.values())[-1]
                         if not isinstance(last_step, RegressorMixin):
@@ -986,33 +900,29 @@ def create_ensemble_model(task, args):
             print(f"  ✗ Failed to create {model_name}: {e}")
             failed_models.append(model_name)
     
-    # Remove failed models from ensemble_models list for reporting
     successful_models = [m for m in ensemble_models if m not in failed_models]
     
     if not estimators:
         print("\nNo valid ensemble models. Falling back to linear model.")
         return create_linear_model(task, args)
     
-    # Create the appropriate ensemble based on task
     if task == "classification":
-        # For classification: use soft voting (probability averaging)
         voting_type = getattr(args, 'ensemble_voting', 'soft')
-        
         ensemble = VotingClassifier(
             estimators=estimators,
-            voting=voting_type,  # 'soft' for probability averaging, 'hard' for majority vote
+            voting=voting_type,
             weights=getattr(args, 'ensemble_weights', None),
             n_jobs=-1
         )
         
         print(f"\n✓ Created CLASSIFICATION ensemble with {len(estimators)} models")
-        print(f"  - Voting type: {voting_type} {'(probability averaging)' if voting_type == 'soft' else '(majority vote)'}")
+        print(f"  - Voting type: {voting_type}")
         print(f"  - Models: {successful_models}")
         
         if getattr(args, 'ensemble_weights', None):
             print(f"  - Weights: {args.ensemble_weights}")
         
-    else:  # regression
+    else:
         ensemble = VotingRegressor(
             estimators=estimators,
             weights=getattr(args, 'ensemble_weights', None),
@@ -1020,71 +930,18 @@ def create_ensemble_model(task, args):
         )
         
         print(f"\n✓ Created REGRESSION ensemble with {len(estimators)} models")
-        print(f"  - Averaging type: weighted {'with weights' if getattr(args, 'ensemble_weights', None) else 'equal'}")
         print(f"  - Models: {successful_models}")
         
         if getattr(args, 'ensemble_weights', None):
             print(f"  - Weights: {args.ensemble_weights}")
     
-    # Save ensemble information to args for later use
     args.ensemble_models_used = successful_models
-    
-    return ensemble
-
-def create_ensemble_model_with_list(task, args, model_list):
-    """Helper function to create ensemble with a specific list of models."""
-    model_creators = {
-        'linear': create_linear_model,
-        'ridge': create_ridge,
-        'lasso': create_lasso,
-        'elasticnet': create_elasticnet,
-        'random_forest': create_random_forest,
-        'svm': create_svm,
-        'gradient_boosting': create_gradient_boosting,
-        'hist_gradient_boosting': create_hist_gradient_boosting,
-        'knn': create_knn,
-    }
-    
-    estimators = []
-    for model_name in model_list:
-        if model_name in model_creators:
-            model = model_creators[model_name](task, args)
-            estimators.append((model_name, model))
-            print(f"  - Adding {model_name} to ensemble")
-    
-    if task == "classification":
-        ensemble = VotingClassifier(
-            estimators=estimators,
-            voting='soft',
-            weights=getattr(args, 'ensemble_weights', None),
-            n_jobs=-1
-        )
-    else:
-        ensemble = VotingRegressor(
-            estimators=estimators,
-            weights=getattr(args, 'ensemble_weights', None)
-        )
     
     return ensemble
 
 
 def make_meta_model(args):
-    """
-    Create meta-model (single or ensemble based on configuration).
-    
-    For single models, supports:
-    - linear: Logistic Regression (classification) or Ridge (regression)
-    - ridge: Ridge regression (regression only, falls back to linear for classification)
-    - lasso: Lasso regression (regression only, falls back to linear for classification)
-    - elasticnet: ElasticNet regression (regression only, falls back to linear for classification)
-    - random_forest: Random Forest (classification or regression)
-    - svm: SVM (classification or regression)
-    - hist_gradient_boosting: Hist Gradient Boosting (classification or regression)
-    - gradient_boosting: Gradient Boosting (classification or regression)
-    - knn: KNN (classification or regression)
-    
-    For ensembles, use --use-ensemble and --ensemble-models
-    """
+    """Create meta-model (single or ensemble based on configuration)."""
     
     if getattr(args, 'use_ensemble', False):
         print("\n" + "=" * 50)
@@ -1092,7 +949,6 @@ def make_meta_model(args):
         print("=" * 50)
         return create_ensemble_model(args.task, args)
     else:
-        # Single model (original behavior)
         print(f"\nCreating single meta-model: {args.meta_model}")
         
         if args.meta_model == "linear":
@@ -1118,9 +974,10 @@ def make_meta_model(args):
             return create_linear_model(args.task, args)
 
 
-# ----------------------------------------------------------------------
-#  Helper Functions
-# ----------------------------------------------------------------------
+# =======================================================================
+#  EMBEDDING EXTRACTION HELPERS
+# =======================================================================
+
 def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).float()
     summed = (last_hidden_state * mask).sum(dim=1)
@@ -1195,6 +1052,11 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
         min_text_chars=args.min_text_chars,
     )
 
+
+# =======================================================================
+#  PER-QUESTION MODEL TRAINING
+# =======================================================================
+
 def train_question_models(train_df, val_df, test_df, metadata, args, best_hparams, out_dir: Path):
     """Train per-question models."""
     embedding_files = {"train": {}, "val": {}, "test": {}}
@@ -1203,18 +1065,16 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
     questions = [q.upper() for q in args.questions]
     is_test_empty = test_df is None or test_df.empty
     
-    # Initialize validation_scores dictionary at the START of the function
     validation_scores = {}
     
     for question in questions:
         q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
         q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
         
-        # Handle test DataFrame properly
         if not is_test_empty:
             q_test = test_df[test_df["question_id"] == question].reset_index(drop=True)
         else:
-            q_test = pd.DataFrame()  # Empty DataFrame
+            q_test = pd.DataFrame()
 
         if q_train.empty:
             print(f"{question}: skipping, no training examples")
@@ -1226,7 +1086,6 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         val_emb = q_dir / "embeddings_val.csv"
         test_emb = q_dir / "embeddings_test.csv"
 
-        # Check if we need to train the model
         model_exists = model_dir.exists() and saved_model_exists(model_dir)
         embeddings_exist = train_emb.exists() and val_emb.exists()
         test_embeddings_exist = is_test_empty or test_emb.exists()
@@ -1234,7 +1093,6 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
         if (model_exists and embeddings_exist and test_embeddings_exist):
             print(f"{question}: model and embeddings already exist, loading.")
             
-            # Load existing validation score from summary if available
             summary_path = out_dir / "question_model_summary.csv"
             if summary_path.exists():
                 summary_df = pd.read_csv(summary_path)
@@ -1253,7 +1111,6 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             extract_embeddings(model_dir, q_train, args, train_emb, best_hparams["max_length"])
             extract_embeddings(model_dir, q_val, args, val_emb, best_hparams["max_length"])
             
-            # ===== Calculate and store validation score =====
             try:
                 device = choose_device()
                 tokenizer = load_tokenizer(str(model_dir))
@@ -1308,11 +1165,9 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
                 print(f"  Could not calculate validation score for {question}: {e}")
                 validation_scores[question] = None
             
-            # Handle test embeddings
             if not is_test_empty and not q_test.empty:
                 extract_embeddings(model_dir, q_test, args, test_emb, best_hparams["max_length"])
             elif not is_test_empty:
-                # Create empty test embeddings file with correct structure
                 print(f"{question}: No test examples, creating empty test embeddings placeholder")
                 if train_emb.exists():
                     sample_emb = pd.read_csv(train_emb, nrows=1)
@@ -1331,9 +1186,7 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
             "model_dir": str(model_dir)
         })
     
-    # ===== Save validation scores with proper error handling =====
     if validation_scores:
-        # Filter out None values
         valid_scores = {q: s for q, s in validation_scores.items() if s is not None}
         
         if valid_scores:
@@ -1346,18 +1199,10 @@ def train_question_models(train_df, val_df, test_df, metadata, args, best_hparam
                 scores_df = scores_df.sort_values("validation_score", ascending=False)
                 scores_df.to_csv(out_dir / "per_question_model_validation_scores.csv", index=False)
                 print(f"\n✓ Per-question model validation scores saved to: {out_dir / 'per_question_model_validation_scores.csv'}")
-                print(f"  Questions evaluated: {len(scores_df)}")
-                print(scores_df.to_string(index=False))
-            else:
-                print(f"\n⚠️ No valid scores to save (empty DataFrame)")
-        else:
-            print(f"\n⚠️ No valid scores to save (all scores are None)")
-    else:
-        print(f"\n⚠️ No validation scores collected")
     
-    # Save summaries even if no scores
     pd.DataFrame(summaries).to_csv(out_dir / "question_model_summary.csv", index=False)
     return embedding_files
+
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     """Build feature table from embeddings."""
@@ -1402,6 +1247,7 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
     return merged, feature_cols
 
+
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
     """Align feature columns across splits."""
     for df in [val_df, test_df]:
@@ -1414,6 +1260,7 @@ def align_feature_tables(train_df, val_df, test_df, feature_cols):
                 df.drop(columns=extra, inplace=True)
     return train_df, val_df, test_df
 
+
 def question_groups(feature_cols):
     """Group features by question."""
     groups = {}
@@ -1422,9 +1269,13 @@ def question_groups(feature_cols):
         groups.setdefault(q, []).append(c)
     return groups
 
+
+# =======================================================================
+#  IMPORTANCE CALCULATION FUNCTIONS
+# =======================================================================
+
 def permutation_question_importance(model, data_df, feature_cols, args):
     """Calculate feature importance by permuting all features from each question."""
-    # This version works with a single dataset (no separate validation set)
     x_data = data_df[feature_cols].to_numpy()
     y_data = data_df["y_true"].to_numpy()
     base_metrics = score_meta_model(model, x_data, y_data, args.task)
@@ -1454,54 +1305,41 @@ def permutation_question_importance(model, data_df, feature_cols, args):
     
     return pd.DataFrame(rows).sort_values("importance", ascending=False)
 
+
 def shap_question_importance(model, train_df, val_df, feature_cols, args):
-    """SHAP analysis that actually works with small datasets."""
-    
-    from sklearn.decomposition import PCA
-    from sklearn.linear_model import Ridge
+    """SHAP analysis that works with small datasets."""
     import warnings
     warnings.filterwarnings('ignore')
     
     print(f"  SHAP analysis with {len(feature_cols)} features...")
     
     n_samples = len(train_df)
-    
-    # CRITICAL: Use at most min(10, n_samples-1) components for stability
     n_components = min(10, n_samples - 1, len(feature_cols))
     print(f"  Using {n_components} PCA components (samples: {n_samples})")
     
-    # Apply PCA
     pca = PCA(n_components=n_components, random_state=args.seed)
     train_reduced = pca.fit_transform(train_df[feature_cols].to_numpy())
     val_reduced = pca.transform(val_df[feature_cols].to_numpy())
     
     print(f"  Explained variance: {pca.explained_variance_ratio_.sum():.3f}")
     
-    # Train a SIMPLE linear model on reduced features (not ensemble)
-    from sklearn.linear_model import Ridge
     simple_model = Ridge(alpha=1.0, random_state=args.seed)
     simple_model.fit(train_reduced, train_df["y_true"].to_numpy())
     
     print(f"  Simple model R²: {simple_model.score(val_reduced, val_df['y_true'].to_numpy()):.3f}")
     
-    # Use LinearExplainer (fast, stable, works with small data)
     print("  Creating LinearExplainer...")
     explainer = shap.LinearExplainer(simple_model, train_reduced)
     
-    # Explain validation samples
     n_explain = min(20, len(val_reduced))
     val_sample = val_reduced[:n_explain]
     
     print(f"  Computing SHAP values for {n_explain} samples...")
     shap_values = explainer.shap_values(val_sample)
     
-    # Get mean absolute SHAP per PCA component
     pca_importance = np.abs(shap_values).mean(axis=0)
-    
-    # Project back to original features
     feature_importance = np.abs(pca.components_.T @ pca_importance)
     
-    # Aggregate by question
     groups = question_groups(feature_cols)
     rows = []
     feature_to_idx = {c: i for i, c in enumerate(feature_cols)}
@@ -1523,91 +1361,120 @@ def shap_question_importance(model, train_df, val_df, feature_cols, args):
     
     return importance_df
 
+
 def permutation_question_importance_shap_hybrid(model, train_df, val_df, feature_cols, args):
-    """
-    Hybrid approach: Use permutation importance for feature selection,
-    but also compute SHAP values for interpretation.
-    """
-    # First get permutation importance (as in your original code)
+    """Hybrid approach: Use permutation importance for feature selection, plus SHAP."""
     perm_importance = permutation_question_importance(model, val_df, feature_cols, args)
     
-    # Then compute SHAP values for the top features
     try:
         shap_importance = shap_question_importance(model, train_df, val_df, feature_cols, args)
-        
-        # Merge both metrics
         merged = perm_importance.merge(shap_importance, on="question_id", how="left")
-        
-        # Save SHAP values
         merged.to_csv(Path(args.output_dir) / "shap_question_importance.csv", index=False)
-        
         return merged
     except Exception as e:
         print(f"SHAP computation failed: {e}")
         return perm_importance
 
 
-# =======================================================================
-#  FIXED score_meta_model – computes AUC when probabilities are available
-# =======================================================================
-def score_meta_model(model, x, y, task):
-    """
-    Score a meta-model. Now computes AUC if model supports predict_proba.
-    """
-    if model is None:
-        pred = x
-        proba = None
-    else:
-        pred = model.predict(x)
-        proba = model.predict_proba(x) if hasattr(model, "predict_proba") else None
-
-    if task == "classification":
-        metrics = {
-            "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
-            "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
-            "balanced_accuracy": balanced_accuracy_score(y, pred),
-            "classification_report": classification_report(y, pred, output_dict=True, zero_division=0),
-            "confusion_matrix": confusion_matrix(y, pred).tolist(),
+def save_per_question_validation_scores(
+    train_features, val_features, feature_cols, 
+    questions_ranked, args, out_dir: Path, 
+    prefix: str = ""
+):
+    """Calculate and save validation score for each question individually."""
+    print("\n" + "="*60)
+    print("CALCULATING PER-QUESTION VALIDATION SCORES")
+    print("="*60)
+    
+    per_question_scores = []
+    
+    for idx, q in enumerate(questions_ranked):
+        q_cols = [c for c in feature_cols if c.split("__", 1)[0] == q]
+        
+        if not q_cols:
+            print(f"  Skipping {q}: no features found")
+            continue
+        
+        print(f"  Evaluating {q} (rank {idx+1}/{len(questions_ranked)}) with {len(q_cols)} features...")
+        
+        model = make_meta_model(args)
+        
+        try:
+            model.fit(
+                train_features[q_cols].to_numpy(), 
+                train_features["y_true"].to_numpy()
+            )
+            
+            metrics = score_meta_model(
+                model,
+                val_features[q_cols].to_numpy(),
+                val_features["y_true"].to_numpy(),
+                args.task
+            )
+            
+            score = primary_score(metrics, args.task)
+            
+            additional_metrics = {}
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)) and k not in ['primary_score']:
+                    additional_metrics[k] = v
+            
+            per_question_scores.append({
+                "question_id": q,
+                "rank": idx + 1,
+                "validation_score": score,
+                "n_features": len(q_cols),
+                **additional_metrics
+            })
+            
+        except Exception as e:
+            print(f"    Error evaluating {q}: {e}")
+            continue
+    
+    df = pd.DataFrame(per_question_scores)
+    if not df.empty:
+        df = df.sort_values("validation_score", ascending=False)
+        df['rank_by_score'] = range(1, len(df) + 1)
+        
+        filename = f"{prefix}_per_question_validation_scores.csv" if prefix else "per_question_validation_scores.csv"
+        df.to_csv(out_dir / filename, index=False)
+        
+        print(f"\n✓ Saved per-question validation scores to: {out_dir / filename}")
+        print(f"\nTop 10 questions by validation score:")
+        print(df.head(10)[["question_id", "validation_score", "rank", "rank_by_score"]].to_string(index=False))
+        
+        summary = {
+            "mean_score": df['validation_score'].mean(),
+            "std_score": df['validation_score'].std(),
+            "min_score": df['validation_score'].min(),
+            "max_score": df['validation_score'].max(),
+            "n_questions": len(df)
         }
-        if proba is not None:
-            try:
-                if proba.shape[1] == 2:
-                    metrics["roc_auc"] = roc_auc_score(y, proba[:, 1])
-                else:
-                    metrics["roc_auc_ovr"] = roc_auc_score(y, proba, multi_class='ovr', average='macro')
-            except Exception:
-                pass
-        return metrics
+        with open(out_dir / f"{prefix}_per_question_score_summary.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        return df
     else:
-        rmse = np.sqrt(mean_squared_error(y, pred))
-        return {
-            "rmse": rmse,
-            "mae": mean_absolute_error(y, pred),
-            "r2": r2_score(y, pred),
-        }
+        print("  No valid question scores could be calculated")
+        return None
 
 
 # =======================================================================
-#  Audio feature loading and fusion utilities
+#  AUDIO FEATURE LOADING AND FUSION UTILITIES
 # =======================================================================
 
 def load_audio_features(csv_path: str, speaker_col: str = "speaker_id",
                         exclude_cols: list = None) -> pd.DataFrame:
-    """
-    Load audio features from CSV and prepare them for fusion.
-    Assumes the CSV has a speaker_id column and numeric feature columns.
-    """
+    """Load audio features from CSV and prepare them for fusion."""
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Audio features CSV not found: {csv_path}")
     
     audio_df = pd.read_csv(csv_path)
     
-    # Ensure speaker column exists
     if speaker_col not in audio_df.columns:
         raise ValueError(f"Speaker column '{speaker_col}' not found in audio CSV. Available: {audio_df.columns.tolist()}")
     
-    # Determine feature columns: all numeric columns except identifier columns
     exclude = exclude_cols or [speaker_col, 'session_id', 'utterance_id', 'question_id', 'label', 'y_true']
     numeric_cols = audio_df.select_dtypes(include=[np.number]).columns.tolist()
     audio_feature_cols = [c for c in numeric_cols if c not in exclude]
@@ -1615,33 +1482,25 @@ def load_audio_features(csv_path: str, speaker_col: str = "speaker_id",
     if not audio_feature_cols:
         raise ValueError("No numeric feature columns found in audio CSV. Check exclude_cols.")
     
-    # Keep only speaker and feature columns
     keep_cols = [speaker_col] + audio_feature_cols
     audio_df = audio_df[keep_cols].copy()
     
-    # Ensure no duplicate speakers
     if audio_df.duplicated(subset=[speaker_col]).any():
-        # Aggregate by speaker (mean) if duplicates exist
         audio_df = audio_df.groupby(speaker_col).mean().reset_index()
     
-    # Rename speaker column to match our pipeline
     if speaker_col != 'speaker_id':
         audio_df.rename(columns={speaker_col: 'speaker_id'}, inplace=True)
     
     print(f"Loaded audio features: {len(audio_df)} speakers, {len(audio_feature_cols)} features")
+    print(f"  Audio feature columns: {audio_feature_cols[:5]}...")
     return audio_df
 
 
 def merge_audio_features(feature_df: pd.DataFrame, audio_df: pd.DataFrame,
                          how: str = 'left') -> pd.DataFrame:
-    """
-    Merge speaker-level feature table with audio features.
-    feature_df must have 'speaker_id' column.
-    audio_df must have 'speaker_id' column.
-    """
+    """Merge speaker-level feature table with audio features."""
     merged = feature_df.merge(audio_df, on='speaker_id', how=how)
     if how == 'left':
-        # Fill missing audio features with 0
         audio_cols = [c for c in audio_df.columns if c != 'speaker_id']
         for col in audio_cols:
             if col in merged.columns:
@@ -1654,1117 +1513,15 @@ def get_audio_feature_cols(audio_df: pd.DataFrame) -> list:
     return [c for c in audio_df.columns if c != 'speaker_id']
 
 
-def train_meta_model_on_features(train_features, val_features, test_features,
-                                 feature_cols, args, out_dir: Path,
-                                 model_name_suffix: str = ""):
-    """
-    Train a meta-model on the given feature set, with CV-based K selection.
-    This is a wrapper around train_meta_model_with_cv_selection.
-    """
-    # We need to call the existing training function; but we need to make sure
-    # it uses the provided feature_cols. Since the original function computes
-    # importance inside, we'll adapt by passing feature_cols.
-    # We'll create a wrapper that mimics the original.
-    # Instead of duplicating, we'll use the same function but we need to
-    # ensure it doesn't recompute feature_cols from embedding files.
-    # The original train_meta_model_with_cv_selection expects train_features,
-    # val_features, test_features, feature_cols, args, out_dir.
-    # So we can just call it.
-    if args.test_frac == 0:
-        # If no test set, use CV-only mode
-        return train_meta_model_cv(
-            train_features, val_features, test_features, feature_cols, args, out_dir
-        )
-    else:
-        return train_meta_model_with_cv_selection(
-            train_features, val_features, test_features, feature_cols, args, out_dir
-        )
-
-
-def combine_predictions(preds_list, task, weights=None):
-    """
-    Combine predictions from multiple models.
-    For classification: soft voting (average probabilities) if probabilities provided,
-    else majority vote.
-    For regression: average.
-    """
-    if task == "classification":
-        # Assuming preds_list contains dictionaries with 'y_pred' and optionally 'probs'
-        # If all have 'probs', average them; else use y_pred for majority vote.
-        probs_available = all('probs' in p for p in preds_list)
-        if probs_available:
-            # Average probabilities
-            avg_probs = np.mean([p['probs'] for p in preds_list], axis=0)
-            y_comb = np.argmax(avg_probs, axis=1)
-            # Also return averaged probs
-            return {"y_pred": y_comb, "probs": avg_probs}
-        else:
-            # Majority vote
-            y_preds = np.array([p['y_pred'] for p in preds_list])
-            y_comb = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0, arr=y_preds)
-            return {"y_pred": y_comb}
-    else:
-        # Average predictions
-        y_preds = np.array([p['y_pred'] for p in preds_list])
-        y_comb = np.mean(y_preds, axis=0)
-        return {"y_pred": y_comb}
-
-
-def train_model_based_fusion(text_model, audio_model, train_preds, val_preds, test_preds,
-                             task, args):
-    """
-    Train a second-level meta-model on the predictions of text and audio models.
-    train_preds, val_preds, test_preds are DataFrames with columns for each modality's predictions.
-    For classification, we use probabilities; for regression, raw predictions.
-    """
-    from sklearn.linear_model import LogisticRegression, Ridge
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-    
-    # Prepare training data: features = concatenated predictions
-    X_train = np.column_stack([train_preds['text_y_pred'], train_preds['audio_y_pred']])
-    y_train = train_preds['y_true'].values
-    X_val = np.column_stack([val_preds['text_y_pred'], val_preds['audio_y_pred']])
-    y_val = val_preds['y_true'].values
-    X_test = np.column_stack([test_preds['text_y_pred'], test_preds['audio_y_pred']])
-    y_test = test_preds['y_true'].values
-    
-    if task == "classification":
-        # Use logistic regression with balanced class weights
-        meta_model = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
-        ])
-    else:
-        meta_model = Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", Ridge(alpha=1.0))
-        ])
-    
-    meta_model.fit(X_train, y_train)
-    y_pred = meta_model.predict(X_test)
-    metrics = score_meta_model(None, y_pred, y_test, task)
-    return meta_model, metrics, y_pred
-
-
 # =======================================================================
-#  NEW: Late Fusion in CV mode (runs inside each fold)
-# =======================================================================
-def run_late_fusion_cv(train_features, val_features, audio_df, feature_cols_text,
-                       audio_feature_cols, args, out_dir):
-    """
-    Late fusion (average predictions) using 5‑fold CV.
-    For each fold, train text and audio models on fold train, get predictions on fold val,
-    average them, and collect all predictions across folds.
-    """
-    all_data = pd.concat([train_features, val_features], ignore_index=True)
-    all_with_audio = merge_audio_features(all_data, audio_df, how='left')
-    
-    speakers = all_data.groupby("speaker_id")["y_true"].first().reset_index()
-    speakers.columns = ["speaker_id", "label"]
-    if args.task == "classification":
-        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers, speakers["label"]))
-    else:
-        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers))
-    
-    all_preds = []
-    all_true = []
-    fold_metrics = []
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
-        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
-        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
-        
-        fold_train = all_data[all_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        fold_val = all_data[all_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        fold_train_audio = all_with_audio[all_with_audio["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        fold_val_audio = all_with_audio[all_with_audio["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        
-        # Train text model with CV feature selection (uses train_meta_model_cv)
-        text_result = train_meta_model_cv(
-            fold_train, fold_val, None, feature_cols_text, args, out_dir / f"late_text_fold{fold_idx}"
-        )
-        audio_result = train_meta_model_cv(
-            fold_train_audio, fold_val_audio, None, audio_feature_cols, args, out_dir / f"late_audio_fold{fold_idx}"
-        )
-        
-        # Load the final CV models (trained on full fold train data)
-        text_model = joblib.load(out_dir / f"late_text_fold{fold_idx}" / "final_cv_model.joblib")
-        audio_model = joblib.load(out_dir / f"late_audio_fold{fold_idx}" / "final_cv_model.joblib")
-        
-        text_selected = pd.read_csv(out_dir / f"late_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        audio_selected = pd.read_csv(out_dir / f"late_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        
-        X_text_val = fold_val[text_selected].to_numpy()
-        X_audio_val = fold_val_audio[audio_selected].to_numpy()
-        y_val = fold_val["y_true"].to_numpy()
-        
-        if args.task == "classification":
-            if hasattr(text_model, "predict_proba") and hasattr(audio_model, "predict_proba"):
-                prob_text = text_model.predict_proba(X_text_val)
-                prob_audio = audio_model.predict_proba(X_audio_val)
-                prob_avg = (prob_text + prob_audio) / 2.0
-                preds = np.argmax(prob_avg, axis=1)
-            else:
-                pred_text = text_model.predict(X_text_val)
-                pred_audio = audio_model.predict(X_audio_val)
-                preds = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0,
-                                            arr=np.array([pred_text, pred_audio]))
-        else:
-            pred_text = text_model.predict(X_text_val)
-            pred_audio = audio_model.predict(X_audio_val)
-            preds = (pred_text + pred_audio) / 2.0
-        
-        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
-        all_preds.extend(preds)
-        all_true.extend(y_val)
-    
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
-    
-    # Save per-fold metrics
-    fold_df = pd.DataFrame(fold_metrics)
-    fold_df.to_csv(out_dir / "late_fusion_fold_metrics.csv", index=False)
-    
-    return aggregate_metrics, all_preds, all_true
-
-
-# =======================================================================
-#  NEW: Model‑based Fusion (Stacking) in CV mode with inner CV for OOF
-# =======================================================================
-def run_model_based_fusion_cv(train_features, val_features, audio_df, feature_cols_text,
-                              audio_feature_cols, args, out_dir):
-    """
-    Stacking (model‑based fusion) using 5‑fold CV with inner CV for out‑of‑fold predictions.
-    This avoids leakage by training the meta‑model on out‑of‑fold predictions from the base models.
-    """
-    all_data = pd.concat([train_features, val_features], ignore_index=True)
-    all_with_audio = merge_audio_features(all_data, audio_df, how='left')
-    
-    speakers = all_data.groupby("speaker_id")["y_true"].first().reset_index()
-    speakers.columns = ["speaker_id", "label"]
-    if args.task == "classification":
-        cv_outer = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        outer_splits = list(cv_outer.split(speakers, speakers["label"]))
-    else:
-        cv_outer = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        outer_splits = list(cv_outer.split(speakers))
-    
-    all_preds = []
-    all_true = []
-    fold_metrics = []
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(outer_splits):
-        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
-        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
-        
-        outer_train = all_data[all_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        outer_val = all_data[all_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        outer_train_audio = all_with_audio[all_with_audio["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        outer_val_audio = all_with_audio[all_with_audio["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        
-        # ----- Inner CV to produce out‑of‑fold predictions for stacking -----
-        inner_folds = min(3, len(outer_train) // 10) if len(outer_train) > 10 else 2
-        inner_folds = max(2, inner_folds)
-        
-        # Initialise arrays for out‑of‑fold predictions
-        n_train = len(outer_train)
-        if args.task == "classification":
-            # We'll store probabilities for each class; we need to know number of classes
-            classes = np.unique(outer_train["y_true"])
-            n_classes = len(classes)
-            oof_text_probs = np.zeros((n_train, n_classes))
-            oof_audio_probs = np.zeros((n_train, n_classes))
-        else:
-            oof_text_preds = np.zeros(n_train)
-            oof_audio_preds = np.zeros(n_train)
-        oof_labels = outer_train["y_true"].values
-        
-        inner_speakers = outer_train.groupby("speaker_id")["y_true"].first().reset_index()
-        inner_speakers.columns = ["speaker_id", "label"]
-        if args.task == "classification":
-            cv_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
-            inner_splits = list(cv_inner.split(inner_speakers, inner_speakers["label"]))
-        else:
-            cv_inner = KFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
-            inner_splits = list(cv_inner.split(inner_speakers))
-        
-        for inner_train_idx, inner_val_idx in inner_splits:
-            inner_train_speakers = inner_speakers.iloc[inner_train_idx]["speaker_id"].values
-            inner_val_speakers = inner_speakers.iloc[inner_val_idx]["speaker_id"].values
-            
-            inner_train = outer_train[outer_train["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
-            inner_val = outer_train[outer_train["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
-            inner_train_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
-            inner_val_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
-            
-            # Train base models on inner_train (simple, without feature selection for speed)
-            text_model = make_meta_model(args)
-            audio_model = make_meta_model(args)
-            text_model.fit(inner_train[feature_cols_text].to_numpy(), inner_train["y_true"].to_numpy())
-            audio_model.fit(inner_train_audio[audio_feature_cols].to_numpy(), inner_train_audio["y_true"].to_numpy())
-            
-            # Predict on inner_val
-            if args.task == "classification":
-                text_probs = text_model.predict_proba(inner_val[feature_cols_text].to_numpy())
-                audio_probs = audio_model.predict_proba(inner_val_audio[audio_feature_cols].to_numpy())
-                # Store in the out‑of‑fold arrays using speaker index mapping
-                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
-                for i, row in inner_val.iterrows():
-                    sp = row["speaker_id"]
-                    outer_idx = speaker_to_idx[sp]
-                    oof_text_probs[outer_idx] = text_probs[i]
-                    oof_audio_probs[outer_idx] = audio_probs[i]
-            else:
-                text_preds = text_model.predict(inner_val[feature_cols_text].to_numpy())
-                audio_preds = audio_model.predict(inner_val_audio[audio_feature_cols].to_numpy())
-                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
-                for i, row in inner_val.iterrows():
-                    sp = row["speaker_id"]
-                    outer_idx = speaker_to_idx[sp]
-                    oof_text_preds[outer_idx] = text_preds[i]
-                    oof_audio_preds[outer_idx] = audio_preds[i]
-        
-        # Now build meta‑model on out‑of‑fold predictions
-        if args.task == "classification":
-            X_meta_train = np.concatenate([oof_text_probs, oof_audio_probs], axis=1)
-        else:
-            X_meta_train = np.column_stack([oof_text_preds, oof_audio_preds])
-        y_meta_train = oof_labels
-        
-        from sklearn.linear_model import LogisticRegression, Ridge
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-        if args.task == "classification":
-            meta_model = Pipeline([
-                ("scaler", StandardScaler()),
-                ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
-            ])
-        else:
-            meta_model = Pipeline([
-                ("scaler", StandardScaler()),
-                ("model", Ridge(alpha=1.0))
-            ])
-        meta_model.fit(X_meta_train, y_meta_train)
-        
-        # Now train final base models on the entire outer_train (with feature selection)
-        text_result = train_meta_model_cv(
-            outer_train, outer_val, None, feature_cols_text, args, out_dir / f"stack_text_fold{fold_idx}"
-        )
-        audio_result = train_meta_model_cv(
-            outer_train_audio, outer_val_audio, None, audio_feature_cols, args, out_dir / f"stack_audio_fold{fold_idx}"
-        )
-        text_final = joblib.load(out_dir / f"stack_text_fold{fold_idx}" / "final_cv_model.joblib")
-        audio_final = joblib.load(out_dir / f"stack_audio_fold{fold_idx}" / "final_cv_model.joblib")
-        text_selected = pd.read_csv(out_dir / f"stack_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        audio_selected = pd.read_csv(out_dir / f"stack_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        
-        # Get predictions on outer_val
-        X_text_val = outer_val[text_selected].to_numpy()
-        X_audio_val = outer_val_audio[audio_selected].to_numpy()
-        if args.task == "classification":
-            text_probs_val = text_final.predict_proba(X_text_val)
-            audio_probs_val = audio_final.predict_proba(X_audio_val)
-            X_meta_val = np.concatenate([text_probs_val, audio_probs_val], axis=1)
-            preds = meta_model.predict(X_meta_val)
-        else:
-            text_preds_val = text_final.predict(X_text_val)
-            audio_preds_val = audio_final.predict(X_audio_val)
-            X_meta_val = np.column_stack([text_preds_val, audio_preds_val])
-            preds = meta_model.predict(X_meta_val)
-        
-        fold_metrics.append(score_meta_model(None, preds, outer_val["y_true"].values, args.task))
-        all_preds.extend(preds)
-        all_true.extend(outer_val["y_true"].values)
-    
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
-    
-    fold_df = pd.DataFrame(fold_metrics)
-    fold_df.to_csv(out_dir / "model_based_fusion_fold_metrics.csv", index=False)
-    
-    return aggregate_metrics, all_preds, all_true
-
-
-# =======================================================================
-#  NOVEL FUSION APPROACHES
+#  TRAIN_META_MODEL FUNCTIONS
 # =======================================================================
 
-# 1) Confidence-Weighted Late Fusion
-def confidence_weighted_late_fusion_cv(train_features, val_features, audio_df,
-                                       feature_cols_text, audio_feature_cols, args, out_dir):
-    """
-    Late fusion where each modality's prediction is weighted per sample
-    by the inverse of its entropy (higher confidence = higher weight).
-    """
-    all_data = pd.concat([train_features, val_features], ignore_index=True)
-    all_with_audio = merge_audio_features(all_data, audio_df, how='left')
-    
-    speakers = all_data.groupby("speaker_id")["y_true"].first().reset_index()
-    speakers.columns = ["speaker_id", "label"]
-    if args.task == "classification":
-        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers, speakers["label"]))
-    else:
-        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers))
-    
-    all_preds = []
-    all_true = []
-    fold_metrics = []
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
-        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
-        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
-        
-        fold_train = all_data[all_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        fold_val = all_data[all_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        fold_train_audio = all_with_audio[all_with_audio["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        fold_val_audio = all_with_audio[all_with_audio["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        
-        # Train base models
-        text_result = train_meta_model_cv(
-            fold_train, fold_val, None, feature_cols_text, args, out_dir / f"conf_text_fold{fold_idx}"
-        )
-        audio_result = train_meta_model_cv(
-            fold_train_audio, fold_val_audio, None, audio_feature_cols, args, out_dir / f"conf_audio_fold{fold_idx}"
-        )
-        
-        text_model = joblib.load(out_dir / f"conf_text_fold{fold_idx}" / "final_cv_model.joblib")
-        audio_model = joblib.load(out_dir / f"conf_audio_fold{fold_idx}" / "final_cv_model.joblib")
-        text_selected = pd.read_csv(out_dir / f"conf_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        audio_selected = pd.read_csv(out_dir / f"conf_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        
-        X_text_val = fold_val[text_selected].to_numpy()
-        X_audio_val = fold_val_audio[audio_selected].to_numpy()
-        y_val = fold_val["y_true"].to_numpy()
-        
-        if args.task == "classification":
-            # Get probabilities
-            if hasattr(text_model, "predict_proba") and hasattr(audio_model, "predict_proba"):
-                prob_text = text_model.predict_proba(X_text_val)
-                prob_audio = audio_model.predict_proba(X_audio_val)
-                
-                # Compute entropy for each sample per modality
-                eps = 1e-12
-                entropy_text = -np.sum(prob_text * np.log(prob_text + eps), axis=1)
-                entropy_audio = -np.sum(prob_audio * np.log(prob_audio + eps), axis=1)
-                
-                # Convert to weights (inverse entropy, then normalize per sample)
-                w_text = 1.0 / (entropy_text + eps)
-                w_audio = 1.0 / (entropy_audio + eps)
-                total = w_text + w_audio
-                w_text /= total
-                w_audio /= total
-                
-                # Weighted average of probabilities
-                fused_probs = prob_text * w_text[:, None] + prob_audio * w_audio[:, None]
-                preds = np.argmax(fused_probs, axis=1)
-            else:
-                # Fallback to simple average
-                pred_text = text_model.predict(X_text_val)
-                pred_audio = audio_model.predict(X_audio_val)
-                preds = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0,
-                                            arr=np.array([pred_text, pred_audio]))
-        else:
-            # For regression, we don't have a simple confidence measure; use equal weights
-            pred_text = text_model.predict(X_text_val)
-            pred_audio = audio_model.predict(X_audio_val)
-            preds = (pred_text + pred_audio) / 2.0
-        
-        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
-        all_preds.extend(preds)
-        all_true.extend(y_val)
-    
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
-    
-    fold_df = pd.DataFrame(fold_metrics)
-    fold_df.to_csv(out_dir / "confidence_weighted_fold_metrics.csv", index=False)
-    
-    return aggregate_metrics, all_preds, all_true
-
-
-# 2) Stacking with Interaction Features
-def stacking_with_interactions_cv(train_features, val_features, audio_df,
-                                  feature_cols_text, audio_feature_cols, args, out_dir):
-    """
-    Model-based fusion (stacking) where the meta-model receives not only
-    the base predictions but also cross-modal interactions (product, abs diff, squares).
-    """
-    all_data = pd.concat([train_features, val_features], ignore_index=True)
-    all_with_audio = merge_audio_features(all_data, audio_df, how='left')
-    
-    speakers = all_data.groupby("speaker_id")["y_true"].first().reset_index()
-    speakers.columns = ["speaker_id", "label"]
-    if args.task == "classification":
-        cv_outer = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        outer_splits = list(cv_outer.split(speakers, speakers["label"]))
-    else:
-        cv_outer = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        outer_splits = list(cv_outer.split(speakers))
-    
-    all_preds = []
-    all_true = []
-    fold_metrics = []
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(outer_splits):
-        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
-        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
-        
-        outer_train = all_data[all_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        outer_val = all_data[all_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        outer_train_audio = all_with_audio[all_with_audio["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        outer_val_audio = all_with_audio[all_with_audio["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        
-        # Inner CV to produce OOF predictions (same as before)
-        inner_folds = min(3, len(outer_train) // 10) if len(outer_train) > 10 else 2
-        inner_folds = max(2, inner_folds)
-        n_train = len(outer_train)
-        if args.task == "classification":
-            classes = np.unique(outer_train["y_true"])
-            n_classes = len(classes)
-            oof_text_probs = np.zeros((n_train, n_classes))
-            oof_audio_probs = np.zeros((n_train, n_classes))
-        else:
-            oof_text_preds = np.zeros(n_train)
-            oof_audio_preds = np.zeros(n_train)
-        oof_labels = outer_train["y_true"].values
-        
-        inner_speakers = outer_train.groupby("speaker_id")["y_true"].first().reset_index()
-        inner_speakers.columns = ["speaker_id", "label"]
-        if args.task == "classification":
-            cv_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
-            inner_splits = list(cv_inner.split(inner_speakers, inner_speakers["label"]))
-        else:
-            cv_inner = KFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
-            inner_splits = list(cv_inner.split(inner_speakers))
-        
-        for inner_train_idx, inner_val_idx in inner_splits:
-            inner_train_speakers = inner_speakers.iloc[inner_train_idx]["speaker_id"].values
-            inner_val_speakers = inner_speakers.iloc[inner_val_idx]["speaker_id"].values
-            
-            inner_train = outer_train[outer_train["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
-            inner_val = outer_train[outer_train["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
-            inner_train_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
-            inner_val_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
-            
-            text_model = make_meta_model(args)
-            audio_model = make_meta_model(args)
-            text_model.fit(inner_train[feature_cols_text].to_numpy(), inner_train["y_true"].to_numpy())
-            audio_model.fit(inner_train_audio[audio_feature_cols].to_numpy(), inner_train_audio["y_true"].to_numpy())
-            
-            if args.task == "classification":
-                text_probs = text_model.predict_proba(inner_val[feature_cols_text].to_numpy())
-                audio_probs = audio_model.predict_proba(inner_val_audio[audio_feature_cols].to_numpy())
-                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
-                for i, row in inner_val.iterrows():
-                    sp = row["speaker_id"]
-                    outer_idx = speaker_to_idx[sp]
-                    oof_text_probs[outer_idx] = text_probs[i]
-                    oof_audio_probs[outer_idx] = audio_probs[i]
-            else:
-                text_preds = text_model.predict(inner_val[feature_cols_text].to_numpy())
-                audio_preds = audio_model.predict(inner_val_audio[audio_feature_cols].to_numpy())
-                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
-                for i, row in inner_val.iterrows():
-                    sp = row["speaker_id"]
-                    outer_idx = speaker_to_idx[sp]
-                    oof_text_preds[outer_idx] = text_preds[i]
-                    oof_audio_preds[outer_idx] = audio_preds[i]
-        
-        # Build meta-features with interactions
-        if args.task == "classification":
-            # Base predictions
-            X_meta = np.concatenate([oof_text_probs, oof_audio_probs], axis=1)
-            # Add interactions: product, absolute difference, squares
-            X_meta = np.concatenate([
-                X_meta,
-                oof_text_probs * oof_audio_probs,          # product
-                np.abs(oof_text_probs - oof_audio_probs),  # divergence
-                oof_text_probs ** 2,                       # text square
-                oof_audio_probs ** 2                       # audio square
-            ], axis=1)
-        else:
-            # For regression, we have single predictions
-            X_meta = np.column_stack([oof_text_preds, oof_audio_preds])
-            X_meta = np.concatenate([
-                X_meta,
-                (oof_text_preds * oof_audio_preds).reshape(-1, 1),
-                np.abs(oof_text_preds - oof_audio_preds).reshape(-1, 1),
-                (oof_text_preds ** 2).reshape(-1, 1),
-                (oof_audio_preds ** 2).reshape(-1, 1)
-            ], axis=1)
-        y_meta = oof_labels
-        
-        # Train meta-model
-        from sklearn.linear_model import LogisticRegression, Ridge
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-        if args.task == "classification":
-            meta_model = Pipeline([
-                ("scaler", StandardScaler()),
-                ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
-            ])
-        else:
-            meta_model = Pipeline([
-                ("scaler", StandardScaler()),
-                ("model", Ridge(alpha=1.0))
-            ])
-        meta_model.fit(X_meta, y_meta)
-        
-        # Now train final base models on outer_train (with feature selection)
-        text_result = train_meta_model_cv(
-            outer_train, outer_val, None, feature_cols_text, args, out_dir / f"inter_text_fold{fold_idx}"
-        )
-        audio_result = train_meta_model_cv(
-            outer_train_audio, outer_val_audio, None, audio_feature_cols, args, out_dir / f"inter_audio_fold{fold_idx}"
-        )
-        text_final = joblib.load(out_dir / f"inter_text_fold{fold_idx}" / "final_cv_model.joblib")
-        audio_final = joblib.load(out_dir / f"inter_audio_fold{fold_idx}" / "final_cv_model.joblib")
-        text_selected = pd.read_csv(out_dir / f"inter_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        audio_selected = pd.read_csv(out_dir / f"inter_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
-        
-        X_text_val = outer_val[text_selected].to_numpy()
-        X_audio_val = outer_val_audio[audio_selected].to_numpy()
-        if args.task == "classification":
-            text_probs_val = text_final.predict_proba(X_text_val)
-            audio_probs_val = audio_final.predict_proba(X_audio_val)
-            X_meta_val = np.concatenate([
-                text_probs_val, audio_probs_val,
-                text_probs_val * audio_probs_val,
-                np.abs(text_probs_val - audio_probs_val),
-                text_probs_val ** 2,
-                audio_probs_val ** 2
-            ], axis=1)
-        else:
-            text_preds_val = text_final.predict(X_text_val)
-            audio_preds_val = audio_final.predict(X_audio_val)
-            X_meta_val = np.concatenate([
-                text_preds_val.reshape(-1,1), audio_preds_val.reshape(-1,1),
-                (text_preds_val * audio_preds_val).reshape(-1,1),
-                np.abs(text_preds_val - audio_preds_val).reshape(-1,1),
-                (text_preds_val ** 2).reshape(-1,1),
-                (audio_preds_val ** 2).reshape(-1,1)
-            ], axis=1)
-        
-        preds = meta_model.predict(X_meta_val)
-        fold_metrics.append(score_meta_model(None, preds, outer_val["y_true"].values, args.task))
-        all_preds.extend(preds)
-        all_true.extend(outer_val["y_true"].values)
-    
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
-    
-    fold_df = pd.DataFrame(fold_metrics)
-    fold_df.to_csv(out_dir / "interaction_stacking_fold_metrics.csv", index=False)
-    
-    return aggregate_metrics, all_preds, all_true
-
-
-# 3) Mixture of Experts
-def mixture_of_experts_cv(train_features, val_features, audio_df,
-                          feature_cols_text, audio_feature_cols, args, out_dir):
-    """
-    Mixture of Experts: cluster speakers based on text+audio features,
-    train separate fusion models per cluster, and a gating network to route samples.
-    """
-    from sklearn.cluster import KMeans
-    from sklearn.linear_model import LogisticRegression
-    
-    all_data = pd.concat([train_features, val_features], ignore_index=True)
-    all_with_audio = merge_audio_features(all_data, audio_df, how='left')
-    
-    # Get concatenated features for clustering
-    concat_feats = np.concatenate([
-        all_data[feature_cols_text].to_numpy(),
-        all_with_audio[audio_feature_cols].to_numpy()
-    ], axis=1)
-    
-    n_clusters = min(3, len(all_data) // 10) if len(all_data) > 30 else 2
-    n_clusters = max(2, n_clusters)
-    print(f"Mixture of Experts: using {n_clusters} clusters")
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=args.seed, n_init=10)
-    cluster_labels = kmeans.fit_predict(concat_feats)
-    all_data['cluster'] = cluster_labels
-    all_with_audio['cluster'] = cluster_labels
-    
-    # Train a gating model to predict cluster from features
-    gate_model = LogisticRegression(multi_class='multinomial', random_state=args.seed, max_iter=500)
-    gate_model.fit(concat_feats, cluster_labels)
-    
-    # For each cluster, train a separate fusion model (using standard methods, but we'll reuse early fusion)
-    # Since we need to evaluate via CV, we'll create a CV loop.
-    speakers = all_data.groupby("speaker_id")["y_true"].first().reset_index()
-    speakers.columns = ["speaker_id", "label"]
-    if args.task == "classification":
-        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers, speakers["label"]))
-    else:
-        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers))
-    
-    all_preds = []
-    all_true = []
-    fold_metrics = []
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
-        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
-        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
-        
-        fold_train = all_data[all_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        fold_val = all_data[all_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        fold_train_audio = all_with_audio[all_with_audio["speaker_id"].isin(train_speakers)].reset_index(drop=True)
-        fold_val_audio = all_with_audio[all_with_audio["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-        
-        # Train a gating model on fold train
-        train_concat = np.concatenate([
-            fold_train[feature_cols_text].to_numpy(),
-            fold_train_audio[audio_feature_cols].to_numpy()
-        ], axis=1)
-        gate_fold = LogisticRegression(multi_class='multinomial', random_state=args.seed, max_iter=500)
-        gate_fold.fit(train_concat, fold_train['cluster'].values)
-        
-        # For each cluster, train an expert model (early fusion) on fold train
-        expert_models = {}
-        for c in range(n_clusters):
-            cluster_train = fold_train[fold_train['cluster'] == c]
-            cluster_train_audio = fold_train_audio[fold_train_audio['cluster'] == c]
-            if len(cluster_train) < 5:
-                # Not enough data, skip this expert (will use fallback)
-                continue
-            # Early fusion: concatenate features
-            X_train = np.concatenate([
-                cluster_train[feature_cols_text].to_numpy(),
-                cluster_train_audio[audio_feature_cols].to_numpy()
-            ], axis=1)
-            y_train = cluster_train['y_true'].values
-            model = make_meta_model(args)
-            model.fit(X_train, y_train)
-            expert_models[c] = model
-        
-        # Predict on validation
-        # For each sample, get cluster probabilities from gate
-        val_concat = np.concatenate([
-            fold_val[feature_cols_text].to_numpy(),
-            fold_val_audio[audio_feature_cols].to_numpy()
-        ], axis=1)
-        gate_probs = gate_fold.predict_proba(val_concat)  # shape (n_val, n_clusters)
-        
-        # For each sample, compute prediction from each expert (if available) and weight by gate probabilities
-        y_val = fold_val['y_true'].values
-        n_val = len(fold_val)
-        # Initialize predictions
-        if args.task == "classification":
-            # We'll accumulate probabilities per class
-            classes = np.unique(all_data['y_true'])
-            n_classes = len(classes)
-            pred_probs = np.zeros((n_val, n_classes))
-            for c, model in expert_models.items():
-                # Get features for this expert's cluster (but we apply model to all samples)
-                X_val = np.concatenate([
-                    fold_val[feature_cols_text].to_numpy(),
-                    fold_val_audio[audio_feature_cols].to_numpy()
-                ], axis=1)
-                if hasattr(model, "predict_proba"):
-                    probs = model.predict_proba(X_val)
-                    # Align class order if needed
-                    if list(model.classes_) != list(classes):
-                        # Map probabilities to global classes
-                        prob_map = np.zeros((n_val, n_classes))
-                        for i, cls in enumerate(model.classes_):
-                            if cls in classes:
-                                idx_global = np.where(classes == cls)[0][0]
-                                prob_map[:, idx_global] = probs[:, i]
-                        probs = prob_map
-                    pred_probs += gate_probs[:, c][:, None] * probs
-                else:
-                    # Fallback: use hard predictions and convert to one-hot
-                    preds = model.predict(X_val)
-                    one_hot = np.eye(n_classes)[preds.astype(int)]
-                    # If model.classes_ may not match global, we need to map
-                    # For simplicity, assume they match
-                    pred_probs += gate_probs[:, c][:, None] * one_hot
-            preds = np.argmax(pred_probs, axis=1)
-        else:
-            # For regression: weighted average of predictions
-            preds = np.zeros(n_val)
-            for c, model in expert_models.items():
-                X_val = np.concatenate([
-                    fold_val[feature_cols_text].to_numpy(),
-                    fold_val_audio[audio_feature_cols].to_numpy()
-                ], axis=1)
-                preds += gate_probs[:, c] * model.predict(X_val)
-        
-        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
-        all_preds.extend(preds)
-        all_true.extend(y_val)
-    
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
-    
-    fold_df = pd.DataFrame(fold_metrics)
-    fold_df.to_csv(out_dir / "mixture_of_experts_fold_metrics.csv", index=False)
-    
-    return aggregate_metrics, all_preds, all_true
-
-
-# 4) MLP Early Fusion
-def mlp_early_fusion_cv(train_features, val_features, audio_df,
-                        feature_cols_text, audio_feature_cols, args, out_dir):
-    """
-    Use a Multi-Layer Perceptron (MLP) as the meta-model for early fusion
-    on concatenated text+audio features.
-    """
-    from sklearn.neural_network import MLPClassifier, MLPRegressor
-    
-    all_data = pd.concat([train_features, val_features], ignore_index=True)
-    all_with_audio = merge_audio_features(all_data, audio_df, how='left')
-    
-    # Concatenate features
-    X_all = np.concatenate([
-        all_data[feature_cols_text].to_numpy(),
-        all_with_audio[audio_feature_cols].to_numpy()
-    ], axis=1)
-    y_all = all_data['y_true'].values
-    
-    speakers = all_data.groupby("speaker_id")["y_true"].first().reset_index()
-    speakers.columns = ["speaker_id", "label"]
-    if args.task == "classification":
-        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers, speakers["label"]))
-    else:
-        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = list(cv.split(speakers))
-    
-    all_preds = []
-    all_true = []
-    fold_metrics = []
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
-        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
-        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
-        
-        train_mask = all_data["speaker_id"].isin(train_speakers)
-        val_mask = all_data["speaker_id"].isin(val_speakers)
-        
-        X_train = X_all[train_mask]
-        y_train = y_all[train_mask]
-        X_val = X_all[val_mask]
-        y_val = y_all[val_mask]
-        
-        # Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_val_scaled = scaler.transform(X_val)
-        
-        if args.task == "classification":
-            # Use MLPClassifier with 2 hidden layers
-            mlp = MLPClassifier(
-                hidden_layer_sizes=(64, 32),
-                activation='relu',
-                max_iter=500,
-                random_state=args.seed,
-                early_stopping=True,
-                validation_fraction=0.1
-            )
-        else:
-            mlp = MLPRegressor(
-                hidden_layer_sizes=(64, 32),
-                activation='relu',
-                max_iter=500,
-                random_state=args.seed,
-                early_stopping=True,
-                validation_fraction=0.1
-            )
-        mlp.fit(X_train_scaled, y_train)
-        preds = mlp.predict(X_val_scaled)
-        
-        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
-        all_preds.extend(preds)
-        all_true.extend(y_val)
-    
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
-    
-    fold_df = pd.DataFrame(fold_metrics)
-    fold_df.to_csv(out_dir / "mlp_early_fusion_fold_metrics.csv", index=False)
-    
-    return aggregate_metrics, all_preds, all_true
-
-
-# =======================================================================
-#  UPDATED: run_fusion_experiments – now with novel methods
-# =======================================================================
-def run_fusion_experiments(
-    train_features, val_features, test_features,
-    feature_cols_text, audio_df, args, out_dir: Path
-):
-    fusion_out = out_dir / "fusion_results"
-    fusion_out.mkdir(parents=True, exist_ok=True)
-
-    audio_feature_cols = get_audio_feature_cols(audio_df)
-    print(f"\n{'='*60}")
-    print(f"Running FUSION EXPERIMENTS with {len(feature_cols_text)} text features and {len(audio_feature_cols)} audio features.")
-    print(f"Results will be saved to: {fusion_out}")
-    print(f"{'='*60}")
-
-    # Merge audio features
-    train_with_audio = merge_audio_features(train_features, audio_df, how='left')
-    val_with_audio = merge_audio_features(val_features, audio_df, how='left')
-    if test_features is not None and not test_features.empty:
-        test_with_audio = merge_audio_features(test_features, audio_df, how='left')
-    else:
-        test_with_audio = None
-
-    results = {}
-
-    # Helper to train a meta-model and return metrics + paths
-    def train_and_save_meta_model(train_df, val_df, test_df, feat_cols, subdir_name, model_suffix=""):
-        subdir = fusion_out / subdir_name
-        subdir.mkdir(parents=True, exist_ok=True)
-        result = train_meta_model_on_features(
-            train_df, val_df, test_df, feat_cols, args, subdir, model_suffix
-        )
-        with open(subdir / "fusion_metrics.json", "w") as f:
-            json.dump(result, f, indent=2)
-        return result, subdir
-
-    # ----- Standard baselines (always run) -----
-    # 1. TEXT ONLY
-    print("\n" + "="*60)
-    print("BASELINE: TEXT ONLY")
-    print("="*60)
-    text_result, text_dir = train_and_save_meta_model(
-        train_features, val_features, test_features,
-        feature_cols_text, "text_only"
-    )
-    results['text_only'] = text_result
-
-    # 2. AUDIO ONLY
-    print("\n" + "="*60)
-    print("BASELINE: AUDIO ONLY")
-    print("="*60)
-    audio_result, audio_dir = train_and_save_meta_model(
-        train_with_audio, val_with_audio, test_with_audio,
-        audio_feature_cols, "audio_only"
-    )
-    results['audio_only'] = audio_result
-
-    # 3. EARLY FUSION (concat)
-    print("\n" + "="*60)
-    print("EARLY FUSION (concat text + audio)")
-    print("="*60)
-    early_feature_cols = feature_cols_text + audio_feature_cols
-    early_result, early_dir = train_and_save_meta_model(
-        train_with_audio, val_with_audio, test_with_audio,
-        early_feature_cols, "early_fusion"
-    )
-    results['early_fusion'] = early_result
-
-    # 4. LATE FUSION (standard averaging)
-    print("\n" + "="*60)
-    print("LATE FUSION (average predictions)")
-    print("="*60)
-    if args.test_frac == 0:
-        metrics, preds, y_true = run_late_fusion_cv(
-            train_features, val_features, audio_df, feature_cols_text,
-            audio_feature_cols, args, fusion_out / "late_fusion"
-        )
-        late_out = fusion_out / "late_fusion"
-        late_out.mkdir(parents=True, exist_ok=True)
-        with open(late_out / "fusion_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        all_data = pd.concat([train_features, val_features], ignore_index=True)
-        pred_df = all_data[["speaker_id", "y_true"]].copy()
-        pred_df["y_pred"] = preds
-        pred_df.to_csv(late_out / "predictions.csv", index=False)
-        results['late_fusion'] = metrics
-    else:
-        # Held-out test version (simplified here)
-        # For brevity, we implement only CV mode in this rewrite; but you can adapt.
-        # Since test_frac is usually 0 for CV, we assume CV mode.
-        print("WARNING: late_fusion with test_frac>0 not fully implemented in this novel version; skipping.")
-        results['late_fusion'] = None
-
-    # 5. MODEL-BASED FUSION (standard stacking)
-    print("\n" + "="*60)
-    print("MODEL-BASED FUSION (standard stacking)")
-    print("="*60)
-    if args.test_frac == 0:
-        metrics, preds, y_true = run_model_based_fusion_cv(
-            train_features, val_features, audio_df, feature_cols_text,
-            audio_feature_cols, args, fusion_out / "model_based_fusion"
-        )
-        mbf_out = fusion_out / "model_based_fusion"
-        mbf_out.mkdir(parents=True, exist_ok=True)
-        with open(mbf_out / "fusion_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        all_data = pd.concat([train_features, val_features], ignore_index=True)
-        pred_df = all_data[["speaker_id", "y_true"]].copy()
-        pred_df["y_pred"] = preds
-        pred_df.to_csv(mbf_out / "predictions.csv", index=False)
-        results['model_based_fusion'] = metrics
-    else:
-        print("WARNING: model_based_fusion with test_frac>0 not fully implemented; skipping.")
-        results['model_based_fusion'] = None
-
-    # ----- NOVEL METHODS (based on --fusion-novel) -----
-    novel_method = getattr(args, 'fusion_novel', 'none')
-    if novel_method == 'confidence':
-        print("\n" + "="*60)
-        print("NOVEL: CONFIDENCE-WEIGHTED LATE FUSION")
-        print("="*60)
-        metrics, preds, y_true = confidence_weighted_late_fusion_cv(
-            train_features, val_features, audio_df, feature_cols_text,
-            audio_feature_cols, args, fusion_out / "confidence_weighted_fusion"
-        )
-        out_sub = fusion_out / "confidence_weighted_fusion"
-        out_sub.mkdir(parents=True, exist_ok=True)
-        with open(out_sub / "fusion_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        all_data = pd.concat([train_features, val_features], ignore_index=True)
-        pred_df = all_data[["speaker_id", "y_true"]].copy()
-        pred_df["y_pred"] = preds
-        pred_df.to_csv(out_sub / "predictions.csv", index=False)
-        results['confidence_weighted'] = metrics
-
-    elif novel_method == 'interaction':
-        print("\n" + "="*60)
-        print("NOVEL: STACKING WITH INTERACTION FEATURES")
-        print("="*60)
-        metrics, preds, y_true = stacking_with_interactions_cv(
-            train_features, val_features, audio_df, feature_cols_text,
-            audio_feature_cols, args, fusion_out / "interaction_stacking"
-        )
-        out_sub = fusion_out / "interaction_stacking"
-        out_sub.mkdir(parents=True, exist_ok=True)
-        with open(out_sub / "fusion_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        all_data = pd.concat([train_features, val_features], ignore_index=True)
-        pred_df = all_data[["speaker_id", "y_true"]].copy()
-        pred_df["y_pred"] = preds
-        pred_df.to_csv(out_sub / "predictions.csv", index=False)
-        results['interaction_stacking'] = metrics
-
-    elif novel_method == 'moe':
-        print("\n" + "="*60)
-        print("NOVEL: MIXTURE OF EXPERTS")
-        print("="*60)
-        metrics, preds, y_true = mixture_of_experts_cv(
-            train_features, val_features, audio_df, feature_cols_text,
-            audio_feature_cols, args, fusion_out / "mixture_of_experts"
-        )
-        out_sub = fusion_out / "mixture_of_experts"
-        out_sub.mkdir(parents=True, exist_ok=True)
-        with open(out_sub / "fusion_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        all_data = pd.concat([train_features, val_features], ignore_index=True)
-        pred_df = all_data[["speaker_id", "y_true"]].copy()
-        pred_df["y_pred"] = preds
-        pred_df.to_csv(out_sub / "predictions.csv", index=False)
-        results['mixture_of_experts'] = metrics
-
-    elif novel_method == 'mlp':
-        print("\n" + "="*60)
-        print("NOVEL: MLP EARLY FUSION")
-        print("="*60)
-        metrics, preds, y_true = mlp_early_fusion_cv(
-            train_features, val_features, audio_df, feature_cols_text,
-            audio_feature_cols, args, fusion_out / "mlp_early_fusion"
-        )
-        out_sub = fusion_out / "mlp_early_fusion"
-        out_sub.mkdir(parents=True, exist_ok=True)
-        with open(out_sub / "fusion_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        all_data = pd.concat([train_features, val_features], ignore_index=True)
-        pred_df = all_data[["speaker_id", "y_true"]].copy()
-        pred_df["y_pred"] = preds
-        pred_df.to_csv(out_sub / "predictions.csv", index=False)
-        results['mlp_early_fusion'] = metrics
-
-    elif novel_method == 'all':
-        # Run all novel methods sequentially
-        methods = [
-            ('confidence', confidence_weighted_late_fusion_cv, 'confidence_weighted'),
-            ('interaction', stacking_with_interactions_cv, 'interaction_stacking'),
-            ('moe', mixture_of_experts_cv, 'mixture_of_experts'),
-            ('mlp', mlp_early_fusion_cv, 'mlp_early_fusion')
-        ]
-        for name, func, tag in methods:
-            print("\n" + "="*60)
-            print(f"NOVEL: {name.upper()}")
-            print("="*60)
-            try:
-                metrics, preds, y_true = func(
-                    train_features, val_features, audio_df, feature_cols_text,
-                    audio_feature_cols, args, fusion_out / tag
-                )
-                out_sub = fusion_out / tag
-                out_sub.mkdir(parents=True, exist_ok=True)
-                with open(out_sub / "fusion_metrics.json", "w") as f:
-                    json.dump(metrics, f, indent=2)
-                all_data = pd.concat([train_features, val_features], ignore_index=True)
-                pred_df = all_data[["speaker_id", "y_true"]].copy()
-                pred_df["y_pred"] = preds
-                pred_df.to_csv(out_sub / "predictions.csv", index=False)
-                results[tag] = metrics
-            except Exception as e:
-                print(f"Error in {name} fusion: {e}")
-                results[tag] = None
-
-    # ----- Summary -----
-    print("\n" + "="*60)
-    print("FUSION EXPERIMENTS SUMMARY")
-    print("="*60)
-    summary_rows = []
-    for name, result in results.items():
-        if result is None:
-            continue
-        if args.task == "classification":
-            if "macro_f1" in result:
-                score = result["macro_f1"]
-            elif "test_metrics" in result and isinstance(result["test_metrics"], dict):
-                score = result["test_metrics"].get("macro_f1", 0.0)
-            else:
-                score = 0.0
-        else:
-            if "rmse" in result:
-                score = -result["rmse"]
-            elif "test_metrics" in result and isinstance(result["test_metrics"], dict):
-                score = -result["test_metrics"].get("rmse", float('inf'))
-            else:
-                score = -float('inf')
-        summary_rows.append({
-            "fusion_method": name,
-            "primary_score": score,
-            "details": result
-        })
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(fusion_out / "fusion_summary.csv", index=False)
-    print(summary_df.to_string(index=False))
-
-    return results
-
-
-# ----------------------------------------------------------------------
-#  Meta-model training functions (unchanged)
-# ----------------------------------------------------------------------
 def train_meta_model_with_cv_selection(
     train_features, val_features, test_features, feature_cols, args, out_dir: Path
 ):
     """Train meta-model with CV-based K selection, then evaluate on test set."""
     
-    # Check if CV results already exist
     cv_results_file = out_dir / "cv_k_selection_results.csv"
     selected_questions_file = out_dir / "selected_questions.csv"
     meta_model_file = out_dir / "meta_model.joblib"
@@ -2774,31 +1531,25 @@ def train_meta_model_with_cv_selection(
         print("Loading existing CV k-selection results...")
         print(f"{'='*60}")
         
-        # Load existing results
         cv_results = pd.read_csv(cv_results_file)
         selected_questions_df = pd.read_csv(selected_questions_file)
         selected_qs_final = selected_questions_df["question_id"].tolist()
         
-        # Load the best_k value
         best_k_row = cv_results[cv_results["is_best"] == True]
         if not best_k_row.empty:
             best_k = int(best_k_row.iloc[0]["k"])
             best_mean_score = best_k_row.iloc[0]["mean_cv_score"]
         else:
-            # If no best marked, take the one with highest mean score
             best_k = int(cv_results.loc[cv_results["mean_cv_score"].idxmax(), "k"])
             best_mean_score = cv_results["mean_cv_score"].max()
         
         print(f"Loaded best K: {best_k} (CV mean score: {best_mean_score:.4f})")
         print(f"Loaded {len(selected_qs_final)} selected questions")
         
-        # Build selected feature columns
         selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
         
-        # Check if we need to retrain the final model
         if not meta_model_file.exists() or args.force_hpo:
             print("Retraining final model...")
-            # Combine train and val
             trainval_features = pd.concat([train_features, val_features], ignore_index=True)
             
             final_model = make_meta_model(args)
@@ -2811,7 +1562,6 @@ def train_meta_model_with_cv_selection(
             print("Loading existing final model...")
             final_model = joblib.load(meta_model_file)
         
-        # Evaluate on held-out test set
         test_metrics = score_meta_model(
             final_model,
             test_features[selected_cols_final].to_numpy(),
@@ -2822,7 +1572,6 @@ def train_meta_model_with_cv_selection(
         print("\nFinal test metrics (loaded from existing model):")
         print(json.dumps(test_metrics, indent=2))
         
-        # Save predictions if they don't exist
         predictions_file = out_dir / "meta_test_predictions.csv"
         if not predictions_file.exists():
             preds = final_model.predict(test_features[selected_cols_final].to_numpy())
@@ -2848,15 +1597,12 @@ def train_meta_model_with_cv_selection(
             "loaded_from_cache": True
         }
     
-    # If results don't exist, run the full CV selection
     print(f"\n{'='*60}")
     print("No existing CV results found. Running CV k-selection...")
     print(f"{'='*60}")
     
-    # Combine train and val for CV-based selection
     trainval_features = pd.concat([train_features, val_features], ignore_index=True)
     
-    # Create CV splits based on speakers
     speakers = trainval_features.groupby("speaker_id")["y_true"].first().reset_index()
     speakers.columns = ["speaker_id", "label"]
     
@@ -2867,7 +1613,6 @@ def train_meta_model_with_cv_selection(
         cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
         fold_splits = list(cv.split(speakers))
     
-    # Calculate question importance using all training+validation data
     print("\nCalculating question importance on full training+validation data...")
     base_model = make_meta_model(args)
     base_model.fit(trainval_features[feature_cols].to_numpy(), trainval_features["y_true"].to_numpy())
@@ -2880,7 +1625,7 @@ def train_meta_model_with_cv_selection(
         importance_df = permutation_question_importance_shap_hybrid(
             base_model, trainval_features, trainval_features, feature_cols, args
         )
-    else:  # permutation
+    else:
         importance_df = permutation_question_importance(
             base_model, trainval_features, feature_cols, args
         )
@@ -2888,14 +1633,12 @@ def train_meta_model_with_cv_selection(
     importance_df.to_csv(out_dir / "question_embedding_importance.csv", index=False)
     questions_ranked = importance_df["question_id"].tolist()
 
-    # ===== NEW: Save per-question validation scores =====
     per_question_scores = save_per_question_validation_scores(
         train_features, val_features, feature_cols, 
         questions_ranked, args, out_dir, 
         prefix="initial"
     )
     
-    # Cross-validation to find best K
     print(f"\n{'='*60}")
     print(f"Cross-validating to find best K (using {args.n_cv_folds} folds)")
     print(f"{'='*60}")
@@ -2904,7 +1647,6 @@ def train_meta_model_with_cv_selection(
     if args.top_k and 0 < args.top_k < len(questions_ranked):
         ks = sorted(set(ks + [args.top_k]))
     
-    # Store CV results for each K
     cv_results_by_k = {k: [] for k in ks}
     
     for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
@@ -2924,11 +1666,9 @@ def train_meta_model_with_cv_selection(
                 cv_results_by_k[k].append(float('-inf'))
                 continue
             
-            # Train on fold training data
             model = make_meta_model(args)
             model.fit(fold_train[selected_cols].to_numpy(), fold_train["y_true"].to_numpy())
             
-            # Evaluate on fold validation data
             metrics = score_meta_model(
                 model,
                 fold_val[selected_cols].to_numpy(),
@@ -2940,7 +1680,6 @@ def train_meta_model_with_cv_selection(
             cv_results_by_k[k].append(score)
             print(f"  K={k}: score={score:.4f}")
     
-    # Find best K based on mean CV score
     best_k = None
     best_mean_score = -float('inf')
     k_scores = {}
@@ -2965,7 +1704,6 @@ def train_meta_model_with_cv_selection(
     print(f"BEST K SELECTED: {best_k} (CV mean score: {best_mean_score:.4f})")
     print(f"{'='*60}")
     
-    # Save CV results
     cv_summary = []
     for k, info in k_scores.items():
         cv_summary.append({
@@ -2976,7 +1714,6 @@ def train_meta_model_with_cv_selection(
         })
     pd.DataFrame(cv_summary).to_csv(out_dir / "cv_k_selection_results.csv", index=False)
     
-    # Now train final model on ALL training+validation data with best_k
     selected_qs_final = questions_ranked[:best_k]
     selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
     
@@ -2990,7 +1727,6 @@ def train_meta_model_with_cv_selection(
         trainval_features["y_true"].to_numpy()
     )
     
-    # Evaluate on held-out test set
     test_metrics = score_meta_model(
         final_model,
         test_features[selected_cols_final].to_numpy(),
@@ -3001,7 +1737,6 @@ def train_meta_model_with_cv_selection(
     print("\nFinal test metrics:")
     print(json.dumps(test_metrics, indent=2))
     
-    # Save results
     out_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(final_model, out_dir / "meta_model.joblib")
     pd.DataFrame({"question_id": selected_qs_final}).to_csv(out_dir / "selected_questions.csv", index=False)
@@ -3009,7 +1744,6 @@ def train_meta_model_with_cv_selection(
     with open(out_dir / "meta_test_metrics.json", "w") as f:
         json.dump(test_metrics, f, indent=2)
     
-    # Save predictions
     preds = final_model.predict(test_features[selected_cols_final].to_numpy())
     out_df = test_features[["speaker_id", "y_true"]].copy()
     out_df["y_pred"] = preds
@@ -3026,7 +1760,6 @@ def train_meta_model_with_cv_selection(
     
     out_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
     
-    # Save ensemble info if used
     if getattr(args, 'use_ensemble', False):
         ensemble_info = {
             "use_ensemble": True,
@@ -3053,10 +1786,8 @@ def train_meta_model_cv(
 ):
     """Train meta-model with cross-validation only (test_percentage=0)."""
     
-    # Combine train and val for CV
     all_trainval = pd.concat([train_features, val_features], ignore_index=True)
     
-    # Create CV splits based on speakers
     speakers = all_trainval.groupby("speaker_id")["y_true"].first().reset_index()
     speakers.columns = ["speaker_id", "label"]
     
@@ -3070,9 +1801,6 @@ def train_meta_model_cv(
     fold_results = []
     all_fold_predictions = []
     fold_importance_dfs = []
-    best_k_per_fold = []
-
-    # After getting questions_ranked for each fold, accumulate scores
     all_per_question_scores = []
     
     for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
@@ -3088,11 +1816,9 @@ def train_meta_model_cv(
         
         print(f"Train size: {len(fold_train)}, Val size: {len(fold_val)}")
         
-        # Train base model for importance calculation
         base_model = make_meta_model(args)
         base_model.fit(fold_train[feature_cols].to_numpy(), fold_train["y_true"].to_numpy())
 
-        # Calculate question importance for this fold
         if args.importance == "shap":
             importance_df = shap_question_importance(
                 base_model, fold_train, fold_val, feature_cols, args
@@ -3108,12 +1834,10 @@ def train_meta_model_cv(
         importance_df["fold"] = fold_idx
         fold_importance_dfs.append(importance_df)
         
-        # Get ranked questions for this fold
         questions_ranked = importance_df["question_id"].tolist()
         if not questions_ranked:
             questions_ranked = [c.split("__", 1)[0] for c in feature_cols]
 
-        # ===== NEW: Calculate per-question scores for this fold =====
         fold_scores = save_per_question_validation_scores(
             fold_train, fold_val, feature_cols, 
             questions_ranked, args, out_dir, 
@@ -3128,7 +1852,6 @@ def train_meta_model_cv(
         if args.top_k and 0 < args.top_k < max_k:
             ks = sorted(set(ks + [args.top_k]))
         
-        # Find best k for this fold
         best_val_score = -float("inf")
         best_k = 1
         fold_val_metrics = {}
@@ -3155,10 +1878,8 @@ def train_meta_model_cv(
                 best_val_score = score
                 best_k = k
         
-        best_k_per_fold.append({"fold": fold_idx, "best_k": best_k, "best_score": best_val_score})
         print(f"Best k for fold {fold_idx}: {best_k} (score: {best_val_score:.4f})")
         
-        # Train final model for this fold with best k
         selected_qs_final = questions_ranked[:best_k]
         selected_cols_final = [c for c in feature_cols if c.split("__", 1)[0] in set(selected_qs_final)]
         
@@ -3168,7 +1889,6 @@ def train_meta_model_cv(
             fold_train["y_true"].to_numpy()
         )
         
-        # Evaluate on validation set
         val_metrics = score_meta_model(
             final_model,
             fold_val[selected_cols_final].to_numpy(),
@@ -3176,7 +1896,6 @@ def train_meta_model_cv(
             args.task
         )
         
-        # Store predictions
         val_preds = final_model.predict(fold_val[selected_cols_final].to_numpy())
         fold_predictions = fold_val[["speaker_id", "y_true"]].copy()
         fold_predictions["y_pred"] = val_preds
@@ -3201,7 +1920,6 @@ def train_meta_model_cv(
             "n_selected_features": len(selected_cols_final)
         })
         
-        # Save individual fold model
         fold_model_dir = out_dir / f"fold_{fold_idx}"
         fold_model_dir.mkdir(parents=True, exist_ok=True)
         joblib.dump(final_model, fold_model_dir / "meta_model.joblib")
@@ -3209,11 +1927,9 @@ def train_meta_model_cv(
             fold_model_dir / "selected_questions.csv", index=False
         )
     
-    # ===== NEW: Aggregate per-question scores across folds =====
     if all_per_question_scores:
         combined_scores = pd.concat(all_per_question_scores, ignore_index=True)
         
-        # Calculate mean and std across folds
         agg_scores = combined_scores.groupby('question_id').agg({
             'validation_score': ['mean', 'std', 'count'],
             'rank': 'mean',
@@ -3229,27 +1945,23 @@ def train_meta_model_cv(
         print("\nTop 10 questions by mean validation score:")
         print(agg_scores.head(10)[['mean_score', 'std_score', 'n_folds']].to_string())
 
-    # Aggregate results across folds
     print("\n" + "="*60)
     print("AGGREGATED RESULTS ACROSS FOLDS")
     print("="*60)
     
-    # Combine all predictions
     all_predictions = pd.concat(all_fold_predictions, ignore_index=True)
     all_predictions.to_csv(out_dir / "cv_all_predictions.csv", index=False)
     
-    # Calculate aggregate metrics using the stored predictions
     aggregate_metrics = score_meta_model(
-        None,  # No model needed
-        all_predictions["y_pred"].values,  # Pass predictions as x
-        all_predictions["y_true"].values,  # Pass true labels as y
+        None,
+        all_predictions["y_pred"].values,
+        all_predictions["y_true"].values,
         args.task
     )
     
     print("\nAggregate metrics across all folds:")
     print(json.dumps(aggregate_metrics, indent=2))
     
-    # Per-fold statistics
     fold_summaries = []
     for res in fold_results:
         score = primary_score(res["val_metrics"], args.task)
@@ -3268,10 +1980,8 @@ def train_meta_model_cv(
     print(f"\nMean best_k: {fold_summary_df['best_k'].mean():.1f}")
     print(f"Mean primary score: {fold_summary_df['primary_score'].mean():.4f} (+/- {fold_summary_df['primary_score'].std():.4f})")
     
-    # Aggregate question importance across folds
     all_importance = pd.concat(fold_importance_dfs, ignore_index=True)
     
-    # Calculate mean importance per question across folds
     question_importance_agg = all_importance.groupby("question_id").agg({
         "importance": ["mean", "std", "count"],
         "importance_std": "mean"
@@ -3283,22 +1993,18 @@ def train_meta_model_cv(
     print("\nTop 10 most important questions across folds:")
     print(question_importance_agg.head(10))
     
-    # Determine final top K based on average best_k across folds
     avg_best_k = int(np.round(fold_summary_df['best_k'].mean()))
     print(f"\nAverage best K across folds: {avg_best_k}")
     
-    # Get top K questions based on mean importance
     top_questions = question_importance_agg.head(avg_best_k).index.tolist()
     top_features = [c for c in feature_cols if c.split("__", 1)[0] in top_questions]
     
     print(f"Selected {len(top_questions)} top questions: {top_questions}")
     
-    # ===== NEW: Save selected_questions.csv for consistency with test_frac>0 mode =====
     selected_questions_df = pd.DataFrame({"question_id": top_questions})
     selected_questions_df.to_csv(out_dir / "selected_questions.csv", index=False)
     print(f"\n✓ Saved selected_questions.csv with {len(top_questions)} questions")
     
-    # ===== NEW: Save cv_k_selection_results.csv for consistency =====
     cv_k_results = []
     for fold_idx in range(args.n_cv_folds):
         fold_best_k = fold_summary_df[fold_summary_df['fold'] == fold_idx]['best_k'].values
@@ -3307,25 +2013,23 @@ def train_meta_model_cv(
             cv_k_results.append({
                 "k": int(fold_best_k[0]),
                 "mean_cv_score": fold_score,
-                "std_cv_score": 0.0,  # Single fold, no std
+                "std_cv_score": 0.0,
                 "is_best": fold_best_k[0] == avg_best_k,
                 "fold": fold_idx
             })
     
-    # Add the average as a summary row
     cv_k_results.append({
         "k": avg_best_k,
         "mean_cv_score": fold_summary_df['primary_score'].mean(),
         "std_cv_score": fold_summary_df['primary_score'].std(),
         "is_best": True,
-        "fold": -1  # -1 indicates this is the aggregate row
+        "fold": -1
     })
     
     cv_k_results_df = pd.DataFrame(cv_k_results)
     cv_k_results_df.to_csv(out_dir / "cv_k_selection_results.csv", index=False)
     print(f"✓ Saved cv_k_selection_results.csv with {len(cv_k_results)} entries")
     
-    # ===== NEW: Save meta_test_metrics.json (CV metrics instead of test metrics) =====
     cv_metrics_for_json = {
         "cv_aggregate_metrics": aggregate_metrics,
         "mean_cv_score": float(fold_summary_df['primary_score'].mean()),
@@ -3338,7 +2042,6 @@ def train_meta_model_cv(
         "total_samples": len(all_trainval)
     }
     
-    # Add classification or regression specific metrics
     if args.task == "classification":
         cv_metrics_for_json["macro_f1"] = aggregate_metrics.get("macro_f1", 0.0)
         cv_metrics_for_json["weighted_f1"] = aggregate_metrics.get("weighted_f1", 0.0)
@@ -3352,7 +2055,6 @@ def train_meta_model_cv(
         json.dump(cv_metrics_for_json, f, indent=2)
     print(f"✓ Saved meta_test_metrics.json with CV aggregate metrics")
     
-    # Train final ensemble model on all data using top K questions
     print("\n" + "="*60)
     print("TRAINING FINAL MODEL ON ALL DATA WITH TOP K QUESTIONS")
     print("="*60)
@@ -3363,7 +2065,6 @@ def train_meta_model_cv(
         all_trainval["y_true"].to_numpy()
     )
     
-    # Save final model
     joblib.dump(final_model, out_dir / "final_cv_model.joblib")
     pd.DataFrame({"question_id": top_questions}).to_csv(
         out_dir / "final_selected_questions.csv", index=False
@@ -3372,7 +2073,6 @@ def train_meta_model_cv(
         out_dir / "final_selected_features.csv", index=False
     )
     
-    # Save aggregate results
     cv_results = {
         "cv_folds": args.n_cv_folds,
         "aggregate_metrics": aggregate_metrics,
@@ -3386,7 +2086,6 @@ def train_meta_model_cv(
     with open(out_dir / "cv_results.json", "w") as f:
         json.dump(cv_results, f, indent=2)
     
-    # Create summary report
     with open(out_dir / "cv_summary_report.txt", "w") as f:
         f.write("="*60 + "\n")
         f.write("CROSS-VALIDATION SUMMARY REPORT\n")
@@ -3437,7 +2136,6 @@ def train_meta_model_cv(
     print(f"  - cv_summary_report.txt: Detailed summary report")
     print(f"  - aggregated_question_importance.csv: Question importance across folds")
     
-    # Print ensemble info if used
     if args.use_ensemble:
         print("\n" + "=" * 50)
         print("ENSEMBLE SUMMARY")
@@ -3458,9 +2156,1930 @@ def train_meta_model_cv(
     }
 
 
-# ----------------------------------------------------------------------
-#  Parser Setup
-# ----------------------------------------------------------------------
+# =======================================================================
+#  ALL FUSION METHODS - COMPLETE IMPLEMENTATIONS
+# =======================================================================
+
+def run_text_only_baseline(train_features, val_features, test_features,
+                           feature_cols_text, args, out_dir: Path,
+                           text_meta_model=None, text_selected_features=None):
+    """TEXT ONLY baseline - reuses existing text model if available."""
+    text_dir = out_dir / "text_only"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    
+    if text_meta_model is not None and text_selected_features is not None:
+        print("  ✓ Using existing text model from main pipeline")
+        joblib.dump(text_meta_model, text_dir / "meta_model.joblib")
+        pd.DataFrame({"feature": text_selected_features}).to_csv(
+            text_dir / "selected_embedding_features.csv", index=False
+        )
+        
+        if test_features is not None and not test_features.empty:
+            X_test = test_features[text_selected_features].to_numpy()
+            y_test = test_features["y_true"].to_numpy()
+            test_metrics = score_meta_model(text_meta_model, X_test, y_test, args.task)
+        else:
+            test_metrics = {"macro_f1": 0.0, "note": "CV mode - use main pipeline results"}
+        
+        result = {
+            "test_metrics": test_metrics,
+            "used_existing_model": True,
+            "n_selected_features": len(text_selected_features)
+        }
+        
+        with open(text_dir / "fusion_metrics.json", "w") as f:
+            json.dump(result, f, indent=2)
+        
+        return result
+    else:
+        if args.test_frac == 0:
+            result = train_meta_model_cv(
+                train_features, val_features, test_features, 
+                feature_cols_text, args, text_dir
+            )
+        else:
+            result = train_meta_model_with_cv_selection(
+                train_features, val_features, test_features, 
+                feature_cols_text, args, text_dir
+            )
+        
+        with open(text_dir / "fusion_metrics.json", "w") as f:
+            json.dump(result, f, indent=2)
+        
+        return result
+
+
+def run_audio_only_baseline(train_features, val_features, test_features,
+                            audio_feature_cols, args, out_dir: Path):
+    """
+    AUDIO ONLY baseline - trains on audio features only.
+    Returns None if training fails (caller will stop execution).
+    """
+    audio_dir = out_dir / "audio_only"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"  Training audio-only model with {len(audio_feature_cols)} audio features")
+    
+    # Check if audio features are usable
+    if len(audio_feature_cols) == 0:
+        print("  ❌ No audio features available!")
+        return None
+    
+    # Check if training data has enough samples
+    if len(train_features) < 10:
+        print(f"  ❌ Not enough training samples: {len(train_features)} (need at least 10)")
+        return None
+    
+    # Check if there are enough unique speakers
+    unique_speakers = train_features['speaker_id'].nunique()
+    if unique_speakers < args.n_cv_folds:
+        print(f"  ❌ Not enough unique speakers: {unique_speakers} (need at least {args.n_cv_folds} for CV)")
+        return None
+    
+    try:
+        if args.test_frac == 0:
+            result = train_meta_model_cv(
+                train_features, val_features, test_features, 
+                audio_feature_cols, args, audio_dir
+            )
+        else:
+            result = train_meta_model_with_cv_selection(
+                train_features, val_features, test_features, 
+                audio_feature_cols, args, audio_dir
+            )
+        
+        # Check if result is valid
+        if result is None:
+            print("  ❌ Audio-only training produced None result")
+            return None
+        
+        if isinstance(result, dict) and not result:
+            print("  ❌ Audio-only training produced empty result")
+            return None
+        
+        # Check for successful metrics
+        if args.task == "classification":
+            if "macro_f1" not in result and "test_metrics" not in result:
+                print(f"  ❌ Audio-only result missing 'macro_f1' or 'test_metrics'")
+                print(f"     Result keys: {result.keys()}")
+                return None
+        else:
+            if "rmse" not in result and "test_metrics" not in result:
+                print(f"  ❌ Audio-only result missing 'rmse' or 'test_metrics'")
+                print(f"     Result keys: {result.keys()}")
+                return None
+        
+        # Save result
+        with open(audio_dir / "fusion_metrics.json", "w") as f:
+            json.dump(result, f, indent=2)
+        
+        # Extract score for logging
+        if args.task == "classification":
+            if "test_metrics" in result:
+                score = result["test_metrics"].get("macro_f1", 0.0)
+            else:
+                score = result.get("macro_f1", 0.0)
+        else:
+            if "test_metrics" in result:
+                score = result["test_metrics"].get("rmse", float('inf'))
+            else:
+                score = result.get("rmse", float('inf'))
+        
+        print(f"  ✅ Audio-only completed with {len(audio_feature_cols)} features, score: {score:.4f}")
+        return result
+        
+    except Exception as e:
+        print(f"  ❌ Audio-only training failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def run_early_fusion(train_features, val_features, test_features,
+                     feature_cols_text, audio_feature_cols, args, out_dir: Path):
+    """EARLY FUSION - concatenates text and audio features."""
+    early_dir = out_dir / "early_fusion"
+    early_dir.mkdir(parents=True, exist_ok=True)
+    
+    early_feature_cols = feature_cols_text + audio_feature_cols
+    print(f"  Early fusion features: {len(early_feature_cols)} total")
+    print(f"    Text: {len(feature_cols_text)}, Audio: {len(audio_feature_cols)}")
+    
+    if args.test_frac == 0:
+        result = train_meta_model_cv(
+            train_features, val_features, test_features, 
+            early_feature_cols, args, early_dir
+        )
+    else:
+        result = train_meta_model_with_cv_selection(
+            train_features, val_features, test_features, 
+            early_feature_cols, args, early_dir
+        )
+    
+    with open(early_dir / "fusion_metrics.json", "w") as f:
+        json.dump(result, f, indent=2)
+    
+    return result
+
+# =======================================================================
+#  FIXED: LATE FUSION - Properly uses audio features
+# =======================================================================
+
+def run_late_fusion(train_features, val_features, test_features,
+                    train_with_audio, val_with_audio, test_with_audio,
+                    feature_cols_text, audio_feature_cols, args, out_dir: Path,
+                    text_meta_model=None, text_selected_features=None):
+    """
+    LATE FUSION - averages predictions from separate text and audio models.
+    Uses audio features properly.
+    """
+    late_dir = out_dir / "late_fusion"
+    late_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.test_frac == 0:
+        # CV-based late fusion - PASS audio features
+        metrics, preds, y_true = run_late_fusion_cv(
+            train_features, val_features,
+            train_with_audio, val_with_audio,
+            feature_cols_text, audio_feature_cols, args, late_dir
+        )
+        with open(late_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        return metrics
+    else:
+        # Held-out test mode
+        # Text model (NO audio)
+        if text_meta_model is not None and text_selected_features is not None:
+            print("  Using existing text model for late fusion...")
+            text_model = text_meta_model
+            text_selected = text_selected_features
+        else:
+            print("  Training text model for late fusion...")
+            text_result = train_meta_model_with_cv_selection(
+                train_features, val_features, test_features,
+                feature_cols_text, args, late_dir / "text_model"
+            )
+            text_model = joblib.load(late_dir / "text_model" / "meta_model.joblib")
+            text_selected = pd.read_csv(late_dir / "text_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Audio model (ONLY audio) - USING train_with_audio, val_with_audio, test_with_audio
+        print("  Training audio model for late fusion...")
+        audio_result = train_meta_model_with_cv_selection(
+            train_with_audio, val_with_audio, test_with_audio,
+            audio_feature_cols, args, late_dir / "audio_model"
+        )
+        audio_model = joblib.load(late_dir / "audio_model" / "meta_model.joblib")
+        audio_selected = pd.read_csv(late_dir / "audio_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Get predictions on test set
+        X_text_test = test_features[text_selected].to_numpy()
+        X_audio_test = test_with_audio[audio_selected].to_numpy()  # Audio features
+        y_true = test_features["y_true"].to_numpy()
+        
+        if args.task == "classification":
+            if hasattr(text_model, "predict_proba") and hasattr(audio_model, "predict_proba"):
+                prob_text = text_model.predict_proba(X_text_test)
+                prob_audio = audio_model.predict_proba(X_audio_test)
+                prob_avg = (prob_text + prob_audio) / 2.0
+                preds = np.argmax(prob_avg, axis=1)
+            else:
+                pred_text = text_model.predict(X_text_test)
+                pred_audio = audio_model.predict(X_audio_test)
+                preds = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0,
+                                            arr=np.array([pred_text, pred_audio]))
+        else:
+            pred_text = text_model.predict(X_text_test)
+            pred_audio = audio_model.predict(X_audio_test)
+            preds = (pred_text + pred_audio) / 2.0
+        
+        metrics = score_meta_model(None, preds, y_true, args.task)
+        
+        with open(late_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        
+        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = preds
+        pred_df.to_csv(late_dir / "predictions.csv", index=False)
+        
+        return metrics
+
+
+def run_late_fusion_cv(train_features, val_features,
+                       train_with_audio, val_with_audio,
+                       feature_cols_text, audio_feature_cols, args, out_dir):
+    """Late fusion using CV with audio features."""
+    all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+    all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+    
+    speakers = all_text_data.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers, speakers["label"]))
+    else:
+        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers))
+    
+    all_preds = []
+    all_true = []
+    fold_metrics = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
+        
+        # Text data
+        fold_train = all_text_data[all_text_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val = all_text_data[all_text_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Audio data
+        fold_train_audio = all_audio_data[all_audio_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val_audio = all_audio_data[all_audio_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Train text model
+        text_result = train_meta_model_cv(
+            fold_train, fold_val, None, feature_cols_text, args, 
+            out_dir / f"late_text_fold{fold_idx}"
+        )
+        text_model = joblib.load(out_dir / f"late_text_fold{fold_idx}" / "final_cv_model.joblib")
+        text_selected = pd.read_csv(out_dir / f"late_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        
+        # Train audio model - USING audio data
+        audio_result = train_meta_model_cv(
+            fold_train_audio, fold_val_audio, None, audio_feature_cols, args, 
+            out_dir / f"late_audio_fold{fold_idx}"
+        )
+        audio_model = joblib.load(out_dir / f"late_audio_fold{fold_idx}" / "final_cv_model.joblib")
+        audio_selected = pd.read_csv(out_dir / f"late_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        
+        X_text_val = fold_val[text_selected].to_numpy()
+        X_audio_val = fold_val_audio[audio_selected].to_numpy()
+        y_val = fold_val["y_true"].to_numpy()
+        
+        if args.task == "classification":
+            if hasattr(text_model, "predict_proba") and hasattr(audio_model, "predict_proba"):
+                prob_text = text_model.predict_proba(X_text_val)
+                prob_audio = audio_model.predict_proba(X_audio_val)
+                prob_avg = (prob_text + prob_audio) / 2.0
+                preds = np.argmax(prob_avg, axis=1)
+            else:
+                pred_text = text_model.predict(X_text_val)
+                pred_audio = audio_model.predict(X_audio_val)
+                preds = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0,
+                                            arr=np.array([pred_text, pred_audio]))
+        else:
+            pred_text = text_model.predict(X_text_val)
+            pred_audio = audio_model.predict(X_audio_val)
+            preds = (pred_text + pred_audio) / 2.0
+        
+        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
+        all_preds.extend(preds)
+        all_true.extend(y_val)
+    
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
+    
+    fold_df = pd.DataFrame(fold_metrics)
+    fold_df.to_csv(out_dir / "late_fusion_fold_metrics.csv", index=False)
+    
+    pred_df = all_text_data[["speaker_id", "y_true"]].copy()
+    pred_df["y_pred"] = all_preds
+    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+    
+    return aggregate_metrics, all_preds, all_true
+
+
+# =======================================================================
+#  FIXED: MODEL-BASED FUSION - Properly uses audio features
+# =======================================================================
+
+def run_model_based_fusion(train_features, val_features, test_features,
+                           train_with_audio, val_with_audio, test_with_audio,
+                           feature_cols_text, audio_feature_cols, args, out_dir: Path,
+                           text_meta_model=None, text_selected_features=None):
+    """
+    MODEL-BASED FUSION (Stacking) - meta-model on predictions from text and audio models.
+    Uses audio features properly.
+    """
+    mbf_dir = out_dir / "model_based_fusion"
+    mbf_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.test_frac == 0:
+        metrics, preds, y_true = run_model_based_fusion_cv(
+            train_features, val_features,
+            train_with_audio, val_with_audio,
+            feature_cols_text, audio_feature_cols, args, mbf_dir
+        )
+        with open(mbf_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        return metrics
+    else:
+        # Text model
+        if text_meta_model is not None and text_selected_features is not None:
+            print("  Using existing text model for stacking...")
+            text_model = text_meta_model
+            text_selected = text_selected_features
+        else:
+            print("  Training text model for stacking...")
+            text_result = train_meta_model_with_cv_selection(
+                train_features, val_features, test_features,
+                feature_cols_text, args, mbf_dir / "text_model"
+            )
+            text_model = joblib.load(mbf_dir / "text_model" / "meta_model.joblib")
+            text_selected = pd.read_csv(mbf_dir / "text_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Audio model - USING train_with_audio, val_with_audio, test_with_audio
+        print("  Training audio model for stacking...")
+        audio_result = train_meta_model_with_cv_selection(
+            train_with_audio, val_with_audio, test_with_audio,
+            audio_feature_cols, args, mbf_dir / "audio_model"
+        )
+        audio_model = joblib.load(mbf_dir / "audio_model" / "meta_model.joblib")
+        audio_selected = pd.read_csv(mbf_dir / "audio_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Get predictions - text uses text features, audio uses audio features
+        train_text_X = train_features[text_selected].to_numpy()
+        train_audio_X = train_with_audio[audio_selected].to_numpy()
+        val_text_X = val_features[text_selected].to_numpy()
+        val_audio_X = val_with_audio[audio_selected].to_numpy()
+        test_text_X = test_features[text_selected].to_numpy()
+        test_audio_X = test_with_audio[audio_selected].to_numpy()
+        
+        if args.task == "classification":
+            classes = np.unique(train_features["y_true"])
+            n_classes = len(classes)
+            
+            def get_probs(model, X):
+                if hasattr(model, "predict_proba"):
+                    return model.predict_proba(X)
+                else:
+                    preds = model.predict(X)
+                    return np.eye(n_classes)[preds.astype(int)]
+            
+            train_probs_text = get_probs(text_model, train_text_X)
+            train_probs_audio = get_probs(audio_model, train_audio_X)
+            val_probs_text = get_probs(text_model, val_text_X)
+            val_probs_audio = get_probs(audio_model, val_audio_X)
+            test_probs_text = get_probs(text_model, test_text_X)
+            test_probs_audio = get_probs(audio_model, test_audio_X)
+            
+            X_train_meta = np.concatenate([train_probs_text, train_probs_audio], axis=1)
+            X_val_meta = np.concatenate([val_probs_text, val_probs_audio], axis=1)
+            X_test_meta = np.concatenate([test_probs_text, test_probs_audio], axis=1)
+        else:
+            train_preds_text = text_model.predict(train_text_X)
+            train_preds_audio = audio_model.predict(train_audio_X)
+            val_preds_text = text_model.predict(val_text_X)
+            val_preds_audio = audio_model.predict(val_audio_X)
+            test_preds_text = text_model.predict(test_text_X)
+            test_preds_audio = audio_model.predict(test_audio_X)
+            
+            X_train_meta = np.column_stack([train_preds_text, train_preds_audio])
+            X_val_meta = np.column_stack([val_preds_text, val_preds_audio])
+            X_test_meta = np.column_stack([test_preds_text, test_preds_audio])
+        
+        y_train = train_features["y_true"].to_numpy()
+        y_val = val_features["y_true"].to_numpy()
+        y_test = test_features["y_true"].to_numpy()
+        
+        # Train meta-model on train + val
+        X_meta_all = np.concatenate([X_train_meta, X_val_meta], axis=0)
+        y_meta_all = np.concatenate([y_train, y_val], axis=0)
+        
+        if args.task == "classification":
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
+            ])
+        else:
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", Ridge(alpha=1.0))
+            ])
+        
+        meta_model.fit(X_meta_all, y_meta_all)
+        y_pred = meta_model.predict(X_test_meta)
+        metrics = score_meta_model(None, y_pred, y_test, args.task)
+        
+        with open(mbf_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        
+        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = y_pred
+        if args.task == "classification" and hasattr(meta_model, "predict_proba"):
+            probs = meta_model.predict_proba(X_test_meta)
+            classes = meta_model.classes_
+            for i, cls in enumerate(classes):
+                pred_df[f"prob_{cls}"] = probs[:, i]
+        pred_df.to_csv(mbf_dir / "predictions.csv", index=False)
+        
+        return metrics
+
+
+def run_model_based_fusion_cv(train_features, val_features,
+                              train_with_audio, val_with_audio,
+                              feature_cols_text, audio_feature_cols, args, out_dir):
+    """Model-based fusion using CV with audio features."""
+    all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+    all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+    
+    speakers = all_text_data.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv_outer = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        outer_splits = list(cv_outer.split(speakers, speakers["label"]))
+    else:
+        cv_outer = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        outer_splits = list(cv_outer.split(speakers))
+    
+    all_preds = []
+    all_true = []
+    fold_metrics = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(outer_splits):
+        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
+        
+        # Text data
+        outer_train = all_text_data[all_text_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        outer_val = all_text_data[all_text_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Audio data
+        outer_train_audio = all_audio_data[all_audio_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        outer_val_audio = all_audio_data[all_audio_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Inner CV for OOF predictions
+        inner_folds = min(3, len(outer_train) // 10) if len(outer_train) > 10 else 2
+        inner_folds = max(2, inner_folds)
+        n_train = len(outer_train)
+        
+        if args.task == "classification":
+            classes = np.unique(outer_train["y_true"])
+            n_classes = len(classes)
+            oof_text_probs = np.zeros((n_train, n_classes))
+            oof_audio_probs = np.zeros((n_train, n_classes))
+        else:
+            oof_text_preds = np.zeros(n_train)
+            oof_audio_preds = np.zeros(n_train)
+        
+        inner_speakers = outer_train.groupby("speaker_id")["y_true"].first().reset_index()
+        inner_speakers.columns = ["speaker_id", "label"]
+        
+        if args.task == "classification":
+            cv_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
+            inner_splits = list(cv_inner.split(inner_speakers, inner_speakers["label"]))
+        else:
+            cv_inner = KFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
+            inner_splits = list(cv_inner.split(inner_speakers))
+        
+        for inner_train_idx, inner_val_idx in inner_splits:
+            inner_train_speakers = inner_speakers.iloc[inner_train_idx]["speaker_id"].values
+            inner_val_speakers = inner_speakers.iloc[inner_val_idx]["speaker_id"].values
+            
+            inner_train = outer_train[outer_train["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
+            inner_val = outer_train[outer_train["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
+            inner_train_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
+            inner_val_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
+            
+            text_model = make_meta_model(args)
+            audio_model = make_meta_model(args)
+            text_model.fit(inner_train[feature_cols_text].to_numpy(), inner_train["y_true"].to_numpy())
+            audio_model.fit(inner_train_audio[audio_feature_cols].to_numpy(), inner_train_audio["y_true"].to_numpy())
+            
+            if args.task == "classification":
+                text_probs = text_model.predict_proba(inner_val[feature_cols_text].to_numpy())
+                audio_probs = audio_model.predict_proba(inner_val_audio[audio_feature_cols].to_numpy())
+                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
+                for i, row in inner_val.iterrows():
+                    sp = row["speaker_id"]
+                    outer_idx = speaker_to_idx[sp]
+                    oof_text_probs[outer_idx] = text_probs[i]
+                    oof_audio_probs[outer_idx] = audio_probs[i]
+            else:
+                text_preds = text_model.predict(inner_val[feature_cols_text].to_numpy())
+                audio_preds = audio_model.predict(inner_val_audio[audio_feature_cols].to_numpy())
+                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
+                for i, row in inner_val.iterrows():
+                    sp = row["speaker_id"]
+                    outer_idx = speaker_to_idx[sp]
+                    oof_text_preds[outer_idx] = text_preds[i]
+                    oof_audio_preds[outer_idx] = audio_preds[i]
+        
+        # Build meta-model on OOF predictions
+        if args.task == "classification":
+            X_meta_train = np.concatenate([oof_text_probs, oof_audio_probs], axis=1)
+        else:
+            X_meta_train = np.column_stack([oof_text_preds, oof_audio_preds])
+        y_meta_train = outer_train["y_true"].values
+        
+        if args.task == "classification":
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
+            ])
+        else:
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", Ridge(alpha=1.0))
+            ])
+        meta_model.fit(X_meta_train, y_meta_train)
+        
+        # Train final base models on outer_train
+        text_result = train_meta_model_cv(
+            outer_train, outer_val, None, feature_cols_text, args, 
+            out_dir / f"stack_text_fold{fold_idx}"
+        )
+        audio_result = train_meta_model_cv(
+            outer_train_audio, outer_val_audio, None, audio_feature_cols, args, 
+            out_dir / f"stack_audio_fold{fold_idx}"
+        )
+        text_final = joblib.load(out_dir / f"stack_text_fold{fold_idx}" / "final_cv_model.joblib")
+        audio_final = joblib.load(out_dir / f"stack_audio_fold{fold_idx}" / "final_cv_model.joblib")
+        text_selected = pd.read_csv(out_dir / f"stack_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        audio_selected = pd.read_csv(out_dir / f"stack_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        
+        X_text_val = outer_val[text_selected].to_numpy()
+        X_audio_val = outer_val_audio[audio_selected].to_numpy()
+        
+        if args.task == "classification":
+            text_probs_val = text_final.predict_proba(X_text_val)
+            audio_probs_val = audio_final.predict_proba(X_audio_val)
+            X_meta_val = np.concatenate([text_probs_val, audio_probs_val], axis=1)
+            preds = meta_model.predict(X_meta_val)
+        else:
+            text_preds_val = text_final.predict(X_text_val)
+            audio_preds_val = audio_final.predict(X_audio_val)
+            X_meta_val = np.column_stack([text_preds_val, audio_preds_val])
+            preds = meta_model.predict(X_meta_val)
+        
+        fold_metrics.append(score_meta_model(None, preds, outer_val["y_true"].values, args.task))
+        all_preds.extend(preds)
+        all_true.extend(outer_val["y_true"].values)
+    
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
+    
+    fold_df = pd.DataFrame(fold_metrics)
+    fold_df.to_csv(out_dir / "model_based_fusion_fold_metrics.csv", index=False)
+    
+    pred_df = all_text_data[["speaker_id", "y_true"]].copy()
+    pred_df["y_pred"] = all_preds
+    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+    
+    return aggregate_metrics, all_preds, all_true
+
+
+# =======================================================================
+#  FIXED: MAIN FUSION ORCHESTRATOR - Correct order and all functions
+# =======================================================================
+
+def run_fusion_experiments(
+    train_features, val_features, test_features,
+    feature_cols_text, audio_df, args, out_dir: Path,
+    text_meta_model=None, text_selected_features=None
+):
+    """
+    Run ALL fusion experiments with audio features properly used.
+    EXITS if audio-only fails.
+    """
+    fusion_out = out_dir / "fusion_results"
+    fusion_out.mkdir(parents=True, exist_ok=True)
+
+    # Get audio feature columns
+    audio_feature_cols = get_audio_feature_cols(audio_df)
+    
+    print(f"\n{'='*60}")
+    print(f"RUNNING ALL FUSION EXPERIMENTS")
+    print(f"  Text features: {len(feature_cols_text)}")
+    print(f"  Audio features: {len(audio_feature_cols)}")
+    print(f"  Audio columns: {audio_feature_cols[:5]}...")
+    print(f"  Results saved to: {fusion_out}")
+    print(f"{'='*60}")
+
+    # ============================================================
+    # CRITICAL: Merge audio features with ALL splits
+    # ============================================================
+    print("\nMerging audio features with text features...")
+    train_with_audio = merge_audio_features(train_features, audio_df, how='left')
+    val_with_audio = merge_audio_features(val_features, audio_df, how='left')
+    
+    if test_features is not None and not test_features.empty:
+        test_with_audio = merge_audio_features(test_features, audio_df, how='left')
+    else:
+        test_with_audio = None
+    
+    print(f"  Train: {len(train_with_audio)} samples, {len(train_with_audio.columns)} columns")
+    print(f"  Val: {len(val_with_audio)} samples, {len(val_with_audio.columns)} columns")
+    if test_with_audio is not None:
+        print(f"  Test: {len(test_with_audio)} samples, {len(test_with_audio.columns)} columns")
+    
+    # Verify audio features are present
+    audio_cols_present = [c for c in audio_feature_cols if c in train_with_audio.columns]
+    print(f"  Audio columns present in merged data: {len(audio_cols_present)}/{len(audio_feature_cols)}")
+    
+    # ============================================================
+    # CRITICAL CHECK: Must have audio features to continue
+    # ============================================================
+    if len(audio_cols_present) == 0:
+        error_msg = (
+            "\n" + "="*60 + "\n"
+            "❌ CRITICAL ERROR: No audio features found in merged data!\n"
+            f"   Audio columns requested: {audio_feature_cols[:5]}...\n"
+            f"   Columns available in train data: {train_with_audio.columns.tolist()[:10]}...\n"
+            "   Please check:\n"
+            "     1. Audio CSV path is correct\n"
+            "     2. Speaker IDs match between text and audio data\n"
+            "     3. Audio CSV has numeric feature columns\n"
+            "     4. --audio-feature-cols (if provided) exist in the CSV\n"
+            "="*60
+        )
+        print(error_msg)
+        raise ValueError(error_msg)
+
+    results = {}
+
+    # ============================================================
+    # 1. AUDIO ONLY - Runs FIRST - MUST SUCCEED
+    # ============================================================
+    print("\n" + "="*60)
+    print("1. AUDIO ONLY (audio features only - NO TEXT) - RUNNING FIRST")
+    print("="*60)
+    
+    audio_result = None
+    try:
+        audio_result = run_audio_only_baseline(
+            train_with_audio, val_with_audio, test_with_audio,
+            audio_feature_cols, args, fusion_out
+        )
+        
+        # Check if audio-only succeeded
+        if audio_result is None:
+            error_msg = (
+                "\n" + "="*60 + "\n"
+                "❌ AUDIO-ONLY FAILED - Stopping all experiments!\n"
+                "   Audio-only returned None. This could be due to:\n"
+                "     1. Not enough training samples\n"
+                "     2. Training failed during cross-validation\n"
+                "     3. Numerical issues with audio features\n"
+                "     4. All folds failed\n"
+                "   Check the logs above for specific errors.\n"
+                "="*60
+            )
+            print(error_msg)
+            raise RuntimeError(error_msg)
+        
+        # Check if audio_result has valid metrics
+        if args.task == "classification":
+            if isinstance(audio_result, dict):
+                if "macro_f1" not in audio_result and "test_metrics" not in audio_result:
+                    error_msg = (
+                        "\n" + "="*60 + "\n"
+                        "❌ AUDIO-ONLY FAILED - Invalid result structure!\n"
+                        f"   Expected 'macro_f1' or 'test_metrics' in result\n"
+                        f"   Got: {audio_result.keys() if isinstance(audio_result, dict) else type(audio_result)}\n"
+                        "="*60
+                    )
+                    print(error_msg)
+                    raise ValueError(error_msg)
+        else:
+            if isinstance(audio_result, dict):
+                if "rmse" not in audio_result and "test_metrics" not in audio_result:
+                    error_msg = (
+                        "\n" + "="*60 + "\n"
+                        "❌ AUDIO-ONLY FAILED - Invalid result structure!\n"
+                        f"   Expected 'rmse' or 'test_metrics' in result\n"
+                        f"   Got: {audio_result.keys() if isinstance(audio_result, dict) else type(audio_result)}\n"
+                        "="*60
+                    )
+                    print(error_msg)
+                    raise ValueError(error_msg)
+        
+        print("  ✅ Audio-only completed successfully")
+        results['audio_only'] = audio_result
+        
+    except Exception as e:
+        error_msg = (
+            "\n" + "="*60 + "\n"
+            f"❌ AUDIO-ONLY FAILED with exception: {e}\n"
+            "   Stopping all fusion experiments!\n"
+            "   Please fix the audio feature issues and re-run.\n"
+            "="*60
+        )
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(error_msg) from e
+
+    # ============================================================
+    # 2. TEXT ONLY - Runs SECOND (only if audio succeeded)
+    # ============================================================
+    print("\n" + "="*60)
+    print("2. TEXT ONLY (reusing main pipeline model - NO AUDIO) - RUNNING SECOND")
+    print("="*60)
+    
+    try:
+        results['text_only'] = run_text_only_baseline(
+            train_features, val_features, test_features,
+            feature_cols_text, args, fusion_out,
+            text_meta_model, text_selected_features
+        )
+        print("  ✅ Text-only completed successfully")
+    except Exception as e:
+        print(f"  ❌ Text-only crashed: {e}")
+        # Don't stop on text-only failure, but log it
+        results['text_only'] = None
+
+    # ============================================================
+    # 3. EARLY FUSION - Concatenates text + audio features
+    # ============================================================
+    print("\n" + "="*60)
+    print("3. EARLY FUSION (concat text + audio features)")
+    print("="*60)
+    
+    try:
+        results['early_fusion'] = run_early_fusion(
+            train_with_audio, val_with_audio, test_with_audio,
+            feature_cols_text, audio_feature_cols, args, fusion_out
+        )
+        print("  ✅ Early fusion completed successfully")
+    except Exception as e:
+        print(f"  ❌ Early fusion crashed: {e}")
+        results['early_fusion'] = None
+
+    # ============================================================
+    # 4. LATE FUSION - Separate text and audio models
+    # ============================================================
+    print("\n" + "="*60)
+    print("4. LATE FUSION (separate models, average predictions)")
+    print("="*60)
+    
+    try:
+        results['late_fusion'] = run_late_fusion(
+            train_features, val_features, test_features,
+            train_with_audio, val_with_audio, test_with_audio,
+            feature_cols_text, audio_feature_cols, args, fusion_out,
+            text_meta_model, text_selected_features
+        )
+        print("  ✅ Late fusion completed successfully")
+    except Exception as e:
+        print(f"  ❌ Late fusion crashed: {e}")
+        results['late_fusion'] = None
+
+    # ============================================================
+    # 5. MODEL-BASED FUSION - Stacking
+    # ============================================================
+    print("\n" + "="*60)
+    print("5. MODEL-BASED FUSION (stacking)")
+    print("="*60)
+    
+    try:
+        results['model_based_fusion'] = run_model_based_fusion(
+            train_features, val_features, test_features,
+            train_with_audio, val_with_audio, test_with_audio,
+            feature_cols_text, audio_feature_cols, args, fusion_out,
+            text_meta_model, text_selected_features
+        )
+        print("  ✅ Model-based fusion completed successfully")
+    except Exception as e:
+        print(f"  ❌ Model-based fusion crashed: {e}")
+        results['model_based_fusion'] = None
+
+    # ============================================================
+    # 6. CONFIDENCE-WEIGHTED FUSION (Novel)
+    # ============================================================
+    if getattr(args, 'fusion_novel', 'none') in ['confidence', 'all']:
+        print("\n" + "="*60)
+        print("6. CONFIDENCE-WEIGHTED LATE FUSION (Novel)")
+        print("="*60)
+        
+        try:
+            results['confidence_weighted'] = run_confidence_weighted_fusion(
+                train_features, val_features, test_features,
+                train_with_audio, val_with_audio, test_with_audio,
+                feature_cols_text, audio_feature_cols, args, fusion_out,
+                text_meta_model, text_selected_features
+            )
+            print("  ✅ Confidence-weighted fusion completed successfully")
+        except Exception as e:
+            print(f"  ❌ Confidence-weighted fusion crashed: {e}")
+            results['confidence_weighted'] = None
+
+    # ============================================================
+    # 7. INTERACTION STACKING (Novel)
+    # ============================================================
+    if getattr(args, 'fusion_novel', 'none') in ['interaction', 'all']:
+        print("\n" + "="*60)
+        print("7. INTERACTION STACKING (Novel)")
+        print("="*60)
+        
+        try:
+            results['interaction_stacking'] = run_interaction_stacking_fusion(
+                train_features, val_features, test_features,
+                train_with_audio, val_with_audio, test_with_audio,
+                feature_cols_text, audio_feature_cols, args, fusion_out,
+                text_meta_model, text_selected_features
+            )
+            print("  ✅ Interaction stacking completed successfully")
+        except Exception as e:
+            print(f"  ❌ Interaction stacking crashed: {e}")
+            results['interaction_stacking'] = None
+
+    # ============================================================
+    # 8. MIXTURE OF EXPERTS (Novel)
+    # ============================================================
+    if getattr(args, 'fusion_novel', 'none') in ['moe', 'all']:
+        print("\n" + "="*60)
+        print("8. MIXTURE OF EXPERTS (Novel)")
+        print("="*60)
+        
+        try:
+            results['mixture_of_experts'] = run_mixture_of_experts_fusion(
+                train_features, val_features, test_features,
+                train_with_audio, val_with_audio, test_with_audio,
+                feature_cols_text, audio_feature_cols, args, fusion_out
+            )
+            print("  ✅ Mixture of experts completed successfully")
+        except Exception as e:
+            print(f"  ❌ Mixture of experts crashed: {e}")
+            results['mixture_of_experts'] = None
+
+    # ============================================================
+    # 9. MLP EARLY FUSION (Novel)
+    # ============================================================
+    if getattr(args, 'fusion_novel', 'none') in ['mlp', 'all']:
+        print("\n" + "="*60)
+        print("9. MLP EARLY FUSION (Novel)")
+        print("="*60)
+        
+        try:
+            results['mlp_early_fusion'] = run_mlp_early_fusion_fusion(
+                train_features, val_features, test_features,
+                train_with_audio, val_with_audio, test_with_audio,
+                feature_cols_text, audio_feature_cols, args, fusion_out
+            )
+            print("  ✅ MLP early fusion completed successfully")
+        except Exception as e:
+            print(f"  ❌ MLP early fusion crashed: {e}")
+            results['mlp_early_fusion'] = None
+
+    # ============================================================
+    # SUMMARY
+    # ============================================================
+    print("\n" + "="*60)
+    print("FUSION EXPERIMENTS SUMMARY")
+    print("="*60)
+    
+    summary_rows = []
+    for name, result in results.items():
+        if result is None:
+            summary_rows.append({
+                "fusion_method": name,
+                "primary_score": "N/A",
+                "status": "❌ FAILED or SKIPPED"
+            })
+        else:
+            # Extract primary score
+            if args.task == "classification":
+                if isinstance(result, dict):
+                    if "test_metrics" in result and isinstance(result["test_metrics"], dict):
+                        score = result["test_metrics"].get("macro_f1", 0.0)
+                    elif "macro_f1" in result:
+                        score = result.get("macro_f1", 0.0)
+                    elif "cv_aggregate_metrics" in result and isinstance(result["cv_aggregate_metrics"], dict):
+                        score = result["cv_aggregate_metrics"].get("macro_f1", 0.0)
+                    elif "aggregate_metrics" in result and isinstance(result["aggregate_metrics"], dict):
+                        score = result["aggregate_metrics"].get("macro_f1", 0.0)
+                    else:
+                        score = 0.0
+                else:
+                    score = 0.0
+            else:
+                if isinstance(result, dict):
+                    if "test_metrics" in result and isinstance(result["test_metrics"], dict):
+                        score = -result["test_metrics"].get("rmse", float('inf'))
+                    elif "rmse" in result:
+                        score = -result.get("rmse", float('inf'))
+                    elif "cv_aggregate_metrics" in result and isinstance(result["cv_aggregate_metrics"], dict):
+                        score = -result["cv_aggregate_metrics"].get("rmse", float('inf'))
+                    else:
+                        score = -float('inf')
+                else:
+                    score = -float('inf')
+            
+            summary_rows.append({
+                "fusion_method": name,
+                "primary_score": round(score, 4) if score != float('inf') and score != -float('inf') else "N/A",
+                "status": "✅ SUCCESS"
+            })
+    
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df = summary_df.sort_values("primary_score", ascending=False)
+    summary_df.to_csv(fusion_out / "fusion_summary.csv", index=False)
+    
+    print("\n" + summary_df.to_string(index=False))
+    
+    # Find best method
+    if not summary_df.empty:
+        # Filter out failed methods for best method
+        success_df = summary_df[summary_df['status'] == "✅ SUCCESS"]
+        if not success_df.empty:
+            best_row = success_df.iloc[0]
+            print(f"\n🏆 BEST FUSION METHOD: {best_row['fusion_method']} (score: {best_row['primary_score']:.4f})")
+    
+    return results
+
+
+# =======================================================================
+#  FIXED: EARLY FUSION - Properly uses audio features
+# =======================================================================
+
+def run_early_fusion(train_features, val_features, test_features,
+                     feature_cols_text, audio_feature_cols, args, out_dir: Path):
+    """
+    EARLY FUSION - concatenates text and audio features.
+    NOTE: train_features, val_features, test_features should already have audio merged.
+    """
+    early_dir = out_dir / "early_fusion"
+    early_dir.mkdir(parents=True, exist_ok=True)
+    
+    early_feature_cols = feature_cols_text + audio_feature_cols
+    print(f"  Early fusion features: {len(early_feature_cols)} total")
+    print(f"    Text: {len(feature_cols_text)}, Audio: {len(audio_feature_cols)}")
+    
+    if args.test_frac == 0:
+        result = train_meta_model_cv(
+            train_features, val_features, test_features, 
+            early_feature_cols, args, early_dir
+        )
+    else:
+        result = train_meta_model_with_cv_selection(
+            train_features, val_features, test_features, 
+            early_feature_cols, args, early_dir
+        )
+    
+    with open(early_dir / "fusion_metrics.json", "w") as f:
+        json.dump(result, f, indent=2)
+    
+    return result
+
+
+# =======================================================================
+#  MISSING FUNCTION: run_confidence_weighted_fusion
+# =======================================================================
+
+def run_confidence_weighted_fusion(train_features, val_features, test_features,
+                                   train_with_audio, val_with_audio, test_with_audio,
+                                   feature_cols_text, audio_feature_cols, args, out_dir: Path,
+                                   text_meta_model=None, text_selected_features=None):
+    """
+    CONFIDENCE-WEIGHTED LATE FUSION - weights by inverse entropy.
+    Uses audio features properly.
+    """
+    cw_dir = out_dir / "confidence_weighted_fusion"
+    cw_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.test_frac == 0:
+        metrics, preds, y_true = confidence_weighted_late_fusion_cv(
+            train_features, val_features,
+            train_with_audio, val_with_audio,
+            feature_cols_text, audio_feature_cols, args, cw_dir
+        )
+        with open(cw_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        return metrics
+    else:
+        # Text model
+        if text_meta_model is not None and text_selected_features is not None:
+            text_model = text_meta_model
+            text_selected = text_selected_features
+        else:
+            text_result = train_meta_model_with_cv_selection(
+                train_features, val_features, test_features,
+                feature_cols_text, args, cw_dir / "text_model"
+            )
+            text_model = joblib.load(cw_dir / "text_model" / "meta_model.joblib")
+            text_selected = pd.read_csv(cw_dir / "text_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Audio model
+        audio_result = train_meta_model_with_cv_selection(
+            train_with_audio, val_with_audio, test_with_audio,
+            audio_feature_cols, args, cw_dir / "audio_model"
+        )
+        audio_model = joblib.load(cw_dir / "audio_model" / "meta_model.joblib")
+        audio_selected = pd.read_csv(cw_dir / "audio_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        X_text_test = test_features[text_selected].to_numpy()
+        X_audio_test = test_with_audio[audio_selected].to_numpy()
+        y_true = test_features["y_true"].to_numpy()
+        
+        if args.task == "classification":
+            prob_text = text_model.predict_proba(X_text_test)
+            prob_audio = audio_model.predict_proba(X_audio_test)
+            
+            eps = 1e-12
+            entropy_text = -np.sum(prob_text * np.log(prob_text + eps), axis=1)
+            entropy_audio = -np.sum(prob_audio * np.log(prob_audio + eps), axis=1)
+            
+            w_text = 1.0 / (entropy_text + eps)
+            w_audio = 1.0 / (entropy_audio + eps)
+            total = w_text + w_audio
+            w_text /= total
+            w_audio /= total
+            
+            fused_probs = prob_text * w_text[:, None] + prob_audio * w_audio[:, None]
+            preds = np.argmax(fused_probs, axis=1)
+        else:
+            pred_text = text_model.predict(X_text_test)
+            pred_audio = audio_model.predict(X_audio_test)
+            preds = (pred_text + pred_audio) / 2.0
+        
+        metrics = score_meta_model(None, preds, y_true, args.task)
+        
+        with open(cw_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        
+        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = preds
+        pred_df.to_csv(cw_dir / "predictions.csv", index=False)
+        
+        return metrics
+
+
+# =======================================================================
+#  MISSING FUNCTION: confidence_weighted_late_fusion_cv
+# =======================================================================
+
+def confidence_weighted_late_fusion_cv(train_features, val_features,
+                                       train_with_audio, val_with_audio,
+                                       feature_cols_text, audio_feature_cols, args, out_dir):
+    """Confidence-weighted late fusion using CV with audio features."""
+    all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+    all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+    
+    speakers = all_text_data.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers, speakers["label"]))
+    else:
+        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers))
+    
+    all_preds = []
+    all_true = []
+    fold_metrics = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
+        
+        fold_train = all_text_data[all_text_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val = all_text_data[all_text_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        fold_train_audio = all_audio_data[all_audio_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val_audio = all_audio_data[all_audio_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Text model
+        text_result = train_meta_model_cv(
+            fold_train, fold_val, None, feature_cols_text, args, 
+            out_dir / f"cw_text_fold{fold_idx}"
+        )
+        text_model = joblib.load(out_dir / f"cw_text_fold{fold_idx}" / "final_cv_model.joblib")
+        text_selected = pd.read_csv(out_dir / f"cw_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        
+        # Audio model
+        audio_result = train_meta_model_cv(
+            fold_train_audio, fold_val_audio, None, audio_feature_cols, args, 
+            out_dir / f"cw_audio_fold{fold_idx}"
+        )
+        audio_model = joblib.load(out_dir / f"cw_audio_fold{fold_idx}" / "final_cv_model.joblib")
+        audio_selected = pd.read_csv(out_dir / f"cw_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        
+        X_text_val = fold_val[text_selected].to_numpy()
+        X_audio_val = fold_val_audio[audio_selected].to_numpy()
+        y_val = fold_val["y_true"].to_numpy()
+        
+        if args.task == "classification":
+            prob_text = text_model.predict_proba(X_text_val)
+            prob_audio = audio_model.predict_proba(X_audio_val)
+            
+            eps = 1e-12
+            entropy_text = -np.sum(prob_text * np.log(prob_text + eps), axis=1)
+            entropy_audio = -np.sum(prob_audio * np.log(prob_audio + eps), axis=1)
+            
+            w_text = 1.0 / (entropy_text + eps)
+            w_audio = 1.0 / (entropy_audio + eps)
+            total = w_text + w_audio
+            w_text /= total
+            w_audio /= total
+            
+            fused_probs = prob_text * w_text[:, None] + prob_audio * w_audio[:, None]
+            preds = np.argmax(fused_probs, axis=1)
+        else:
+            pred_text = text_model.predict(X_text_val)
+            pred_audio = audio_model.predict(X_audio_val)
+            preds = (pred_text + pred_audio) / 2.0
+        
+        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
+        all_preds.extend(preds)
+        all_true.extend(y_val)
+    
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
+    
+    fold_df = pd.DataFrame(fold_metrics)
+    fold_df.to_csv(out_dir / "confidence_weighted_fold_metrics.csv", index=False)
+    
+    pred_df = all_text_data[["speaker_id", "y_true"]].copy()
+    pred_df["y_pred"] = all_preds
+    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+    
+    return aggregate_metrics, all_preds, all_true
+
+
+# =======================================================================
+#  MISSING FUNCTION: run_interaction_stacking_fusion
+# =======================================================================
+
+def run_interaction_stacking_fusion(train_features, val_features, test_features,
+                                    train_with_audio, val_with_audio, test_with_audio,
+                                    feature_cols_text, audio_feature_cols, args, out_dir: Path,
+                                    text_meta_model=None, text_selected_features=None):
+    """
+    INTERACTION STACKING - stacking with cross-modal interaction features.
+    Uses audio features properly.
+    """
+    inter_dir = out_dir / "interaction_stacking"
+    inter_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.test_frac == 0:
+        metrics, preds, y_true = interaction_stacking_cv(
+            train_features, val_features,
+            train_with_audio, val_with_audio,
+            feature_cols_text, audio_feature_cols, args, inter_dir
+        )
+        with open(inter_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        return metrics
+    else:
+        # Text model
+        if text_meta_model is not None and text_selected_features is not None:
+            text_model = text_meta_model
+            text_selected = text_selected_features
+        else:
+            text_result = train_meta_model_with_cv_selection(
+                train_features, val_features, test_features,
+                feature_cols_text, args, inter_dir / "text_model"
+            )
+            text_model = joblib.load(inter_dir / "text_model" / "meta_model.joblib")
+            text_selected = pd.read_csv(inter_dir / "text_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Audio model
+        audio_result = train_meta_model_with_cv_selection(
+            train_with_audio, val_with_audio, test_with_audio,
+            audio_feature_cols, args, inter_dir / "audio_model"
+        )
+        audio_model = joblib.load(inter_dir / "audio_model" / "meta_model.joblib")
+        audio_selected = pd.read_csv(inter_dir / "audio_model" / "selected_embedding_features.csv")["feature"].tolist()
+        
+        # Get predictions with interactions
+        train_text_X = train_features[text_selected].to_numpy()
+        train_audio_X = train_with_audio[audio_selected].to_numpy()
+        val_text_X = val_features[text_selected].to_numpy()
+        val_audio_X = val_with_audio[audio_selected].to_numpy()
+        test_text_X = test_features[text_selected].to_numpy()
+        test_audio_X = test_with_audio[audio_selected].to_numpy()
+        
+        if args.task == "classification":
+            classes = np.unique(train_features["y_true"])
+            n_classes = len(classes)
+            
+            def get_probs(model, X):
+                if hasattr(model, "predict_proba"):
+                    return model.predict_proba(X)
+                else:
+                    preds = model.predict(X)
+                    return np.eye(n_classes)[preds.astype(int)]
+            
+            train_probs_text = get_probs(text_model, train_text_X)
+            train_probs_audio = get_probs(audio_model, train_audio_X)
+            val_probs_text = get_probs(text_model, val_text_X)
+            val_probs_audio = get_probs(audio_model, val_audio_X)
+            test_probs_text = get_probs(text_model, test_text_X)
+            test_probs_audio = get_probs(audio_model, test_audio_X)
+            
+            X_train_meta = np.concatenate([
+                train_probs_text, train_probs_audio,
+                train_probs_text * train_probs_audio,
+                np.abs(train_probs_text - train_probs_audio),
+                train_probs_text ** 2,
+                train_probs_audio ** 2
+            ], axis=1)
+            
+            X_val_meta = np.concatenate([
+                val_probs_text, val_probs_audio,
+                val_probs_text * val_probs_audio,
+                np.abs(val_probs_text - val_probs_audio),
+                val_probs_text ** 2,
+                val_probs_audio ** 2
+            ], axis=1)
+            
+            X_test_meta = np.concatenate([
+                test_probs_text, test_probs_audio,
+                test_probs_text * test_probs_audio,
+                np.abs(test_probs_text - test_probs_audio),
+                test_probs_text ** 2,
+                test_probs_audio ** 2
+            ], axis=1)
+        else:
+            train_preds_text = text_model.predict(train_text_X)
+            train_preds_audio = audio_model.predict(train_audio_X)
+            val_preds_text = text_model.predict(val_text_X)
+            val_preds_audio = audio_model.predict(val_audio_X)
+            test_preds_text = text_model.predict(test_text_X)
+            test_preds_audio = audio_model.predict(test_audio_X)
+            
+            X_train_meta = np.concatenate([
+                train_preds_text.reshape(-1, 1), train_preds_audio.reshape(-1, 1),
+                (train_preds_text * train_preds_audio).reshape(-1, 1),
+                np.abs(train_preds_text - train_preds_audio).reshape(-1, 1),
+                (train_preds_text ** 2).reshape(-1, 1),
+                (train_preds_audio ** 2).reshape(-1, 1)
+            ], axis=1)
+            
+            X_val_meta = np.concatenate([
+                val_preds_text.reshape(-1, 1), val_preds_audio.reshape(-1, 1),
+                (val_preds_text * val_preds_audio).reshape(-1, 1),
+                np.abs(val_preds_text - val_preds_audio).reshape(-1, 1),
+                (val_preds_text ** 2).reshape(-1, 1),
+                (val_preds_audio ** 2).reshape(-1, 1)
+            ], axis=1)
+            
+            X_test_meta = np.concatenate([
+                test_preds_text.reshape(-1, 1), test_preds_audio.reshape(-1, 1),
+                (test_preds_text * test_preds_audio).reshape(-1, 1),
+                np.abs(test_preds_text - test_preds_audio).reshape(-1, 1),
+                (test_preds_text ** 2).reshape(-1, 1),
+                (test_preds_audio ** 2).reshape(-1, 1)
+            ], axis=1)
+        
+        y_train = train_features["y_true"].to_numpy()
+        y_val = val_features["y_true"].to_numpy()
+        y_test = test_features["y_true"].to_numpy()
+        
+        X_meta_all = np.concatenate([X_train_meta, X_val_meta], axis=0)
+        y_meta_all = np.concatenate([y_train, y_val], axis=0)
+        
+        if args.task == "classification":
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
+            ])
+        else:
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", Ridge(alpha=1.0))
+            ])
+        
+        meta_model.fit(X_meta_all, y_meta_all)
+        y_pred = meta_model.predict(X_test_meta)
+        metrics = score_meta_model(None, y_pred, y_test, args.task)
+        
+        with open(inter_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        
+        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = y_pred
+        pred_df.to_csv(inter_dir / "predictions.csv", index=False)
+        
+        return metrics
+
+
+# =======================================================================
+#  MISSING FUNCTION: interaction_stacking_cv
+# =======================================================================
+
+def interaction_stacking_cv(train_features, val_features,
+                            train_with_audio, val_with_audio,
+                            feature_cols_text, audio_feature_cols, args, out_dir):
+    """Interaction stacking using CV with audio features."""
+    all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+    all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+    
+    speakers = all_text_data.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv_outer = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        outer_splits = list(cv_outer.split(speakers, speakers["label"]))
+    else:
+        cv_outer = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        outer_splits = list(cv_outer.split(speakers))
+    
+    all_preds = []
+    all_true = []
+    fold_metrics = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(outer_splits):
+        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
+        
+        outer_train = all_text_data[all_text_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        outer_val = all_text_data[all_text_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        outer_train_audio = all_audio_data[all_audio_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        outer_val_audio = all_audio_data[all_audio_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Inner CV for OOF predictions
+        inner_folds = min(3, len(outer_train) // 10) if len(outer_train) > 10 else 2
+        inner_folds = max(2, inner_folds)
+        n_train = len(outer_train)
+        
+        if args.task == "classification":
+            classes = np.unique(outer_train["y_true"])
+            n_classes = len(classes)
+            oof_text_probs = np.zeros((n_train, n_classes))
+            oof_audio_probs = np.zeros((n_train, n_classes))
+        else:
+            oof_text_preds = np.zeros(n_train)
+            oof_audio_preds = np.zeros(n_train)
+        
+        inner_speakers = outer_train.groupby("speaker_id")["y_true"].first().reset_index()
+        inner_speakers.columns = ["speaker_id", "label"]
+        
+        if args.task == "classification":
+            cv_inner = StratifiedKFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
+            inner_splits = list(cv_inner.split(inner_speakers, inner_speakers["label"]))
+        else:
+            cv_inner = KFold(n_splits=inner_folds, shuffle=True, random_state=args.seed+fold_idx)
+            inner_splits = list(cv_inner.split(inner_speakers))
+        
+        for inner_train_idx, inner_val_idx in inner_splits:
+            inner_train_speakers = inner_speakers.iloc[inner_train_idx]["speaker_id"].values
+            inner_val_speakers = inner_speakers.iloc[inner_val_idx]["speaker_id"].values
+            
+            inner_train = outer_train[outer_train["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
+            inner_val = outer_train[outer_train["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
+            inner_train_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_train_speakers)].reset_index(drop=True)
+            inner_val_audio = outer_train_audio[outer_train_audio["speaker_id"].isin(inner_val_speakers)].reset_index(drop=True)
+            
+            text_model = make_meta_model(args)
+            audio_model = make_meta_model(args)
+            text_model.fit(inner_train[feature_cols_text].to_numpy(), inner_train["y_true"].to_numpy())
+            audio_model.fit(inner_train_audio[audio_feature_cols].to_numpy(), inner_train_audio["y_true"].to_numpy())
+            
+            if args.task == "classification":
+                text_probs = text_model.predict_proba(inner_val[feature_cols_text].to_numpy())
+                audio_probs = audio_model.predict_proba(inner_val_audio[audio_feature_cols].to_numpy())
+                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
+                for i, row in inner_val.iterrows():
+                    sp = row["speaker_id"]
+                    outer_idx = speaker_to_idx[sp]
+                    oof_text_probs[outer_idx] = text_probs[i]
+                    oof_audio_probs[outer_idx] = audio_probs[i]
+            else:
+                text_preds = text_model.predict(inner_val[feature_cols_text].to_numpy())
+                audio_preds = audio_model.predict(inner_val_audio[audio_feature_cols].to_numpy())
+                speaker_to_idx = {sp: i for i, sp in enumerate(outer_train["speaker_id"])}
+                for i, row in inner_val.iterrows():
+                    sp = row["speaker_id"]
+                    outer_idx = speaker_to_idx[sp]
+                    oof_text_preds[outer_idx] = text_preds[i]
+                    oof_audio_preds[outer_idx] = audio_preds[i]
+        
+        # Build meta-features with interactions
+        if args.task == "classification":
+            X_meta_train = np.concatenate([
+                oof_text_probs, oof_audio_probs,
+                oof_text_probs * oof_audio_probs,
+                np.abs(oof_text_probs - oof_audio_probs),
+                oof_text_probs ** 2,
+                oof_audio_probs ** 2
+            ], axis=1)
+        else:
+            X_meta_train = np.concatenate([
+                oof_text_preds.reshape(-1, 1), oof_audio_preds.reshape(-1, 1),
+                (oof_text_preds * oof_audio_preds).reshape(-1, 1),
+                np.abs(oof_text_preds - oof_audio_preds).reshape(-1, 1),
+                (oof_text_preds ** 2).reshape(-1, 1),
+                (oof_audio_preds ** 2).reshape(-1, 1)
+            ], axis=1)
+        
+        y_meta_train = outer_train["y_true"].values
+        
+        if args.task == "classification":
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", LogisticRegression(class_weight="balanced", random_state=args.seed))
+            ])
+        else:
+            meta_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", Ridge(alpha=1.0))
+            ])
+        meta_model.fit(X_meta_train, y_meta_train)
+        
+        # Train final base models
+        text_result = train_meta_model_cv(
+            outer_train, outer_val, None, feature_cols_text, args, 
+            out_dir / f"inter_text_fold{fold_idx}"
+        )
+        audio_result = train_meta_model_cv(
+            outer_train_audio, outer_val_audio, None, audio_feature_cols, args, 
+            out_dir / f"inter_audio_fold{fold_idx}"
+        )
+        text_final = joblib.load(out_dir / f"inter_text_fold{fold_idx}" / "final_cv_model.joblib")
+        audio_final = joblib.load(out_dir / f"inter_audio_fold{fold_idx}" / "final_cv_model.joblib")
+        text_selected = pd.read_csv(out_dir / f"inter_text_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        audio_selected = pd.read_csv(out_dir / f"inter_audio_fold{fold_idx}" / "final_selected_features.csv")["feature"].tolist()
+        
+        X_text_val = outer_val[text_selected].to_numpy()
+        X_audio_val = outer_val_audio[audio_selected].to_numpy()
+        
+        if args.task == "classification":
+            text_probs_val = text_final.predict_proba(X_text_val)
+            audio_probs_val = audio_final.predict_proba(X_audio_val)
+            X_meta_val = np.concatenate([
+                text_probs_val, audio_probs_val,
+                text_probs_val * audio_probs_val,
+                np.abs(text_probs_val - audio_probs_val),
+                text_probs_val ** 2,
+                audio_probs_val ** 2
+            ], axis=1)
+        else:
+            text_preds_val = text_final.predict(X_text_val)
+            audio_preds_val = audio_final.predict(X_audio_val)
+            X_meta_val = np.concatenate([
+                text_preds_val.reshape(-1, 1), audio_preds_val.reshape(-1, 1),
+                (text_preds_val * audio_preds_val).reshape(-1, 1),
+                np.abs(text_preds_val - audio_preds_val).reshape(-1, 1),
+                (text_preds_val ** 2).reshape(-1, 1),
+                (audio_preds_val ** 2).reshape(-1, 1)
+            ], axis=1)
+        
+        preds = meta_model.predict(X_meta_val)
+        fold_metrics.append(score_meta_model(None, preds, outer_val["y_true"].values, args.task))
+        all_preds.extend(preds)
+        all_true.extend(outer_val["y_true"].values)
+    
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
+    
+    fold_df = pd.DataFrame(fold_metrics)
+    fold_df.to_csv(out_dir / "interaction_stacking_fold_metrics.csv", index=False)
+    
+    pred_df = all_text_data[["speaker_id", "y_true"]].copy()
+    pred_df["y_pred"] = all_preds
+    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+    
+    return aggregate_metrics, all_preds, all_true
+
+
+# =======================================================================
+#  MISSING FUNCTION: run_mixture_of_experts_fusion
+# =======================================================================
+
+def run_mixture_of_experts_fusion(train_features, val_features, test_features,
+                                  train_with_audio, val_with_audio, test_with_audio,
+                                  feature_cols_text, audio_feature_cols, args, out_dir: Path):
+    """
+    MIXTURE OF EXPERTS - clusters speakers, trains separate experts per cluster.
+    Uses audio features properly.
+    """
+    moe_dir = out_dir / "mixture_of_experts"
+    moe_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.test_frac == 0:
+        metrics, preds, y_true = mixture_of_experts_cv(
+            train_features, val_features,
+            train_with_audio, val_with_audio,
+            feature_cols_text, audio_feature_cols, args, moe_dir
+        )
+        with open(moe_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        return metrics
+    else:
+        # Combine text and audio for clustering
+        all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+        all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+        
+        # Get concatenated features for clustering (text + audio)
+        concat_feats = np.concatenate([
+            all_text_data[feature_cols_text].to_numpy(),
+            all_audio_data[audio_feature_cols].to_numpy()
+        ], axis=1)
+        
+        n_clusters = min(3, len(all_text_data) // 10) if len(all_text_data) > 30 else 2
+        n_clusters = max(2, n_clusters)
+        print(f"Mixture of Experts: using {n_clusters} clusters")
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=args.seed, n_init=10)
+        cluster_labels = kmeans.fit_predict(concat_feats)
+        all_text_data['cluster'] = cluster_labels
+        all_audio_data['cluster'] = cluster_labels
+        
+        # Train gating model
+        gate_model = LogisticRegression(multi_class='multinomial', random_state=args.seed, max_iter=500)
+        gate_model.fit(concat_feats, cluster_labels)
+        
+        # Train experts per cluster (early fusion with text + audio)
+        expert_models = {}
+        for c in range(n_clusters):
+            cluster_text = all_text_data[all_text_data['cluster'] == c]
+            cluster_audio = all_audio_data[all_audio_data['cluster'] == c]
+            if len(cluster_text) < 5:
+                continue
+            X_train = np.concatenate([
+                cluster_text[feature_cols_text].to_numpy(),
+                cluster_audio[audio_feature_cols].to_numpy()
+            ], axis=1)
+            y_train = cluster_text['y_true'].values
+            model = make_meta_model(args)
+            model.fit(X_train, y_train)
+            expert_models[c] = model
+        
+        # Predict on test
+        test_concat = np.concatenate([
+            test_features[feature_cols_text].to_numpy(),
+            test_with_audio[audio_feature_cols].to_numpy()
+        ], axis=1)
+        gate_probs = gate_model.predict_proba(test_concat)
+        y_test = test_features["y_true"].to_numpy()
+        n_test = len(test_features)
+        
+        if args.task == "classification":
+            classes = np.unique(all_text_data['y_true'])
+            n_classes = len(classes)
+            pred_probs = np.zeros((n_test, n_classes))
+            for c, model in expert_models.items():
+                X_test = np.concatenate([
+                    test_features[feature_cols_text].to_numpy(),
+                    test_with_audio[audio_feature_cols].to_numpy()
+                ], axis=1)
+                if hasattr(model, "predict_proba"):
+                    probs = model.predict_proba(X_test)
+                    if list(model.classes_) != list(classes):
+                        prob_map = np.zeros((n_test, n_classes))
+                        for i, cls in enumerate(model.classes_):
+                            if cls in classes:
+                                idx_global = np.where(classes == cls)[0][0]
+                                prob_map[:, idx_global] = probs[:, i]
+                        probs = prob_map
+                    pred_probs += gate_probs[:, c][:, None] * probs
+                else:
+                    preds = model.predict(X_test)
+                    one_hot = np.eye(n_classes)[preds.astype(int)]
+                    pred_probs += gate_probs[:, c][:, None] * one_hot
+            preds = np.argmax(pred_probs, axis=1)
+        else:
+            preds = np.zeros(n_test)
+            for c, model in expert_models.items():
+                X_test = np.concatenate([
+                    test_features[feature_cols_text].to_numpy(),
+                    test_with_audio[audio_feature_cols].to_numpy()
+                ], axis=1)
+                preds += gate_probs[:, c] * model.predict(X_test)
+        
+        metrics = score_meta_model(None, preds, y_test, args.task)
+        
+        with open(moe_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        
+        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = preds
+        pred_df.to_csv(moe_dir / "predictions.csv", index=False)
+        
+        return metrics
+
+
+# =======================================================================
+#  MISSING FUNCTION: mixture_of_experts_cv
+# =======================================================================
+
+def mixture_of_experts_cv(train_features, val_features,
+                          train_with_audio, val_with_audio,
+                          feature_cols_text, audio_feature_cols, args, out_dir):
+    """Mixture of Experts using CV with audio features."""
+    from sklearn.cluster import KMeans
+    from sklearn.linear_model import LogisticRegression
+    
+    all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+    all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+    
+    # Get concatenated features for clustering
+    concat_feats = np.concatenate([
+        all_text_data[feature_cols_text].to_numpy(),
+        all_audio_data[audio_feature_cols].to_numpy()
+    ], axis=1)
+    
+    n_clusters = min(3, len(all_text_data) // 10) if len(all_text_data) > 30 else 2
+    n_clusters = max(2, n_clusters)
+    print(f"Mixture of Experts: using {n_clusters} clusters")
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=args.seed, n_init=10)
+    cluster_labels = kmeans.fit_predict(concat_feats)
+    all_text_data['cluster'] = cluster_labels
+    all_audio_data['cluster'] = cluster_labels
+    
+    speakers = all_text_data.groupby("speaker_id")["y_true"].first().reset_index()
+    speakers.columns = ["speaker_id", "label"]
+    
+    if args.task == "classification":
+        cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers, speakers["label"]))
+    else:
+        cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = list(cv.split(speakers))
+    
+    all_preds = []
+    all_true = []
+    fold_metrics = []
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+        train_speakers = speakers.iloc[train_idx]["speaker_id"].values
+        val_speakers = speakers.iloc[val_idx]["speaker_id"].values
+        
+        fold_text = all_text_data[all_text_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val_text = all_text_data[all_text_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        fold_audio = all_audio_data[all_audio_data["speaker_id"].isin(train_speakers)].reset_index(drop=True)
+        fold_val_audio = all_audio_data[all_audio_data["speaker_id"].isin(val_speakers)].reset_index(drop=True)
+        
+        # Train gating model on fold train
+        train_concat = np.concatenate([
+            fold_text[feature_cols_text].to_numpy(),
+            fold_audio[audio_feature_cols].to_numpy()
+        ], axis=1)
+        gate_fold = LogisticRegression(multi_class='multinomial', random_state=args.seed, max_iter=500)
+        gate_fold.fit(train_concat, fold_text['cluster'].values)
+        
+        # Train experts per cluster (early fusion with text + audio)
+        expert_models = {}
+        for c in range(n_clusters):
+            cluster_text = fold_text[fold_text['cluster'] == c]
+            cluster_audio = fold_audio[fold_audio['cluster'] == c]
+            if len(cluster_text) < 5:
+                continue
+            X_train = np.concatenate([
+                cluster_text[feature_cols_text].to_numpy(),
+                cluster_audio[audio_feature_cols].to_numpy()
+            ], axis=1)
+            y_train = cluster_text['y_true'].values
+            model = make_meta_model(args)
+            model.fit(X_train, y_train)
+            expert_models[c] = model
+        
+        # Predict on validation
+        val_concat = np.concatenate([
+            fold_val_text[feature_cols_text].to_numpy(),
+            fold_val_audio[audio_feature_cols].to_numpy()
+        ], axis=1)
+        gate_probs = gate_fold.predict_proba(val_concat)
+        y_val = fold_val_text['y_true'].values
+        n_val = len(fold_val_text)
+        
+        if args.task == "classification":
+            classes = np.unique(all_text_data['y_true'])
+            n_classes = len(classes)
+            pred_probs = np.zeros((n_val, n_classes))
+            for c, model in expert_models.items():
+                X_val = np.concatenate([
+                    fold_val_text[feature_cols_text].to_numpy(),
+                    fold_val_audio[audio_feature_cols].to_numpy()
+                ], axis=1)
+                if hasattr(model, "predict_proba"):
+                    probs = model.predict_proba(X_val)
+                    if list(model.classes_) != list(classes):
+                        prob_map = np.zeros((n_val, n_classes))
+                        for i, cls in enumerate(model.classes_):
+                            if cls in classes:
+                                idx_global = np.where(classes == cls)[0][0]
+                                prob_map[:, idx_global] = probs[:, i]
+                        probs = prob_map
+                    pred_probs += gate_probs[:, c][:, None] * probs
+                else:
+                    preds = model.predict(X_val)
+                    one_hot = np.eye(n_classes)[preds.astype(int)]
+                    pred_probs += gate_probs[:, c][:, None] * one_hot
+            preds = np.argmax(pred_probs, axis=1)
+        else:
+            preds = np.zeros(n_val)
+            for c, model in expert_models.items():
+                X_val = np.concatenate([
+                    fold_val_text[feature_cols_text].to_numpy(),
+                    fold_val_audio[audio_feature_cols].to_numpy()
+                ], axis=1)
+                preds += gate_probs[:, c] * model.predict(X_val)
+        
+        fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
+        all_preds.extend(preds)
+        all_true.extend(y_val)
+    
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
+    
+    fold_df = pd.DataFrame(fold_metrics)
+    fold_df.to_csv(out_dir / "mixture_of_experts_fold_metrics.csv", index=False)
+    
+    pred_df = all_text_data[["speaker_id", "y_true"]].copy()
+    pred_df["y_pred"] = all_preds
+    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+    
+    return aggregate_metrics, all_preds, all_true
+
+
+# =======================================================================
+#  MISSING FUNCTION: run_mlp_early_fusion_fusion
+# =======================================================================
+
+def run_mlp_early_fusion_fusion(train_features, val_features, test_features,
+                                train_with_audio, val_with_audio, test_with_audio,
+                                feature_cols_text, audio_feature_cols, args, out_dir: Path):
+    """
+    MLP EARLY FUSION - uses MLP as meta-model on concatenated text+audio features.
+    Uses audio features properly.
+    """
+    mlp_dir = out_dir / "mlp_early_fusion"
+    mlp_dir.mkdir(parents=True, exist_ok=True)
+    
+    from sklearn.neural_network import MLPClassifier, MLPRegressor
+    
+    # Combine text and audio data
+    all_text_data = pd.concat([train_features, val_features], ignore_index=True)
+    all_audio_data = pd.concat([train_with_audio, val_with_audio], ignore_index=True)
+    
+    # Concatenate text + audio features
+    X_all = np.concatenate([
+        all_text_data[feature_cols_text].to_numpy(),
+        all_audio_data[audio_feature_cols].to_numpy()
+    ], axis=1)
+    y_all = all_text_data['y_true'].values
+    
+    if args.test_frac == 0:
+        speakers = all_text_data.groupby("speaker_id")["y_true"].first().reset_index()
+        speakers.columns = ["speaker_id", "label"]
+        
+        if args.task == "classification":
+            cv = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+            fold_splits = list(cv.split(speakers, speakers["label"]))
+        else:
+            cv = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
+            fold_splits = list(cv.split(speakers))
+        
+        all_preds = []
+        all_true = []
+        fold_metrics = []
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+            train_speakers = speakers.iloc[train_idx]["speaker_id"].values
+            val_speakers = speakers.iloc[val_idx]["speaker_id"].values
+            
+            train_mask = all_text_data["speaker_id"].isin(train_speakers)
+            val_mask = all_text_data["speaker_id"].isin(val_speakers)
+            
+            X_train = X_all[train_mask]
+            y_train = y_all[train_mask]
+            X_val = X_all[val_mask]
+            y_val = y_all[val_mask]
+            
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+            
+            if args.task == "classification":
+                mlp = MLPClassifier(
+                    hidden_layer_sizes=(64, 32),
+                    activation='relu',
+                    max_iter=500,
+                    random_state=args.seed,
+                    early_stopping=True,
+                    validation_fraction=0.1
+                )
+            else:
+                mlp = MLPRegressor(
+                    hidden_layer_sizes=(64, 32),
+                    activation='relu',
+                    max_iter=500,
+                    random_state=args.seed,
+                    early_stopping=True,
+                    validation_fraction=0.1
+                )
+            mlp.fit(X_train_scaled, y_train)
+            preds = mlp.predict(X_val_scaled)
+            
+            fold_metrics.append(score_meta_model(None, preds, y_val, args.task))
+            all_preds.extend(preds)
+            all_true.extend(y_val)
+        
+        all_preds = np.array(all_preds)
+        all_true = np.array(all_true)
+        aggregate_metrics = score_meta_model(None, all_preds, all_true, args.task)
+        
+        fold_df = pd.DataFrame(fold_metrics)
+        fold_df.to_csv(mlp_dir / "mlp_early_fusion_fold_metrics.csv", index=False)
+        
+        with open(mlp_dir / "fusion_metrics.json", "w") as f:
+            json.dump(aggregate_metrics, f, indent=2)
+        
+        pred_df = all_text_data[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = all_preds
+        pred_df.to_csv(mlp_dir / "predictions.csv", index=False)
+        
+        return aggregate_metrics
+    else:
+        # Held-out test mode
+        X_train = X_all
+        y_train = y_all
+        X_test = np.concatenate([
+            test_features[feature_cols_text].to_numpy(),
+            test_with_audio[audio_feature_cols].to_numpy()
+        ], axis=1)
+        y_test = test_features["y_true"].to_numpy()
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        if args.task == "classification":
+            mlp = MLPClassifier(
+                hidden_layer_sizes=(64, 32),
+                activation='relu',
+                max_iter=500,
+                random_state=args.seed,
+                early_stopping=True,
+                validation_fraction=0.1
+            )
+        else:
+            mlp = MLPRegressor(
+                hidden_layer_sizes=(64, 32),
+                activation='relu',
+                max_iter=500,
+                random_state=args.seed,
+                early_stopping=True,
+                validation_fraction=0.1
+            )
+        mlp.fit(X_train_scaled, y_train)
+        preds = mlp.predict(X_test_scaled)
+        metrics = score_meta_model(None, preds, y_test, args.task)
+        
+        with open(mlp_dir / "fusion_metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        
+        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df["y_pred"] = preds
+        pred_df.to_csv(mlp_dir / "predictions.csv", index=False)
+        
+        return metrics
+ 
+# =======================================================================
+#  PARSER SETUP
+# =======================================================================
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Train per‑question models with ensemble meta-model and audio fusion")
     parser.add_argument("--asr-file", required=True)
@@ -3487,28 +4106,22 @@ def build_parser():
     
     # HPO settings
     parser.add_argument("--hpo-backend", choices=["grid", "random", "optuna"], default="optuna")
-    parser.add_argument("--hpo-n-trials", type=int, default=30)  
+    parser.add_argument("--hpo-n-trials", type=int, default=30)
     parser.add_argument("--hpo-timeout", type=int, default=None)
     parser.add_argument("--hpo-folds", type=int, default=5)
     parser.add_argument("--force-hpo", action="store_true")
     
-    # Meta-model settings - SINGLE MODEL
+    # Meta-model settings
     parser.add_argument("--meta-model", 
                         choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
                                 "ridge", "lasso", "elasticnet"],
-                        default="linear",
-                        help="Single meta-model to use (ignored if --use-ensemble is set)")
-    
-    # Ensemble settings
-    parser.add_argument("--use-ensemble", action="store_true",
-                        help="Use ensemble of multiple meta-models with voting/averaging")
+                        default="linear")
+    parser.add_argument("--use-ensemble", action="store_true")
     parser.add_argument("--ensemble-models", nargs="+",
                         choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn",
                                 "ridge", "lasso", "elasticnet"],
-                        default=["linear", "random_forest", "hist_gradient_boosting"],
-                        help="Models to include in ensemble")
-    parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None,
-                        help="Custom weights for ensemble members (default: equal weights)")
+                        default=["linear", "random_forest", "hist_gradient_boosting"])
+    parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None)
     
     # Model hyperparameters
     parser.add_argument("--n-estimators", type=int, default=500)
@@ -3538,32 +4151,29 @@ def build_parser():
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--delimiter", default=";")
     
-    # NEW: Audio features and fusion
-    parser.add_argument("--audio-features-csv", type=str, default=None,
-                        help="Path to CSV file with speaker-level audio features")
-    parser.add_argument("--audio-feature-cols", nargs="+", default=None,
-                        help="List of audio feature column names to use; if not provided, all numeric columns except speaker_id are used")
+    # Audio features and fusion
+    parser.add_argument("--audio-features-csv", type=str, default=None)
+    parser.add_argument("--audio-feature-cols", nargs="+", default=None)
     parser.add_argument("--fusion-methods", nargs="+", 
                         choices=["early", "late", "model_based", "text_only", "audio_only", "all"],
-                        default=["all"],
-                        help="Fusion methods to try. 'all' runs all applicable methods. When audio CSV is given, 'all' forces all five.")
+                        default=["all"])
     parser.add_argument("--audio-meta-model", 
                         choices=["linear", "random_forest", "svm", "hist_gradient_boosting", "gradient_boosting", "knn"],
-                        default="linear",
-                        help="Meta-model to use for audio-only and fusion models")
+                        default="linear")
     
-    # NEW: Novel fusion methods
+    # Novel fusion methods
     parser.add_argument("--fusion-novel", 
                         choices=["none", "confidence", "interaction", "moe", "mlp", "all"],
                         default="none",
-                        help="Novel fusion approach to use in addition to baselines. 'all' runs all four novel methods.")
+                        help="Novel fusion approach to use in addition to baselines")
     
     return parser
 
 
-# ----------------------------------------------------------------------
+# =======================================================================
 #  MAIN
-# ----------------------------------------------------------------------
+# =======================================================================
+
 def main():
     args = build_parser().parse_args()
     set_seed(args.seed)
@@ -3571,17 +4181,16 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
 
-    # ----- NEW: Remove stale per‑question score files to avoid column mismatch -----
+    # Remove stale files
     for f in out_dir.glob("*per_question_validation_scores.csv"):
         f.unlink()
         print(f"Removed stale score file: {f.name}")
 
-    # If audio CSV is provided, force fusion methods to all five (ignoring user input)
     if args.audio_features_csv is not None:
-        print("\nAudio features CSV provided. Running ALL fusion methods (text_only, audio_only, early, late, model_based).")
-        args.fusion_methods = ['all']  # this will trigger the 'all' behaviour
+        print("\nAudio features CSV provided. Running ALL fusion methods.")
+        args.fusion_methods = ['all']
 
-    # Check for existing results (only skip if we are NOT forcing HPO)
+    # Check for existing results
     selected_questions_file = out_dir / "selected_questions.csv"
     cv_k_results_file = out_dir / "cv_k_selection_results.csv"
     test_metrics_file = out_dir / "meta_test_metrics.json"
@@ -3602,33 +4211,25 @@ def main():
         
         with open(test_metrics_file, 'r') as f:
             existing_metrics = json.load(f)
-        
         print("Existing results summary:")
         print(json.dumps(existing_metrics, indent=2))
-        
-        # Also show selected questions
-        selected_df = pd.read_csv(selected_questions_file)
-        print(f"\nSelected {len(selected_df)} questions: {selected_df['question_id'].tolist()[:10]}...")
         return
     
-    # --- Full pipeline ---
+    # Full pipeline
     print("\n" + "="*60)
     print("STARTING FULL PIPELINE")
     print("="*60)
     
     cleanup_old_splits(splits_dir)
-    
-    # Save config
     (out_dir / "question_ensemble_config.json").write_text(json.dumps(vars(args), indent=2))
     
-    # Load full dataset
+    # Load data
     questions = [q.upper() for q in args.questions]
     df, metadata = load_examples(
         args.asr_file, args.demo_file, args.target_column, args.task,
         text_mode="question", min_text_chars=args.min_text_chars,
         filter_questions=questions, delimiter=args.delimiter
     )
-    
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     
     # Manage splits
@@ -3640,14 +4241,11 @@ def main():
     final_train, final_val, final_test = split_mgr.get_final_splits(df)
     print(f"Final splits: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
     
-    # Define best_hparams_path
+    # Hyperparameter search
     best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
-    
-    # Hyperparameter search on ALL questions
     if best_hparams_path.exists() and not args.force_hpo:
         best_hparams = json.loads(best_hparams_path.read_text())
         print(f"Loaded best hyperparameters from {best_hparams_path}")
-        print(f"Best parameters: {best_hparams}")
     else:
         try:
             best_hparams = hyperparameter_search_optuna_all_questions(
@@ -3666,9 +4264,8 @@ def main():
                 "warmup_ratio": args.warmup_ratio,
                 "max_length": args.max_length,
             }
-            print(f"Default parameters: {best_hparams}")
     
-    # Update args with best hyperparameters
+    # Update args
     args.learning_rate = best_hparams["learning_rate"]
     args.batch_size = best_hparams["batch_size"]
     args.epochs = best_hparams["epochs"]
@@ -3676,7 +4273,7 @@ def main():
     args.warmup_ratio = best_hparams.get("warmup_ratio", args.warmup_ratio)
     args.max_length = best_hparams.get("max_length", args.max_length)
     
-    # Train per‑question models
+    # Train per-question models
     embedding_files = train_question_models(
         final_train, final_val, final_test, metadata, args, best_hparams, out_dir
     )
@@ -3686,16 +4283,11 @@ def main():
     train_features, feature_cols = build_feature_table(embedding_files["train"], available_qs)
     val_features, _ = build_feature_table(embedding_files["val"], available_qs)
     
-    # Handle test features
-    test_features = None
     if args.test_frac > 0:
         test_features, _ = build_feature_table(embedding_files["test"], available_qs)
     else:
         print("test_frac=0: No test features will be created")
-        if train_features is not None and not train_features.empty:
-            test_features = pd.DataFrame(columns=train_features.columns)
-        else:
-            test_features = pd.DataFrame()
+        test_features = pd.DataFrame(columns=train_features.columns) if train_features is not None else pd.DataFrame()
     
     # Save raw feature tables
     train_features.to_csv(out_dir / "meta_train_features.csv", index=False)
@@ -3712,90 +4304,50 @@ def main():
         )
     
     # ============================================================
-    # CHOOSE TRAINING PATH BASED ON test_frac
+    # TRAIN META-MODEL (TEXT ONLY - THE BASELINE)
     # ============================================================
+    text_meta_model = None
+    text_selected_features = None
+    
     if args.test_frac == 0:
-        # Cross‑validation only (no held‑out test set)
+        # Cross-validation only
         results = train_meta_model_cv(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
-        
-        print("\n" + "="*60)
-        print("CROSS‑VALIDATION COMPLETE (test_frac=0)")
-        print("="*60)
-        print(f"Results saved to {out_dir}")
-        print(f"  - selected_questions.csv: Top {results['avg_best_k']} questions selected")
-        print(f"  - cv_k_selection_results.csv: K selection results")
-        print(f"  - meta_test_metrics.json: CV aggregate metrics")
-        print(f"  - final_cv_model.joblib: Final model trained on all data")
-        print(f"  - cv_summary_report.txt: Detailed CV report")
-        
+        # Load the final text model
+        model_path = out_dir / "final_cv_model.joblib"
+        if model_path.exists():
+            text_meta_model = joblib.load(model_path)
+            selected_df = pd.read_csv(out_dir / "final_selected_features.csv")
+            text_selected_features = selected_df["feature"].tolist()
+            print(f"  Loaded text model from CV training: {model_path}")
     else:
-        # Standard training with held‑out test set
+        # Held-out test mode
         test_features.to_csv(out_dir / "meta_test_features.csv", index=False)
-        
-        # Train meta‑model WITH CV‑based K selection
         results = train_meta_model_with_cv_selection(
             train_features, val_features, test_features, feature_cols, args, out_dir
         )
-        
-        print("\n" + "="*60)
-        print("HELD‑OUT TEST EVALUATION COMPLETE (test_frac > 0)")
-        print("="*60)
-        print(f"Results saved to {out_dir}")
-        print(f"  - selected_questions.csv: Top {results['best_k']} questions selected")
-        print(f"  - cv_k_selection_results.csv: K selection results from CV")
-        print(f"  - meta_test_metrics.json: Held‑out test metrics")
-        print(f"  - meta_model.joblib: Final meta‑model")
-        print(f"\nTest Metrics:")
-        print(json.dumps(results['test_metrics'], indent=2))
-
+        model_path = out_dir / "meta_model.joblib"
+        if model_path.exists():
+            text_meta_model = joblib.load(model_path)
+            selected_df = pd.read_csv(out_dir / "selected_embedding_features.csv")
+            text_selected_features = selected_df["feature"].tolist()
+            print(f"  Loaded text model from held-out training: {model_path}")
+    
     # ============================================================
-    # SAFE DISPLAY OF PER‑QUESTION SCORES (with error handling)
-    # ============================================================
-    score_files = list(out_dir.glob("*per_question_validation_scores.csv"))
-    if score_files:
-        print("\n" + "="*60)
-        print("PER‑QUESTION VALIDATION SCORES SUMMARY")
-        print("="*60)
-        for score_file in score_files:
-            try:
-                df = pd.read_csv(score_file)
-            except Exception as e:
-                print(f"  Skipping {score_file.name}: could not read ({e})")
-                continue
-
-            if 'validation_score' not in df.columns:
-                print(f"  Skipping {score_file.name}: missing 'validation_score' column (columns: {df.columns.tolist()})")
-                continue
-
-            if df.empty:
-                print(f"  {score_file.name}: empty file")
-                continue
-
-            print(f"\n{score_file.name}:")
-            print(f"  Questions evaluated: {len(df)}")
-            print(f"  Mean score: {df['validation_score'].mean():.4f}")
-            print(f"  Std score: {df['validation_score'].std():.4f}")
-            print(f"  Top 5 questions:")
-            print(df.head(5)[['question_id', 'validation_score']].to_string(index=False))
-
-    # ============================================================
-    # AUDIO FEATURE FUSION EXPERIMENTS – always runs all 5 methods + novel
+    # AUDIO FEATURE FUSION EXPERIMENTS
     # ============================================================
     if args.audio_features_csv is not None:
         print("\n" + "="*60)
         print("RUNNING AUDIO FEATURE FUSION EXPERIMENTS")
         print("="*60)
         try:
-            # Load audio features
             audio_df = load_audio_features(
                 args.audio_features_csv,
                 speaker_col="speaker_id",
                 exclude_cols=args.audio_feature_cols
             )
             
-            # Update audio feature columns if specified
             if args.audio_feature_cols is not None:
                 keep_cols = ["speaker_id"] + args.audio_feature_cols
                 missing = [c for c in args.audio_feature_cols if c not in audio_df.columns]
@@ -3803,10 +4355,12 @@ def main():
                     print(f"Warning: Some specified audio feature columns not found: {missing}")
                 audio_df = audio_df[keep_cols].copy()
             
-            # Run fusion experiments (now with novel methods)
+            # Run ALL fusion experiments with the existing text model
             fusion_results = run_fusion_experiments(
                 train_features, val_features, test_features,
-                feature_cols, audio_df, args, out_dir
+                feature_cols, audio_df, args, out_dir,
+                text_meta_model=text_meta_model,
+                text_selected_features=text_selected_features
             )
             
             print("\nFusion experiments completed. Results saved in fusion_results/")
@@ -3818,10 +4372,10 @@ def main():
     else:
         print("\nNo audio features CSV provided. Skipping fusion experiments.")
     
-    # Cleanup temporary directories
+    # Cleanup
     cleanup_temp_dirs(out_dir)
     
-    # Print ensemble info if used
+    # Print ensemble info
     if args.use_ensemble:
         print("\n" + "=" * 50)
         print("ENSEMBLE SUMMARY")
@@ -3833,59 +4387,6 @@ def main():
         else:
             print(f"Final model: {out_dir / 'meta_model.joblib'}")
 
+
 if __name__ == "__main__":
     main()
-'''
-How to run
-Example with a novel method:
-
-bash
-python question_ensemble_fusion.py \
-    --asr-file data/asr.csv \
-    --demo-file data/demo.csv \
-    --target-column label \
-    --task classification \
-    --output-dir results \
-    --splits-dir splits \
-    --audio-features-csv data/audio_features.csv \
-    --fusion-novel interaction \
-    --force-hpo
-To run all novel methods:
-
-bash
---fusion-novel all
-If you want only the standard baselines (no novel), omit --fusion-novel (default none).
-
-Output structure
-text
-results/
-├── fusion_results/
-│   ├── text_only/               # baseline
-│   ├── audio_only/              # baseline
-│   ├── early_fusion/            # baseline
-│   ├── late_fusion/             # baseline
-│   ├── model_based_fusion/      # baseline
-│   ├── confidence_weighted_fusion/   # novel (if selected)
-│   ├── interaction_stacking/         # novel
-│   ├── mixture_of_experts/           # novel
-│   ├── mlp_early_fusion/             # novel
-│   └── fusion_summary.csv            # comparison of all run methods
-Each subfolder contains:
-
-fusion_metrics.json – primary and detailed metrics.
-
-predictions.csv – speaker‑level predictions (and probabilities for classification).
-
-Per‑fold metrics (if CV mode).
-
-What to check if fusion results are still missing
-Audio CSV loading – the script now prints clear errors if the file is missing, has no speaker_id, or no numeric columns.
-
-Speaker overlap – if there is no overlap between text and audio speakers, the merge will produce empty data, and the fusion functions will fail. The script will print an error.
-
-Insufficient speakers for CV – if you have fewer speakers than --n-cv-folds (default 5), reduce it with --n-cv-folds 2.
-
-Always run with --force-hpo when adding novel methods to ensure a fresh run.
-
-
-'''
