@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
 
 class TextDataset(Dataset):
@@ -67,16 +67,28 @@ def load_tokenizer(model_name):
             return tokenizer
 
 
-def load_model(model_name: str, task: str, num_labels: int, metadata: dict):
+def load_model(model_name: str, task: str, dropout_rate: float, num_labels: int, metadata: dict):
+    # Load and modify config
+    config = AutoConfig.from_pretrained(model_name)
+
+    # Apply dropout from cfg (if available)
+    if hasattr(cfg, 'dropout_rate'):
+        config.hidden_dropout_prob = dropout_rate
+        config.attention_probs_dropout_prob = dropout_rate
+        if hasattr(config, 'classifier_dropout'):
+            config.classifier_dropout = dropout_rate
+
+    # Set task‑specific attributes
     if task == "classification":
-        return AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels,
-            id2label={int(k): v for k, v in metadata["id2label"].items()},
-            label2id=metadata["label2id"],
-        )
+        config.num_labels = num_labels
+        config.id2label = {int(k): v for k, v in metadata["id2label"].items()}
+        config.label2id = metadata["label2id"]
+    else:
+        config.num_labels = 1
+        config.problem_type = "regression"
+
+    # Instantiate model with custom config
     return AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        num_labels=1,
-        problem_type="regression",
+        config=config,
     )

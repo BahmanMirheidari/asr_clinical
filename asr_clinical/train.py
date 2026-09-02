@@ -123,13 +123,23 @@ def train_one_fold(
     device = choose_device()
     tokenizer = load_tokenizer(cfg.model_name)
     num_labels = len(metadata["labels"]) if cfg.task == "classification" else 1
-    model = load_model(cfg.model_name, cfg.task, num_labels, metadata).to(device)
+    model = load_model(cfg.model_name, cfg.task, cfg.dropout_rate, num_labels, metadata).to(device)
 
     train_loader = make_loader(train_df, tokenizer, cfg, shuffle=True)
     val_loader = make_loader(val_df, tokenizer, cfg, shuffle=False)
 
     class_weight_tensor = class_weights_for(train_df["label"], num_labels, device, cfg)
-    loss_fn = make_loss(cfg.task, cfg.loss, class_weight_tensor, cfg.focal_gamma)
+    # NEW: Use label smoothing if classification and loss is 'ce'
+    if cfg.task == "classification" and cfg.loss == "ce" and cfg.label_smoothing > 0:
+        # Override loss function with built-in label smoothing
+        loss_fn = torch.nn.CrossEntropyLoss(
+            weight=class_weight_tensor,
+            label_smoothing=cfg.label_smoothing
+        )
+    else:
+        # Use the custom loss (focal or ce without smoothing)
+        loss_fn = make_loss(cfg.task, cfg.loss, class_weight_tensor, cfg.focal_gamma)
+
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     total_steps = max(1, len(train_loader) * cfg.epochs)
     warmup_steps = int(total_steps * cfg.warmup_ratio)
@@ -150,7 +160,8 @@ def train_one_fold(
             logits = outputs.logits.squeeze(-1) if cfg.task == "regression" else outputs.logits
             loss = loss_fn(logits, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # NEW: Use cfg.gradient_clip_val instead of hardcoded 1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_val)
             optimizer.step()
             scheduler.step()
             losses.append(float(loss.detach().cpu()))
@@ -194,7 +205,6 @@ def train_one_fold(
     metrics = score_predictions(pred_df, cfg.task, cfg.aggregate_level, metadata.get("labels"))
     (fold_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics, pred_df, model, tokenizer, device
-
 
 @torch.no_grad()
 def predict(model, tokenizer, df: pd.DataFrame, cfg: TrainConfig, metadata: dict, device):

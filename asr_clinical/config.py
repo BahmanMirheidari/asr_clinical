@@ -35,6 +35,9 @@ class TrainConfig:
     question_importance: bool = False
     min_text_chars: int = 1
     regression_metric: str = "rmse"
+    label_smoothing: float = 0.0
+    gradient_clip_val: float = 1.0
+    dropout_rate: float = 0.1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--folds-file", default=None)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--gradient_clip_val", type=float, default=1.0)
+    parser.add_argument("--dropout_rate", type=float, default=0.1) 
+    parser.add_argument("--patience", type=int, default=2) 
+
+
     parser.add_argument("--regression-metric", choices=["mae", "rmse"], default="rmse",
                         help="Metric to optimize for regression tasks (default: rmse)")
     parser.add_argument(
