@@ -1171,11 +1171,14 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
 
 
 # =======================================================================
-# FEATURE TABLE BUILDING
+# FEATURE TABLE BUILDING Smart Fill - Use Question Averages
+# Instead of filling with zeros, fill with the question's average embedding:
 # =======================================================================
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     tables = []
+    question_means = {}  # Store mean embedding per question
+    
     for q in questions:
         path = embedding_paths.get(q)
         if path is None or not Path(path).exists():
@@ -1199,8 +1202,10 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
             grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
             grouped[f"{q}__present"] = 1.0
             
-            print(f"  ✓ {q}: {len(grouped)} speakers")
+            # Store mean embedding for this question (for filling)
+            question_means[q] = grouped[[f"{q}__{col}" for col in emb_cols]].mean()
             
+            print(f"  ✓ {q}: {len(grouped)} speakers")
             tables.append(grouped)
         except Exception as e:
             print(f"Error processing embeddings for question {q}: {e}")
@@ -1209,28 +1214,25 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
     if not tables:
         raise ValueError("No embedding tables available.")
     
-    all_speakers = set()
-    for t in tables:
-        all_speakers.update(t.index)
-    print(f"  Total unique speakers across all questions: {len(all_speakers)}")
-    
-    for i, t in enumerate(tables):
-        q_name = questions[i] if i < len(questions) else f"Q{i+1}"
-        missing = all_speakers - set(t.index)
-        if missing:
-            print(f"  ⚠️ {q_name} missing {len(missing)} speakers: {missing}")
-    
-    # Use INNER join to keep only speakers with ALL questions
+    # OUTER join to keep all speakers
     merged = tables[0]
     for t in tables[1:]:
-        merged = merged.join(t.drop(columns=["y_true"]), how="inner")
+        merged = merged.join(t.drop(columns=["y_true"]), how="outer")
         merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
     
-    print(f"  After INNER join: {len(merged)} speakers")
+    print(f"  After OUTER join: {len(merged)} speakers")
+    
+    # Fill missing values with question means (not zeros)
+    for q in questions:
+        if q in question_means:
+            q_cols = [c for c in merged.columns if c.startswith(f"{q}__")]
+            for col in q_cols:
+                if col in question_means[q]:
+                    merged[col] = merged[col].fillna(question_means[q][col])
     
     merged = merged.reset_index()
     feature_cols = [c for c in merged.columns if "__" in c]
-    merged[feature_cols] = merged[feature_cols].fillna(0.0)
+    merged[feature_cols] = merged[feature_cols].fillna(0.0)  # Fallback
     return merged, feature_cols
 
 
