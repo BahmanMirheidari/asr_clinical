@@ -128,24 +128,22 @@ def cleanup_temp_dirs(temp_dir: Path):
 # MODEL CREATION FUNCTIONS WITH IMBALANCE HANDLING
 # =======================================================================
 
+
 def create_balanced_pipeline(base_model, args, method='smote'):
     """
-    Wrap a model with imbalance handling techniques.
-    
-    Args:
-        base_model: The base model (classifier)
-        args: Arguments with imbalance settings
-        method: 'smote', 'adasyn', 'smote_tomek', or None
-    
-    Returns:
-        Pipeline with imbalance handling
+    Wrap a SINGLE model with SMOTE.
+    Do NOT use this on VotingClassifier.
     """
     if args.task != "classification":
         return base_model
     
-    # Check if we should use imbalance handling
     use_imbalance = getattr(args, 'use_smote', False)
     if not use_imbalance:
+        return base_model
+    
+    # ✅ DON'T WRAP VOTING CLASSIFIER
+    if isinstance(base_model, VotingClassifier):
+        print("  ⚠️ Skipping SMOTE wrap on VotingClassifier (already applied to individual models)")
         return base_model
     
     # Get SMOTE parameters
@@ -337,20 +335,26 @@ def create_gradient_boosting(task, args):
 
 def create_hist_gradient_boosting(task, args):
     if task == "classification":
+        # Get xgb_lr with fallback
+        xgb_lr = getattr(args, 'xgb_lr', 0.1)
+        max_depth = getattr(args, 'max_depth', None)
+        
         base_model = HistGradientBoostingClassifier(
             max_iter=args.n_estimators,
-            learning_rate=args.xgb_lr,
-            max_depth=getattr(args, 'max_depth', None),
+            learning_rate=xgb_lr,
+            max_depth=max_depth,
             random_state=args.seed,
             verbose=0,
             class_weight="balanced"
         )
         return create_balanced_pipeline(base_model, args)
     else:
+        xgb_lr = getattr(args, 'xgb_lr', 0.1)
+        max_depth = getattr(args, 'max_depth', None)
         return HistGradientBoostingRegressor(
             max_iter=args.n_estimators,
-            learning_rate=args.xgb_lr,
-            max_depth=getattr(args, 'max_depth', None),
+            learning_rate=xgb_lr,
+            max_depth=max_depth,
             random_state=args.seed,
             verbose=0
         )
@@ -433,12 +437,16 @@ def create_ensemble_model(task, args):
     
     print(f"\nCreating ensemble for {task} task with models: {ensemble_models}")
     
+    # Get SMOTE flag
+    use_smote = getattr(args, 'use_smote', False)
+    
     for model_name in ensemble_models:
         if model_name not in model_creators:
             print(f"  ✗ Unknown model '{model_name}', skipping")
             continue
         
         try:
+            # Create model with SMOTE applied INSIDE (if enabled)
             model = model_creators[model_name](task, args)
             estimators.append((model_name, model))
             successful_models.append(model_name)
@@ -459,8 +467,10 @@ def create_ensemble_model(task, args):
             n_jobs=-1
         )
         print(f"\n✓ Created CLASSIFICATION ensemble with {len(estimators)} models")
-        # Wrap ensemble with imbalance handling
-        return create_balanced_pipeline(ensemble, args)
+        
+        # ✅ DON'T WRAP ENSEMBLE WITH SMOTE
+        # Each individual model already has SMOTE applied inside it
+        return ensemble
     else:
         ensemble = VotingRegressor(
             estimators=estimators,
@@ -474,24 +484,25 @@ def create_ensemble_model(task, args):
 def make_meta_model(args):
     """Create meta-model with optional SMOTE balancing."""
     
-    # Check if we should use SMOTE
     use_smote = getattr(args, 'use_smote', False)
     
     if getattr(args, 'use_ensemble', False):
         print("\n" + "=" * 50)
         print("CREATING ENSEMBLE META-MODEL")
         print("=" * 50)
-        base_ensemble = create_ensemble_model(args.task, args)
         
+        # Create ensemble (each model already has SMOTE inside if enabled)
+        ensemble = create_ensemble_model(args.task, args)
+        
+        # ✅ DON'T WRAP ENSEMBLE WITH SMOTE AGAIN
+        print(f"  ✅ Ensemble created with {len(ensemble.estimators)} models")
         if use_smote and args.task == "classification":
-            print("  🔄 Wrapping ensemble with SMOTE pipeline")
-            return create_balanced_pipeline(base_ensemble, args)
-        else:
-            return base_ensemble
+            print("  ℹ️ SMOTE is applied to individual models inside the ensemble")
+        return ensemble
     else:
         print(f"\nCreating single meta-model: {args.meta_model}")
         
-        # Get the base model
+        # Get the base model with SMOTE applied
         if args.meta_model == "linear":
             base_model = create_linear_model(args.task, args)
         elif args.meta_model == "ridge":
@@ -514,12 +525,8 @@ def make_meta_model(args):
             print(f"Unknown meta_model {args.meta_model}, falling back to linear")
             base_model = create_linear_model(args.task, args)
         
-        # Wrap with SMOTE if requested
-        if use_smote and args.task == "classification":
-            print("  🔄 Wrapping model with SMOTE pipeline")
-            return create_balanced_pipeline(base_model, args)
-        else:
-            return base_model
+        # ✅ SMOTE is already applied inside the model creator
+        return base_model
 
 
 # =======================================================================
@@ -576,11 +583,22 @@ def find_optimal_threshold(model, X_val, y_val, metric='f1'):
 
 
 def predict_with_threshold(model, X, threshold=0.5):
-    """Predict using a custom threshold."""
+    """
+    Predict using a custom threshold.
+    
+    Returns:
+        pred: 1D array of predictions
+        proba: 2D array of probabilities (if available)
+    """
     if hasattr(model, "predict_proba"):
         try:
-            y_proba = model.predict_proba(X)[:, 1]
-            return (y_proba >= threshold).astype(int), y_proba
+            proba = model.predict_proba(X)
+            if proba.shape[1] == 2:
+                pred = (proba[:, 1] >= threshold).astype(int)
+                return pred, proba  # ✅ Return 2D probabilities
+            else:
+                pred = np.argmax(proba, axis=1)
+                return pred, proba
         except:
             return model.predict(X), None
     else:
@@ -1426,15 +1444,29 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
     
     model.fit(Xtr, ytr)
     
-    # Find optimal threshold on validation data
+    # Get predictions and probabilities
     if args.task == "classification":
+        # Find optimal threshold
         best_threshold, best_score = find_optimal_threshold(
             model, Xva, yva, metric='f1'
         )
         print(f"  Optimal threshold: {best_threshold:.3f} (score: {best_score:.4f})")
         
-        # Use threshold for final predictions
-        pred, proba = predict_with_threshold(model, Xva, best_threshold)
+        # Get predictions with threshold
+        if hasattr(model, "predict_proba"):
+            try:
+                proba = model.predict_proba(Xva)
+                if proba.shape[1] == 2:
+                    pred = (proba[:, 1] >= best_threshold).astype(int)
+                else:
+                    pred = np.argmax(proba, axis=1)
+                # ✅ proba is 2D - will be saved correctly
+            except:
+                pred = model.predict(Xva)
+                proba = None
+        else:
+            pred = model.predict(Xva)
+            proba = None
     else:
         pred = model.predict(Xva)
         proba = None
@@ -1442,36 +1474,48 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
     
     metrics = score_meta_model(model, Xva, yva, args.task, threshold=best_threshold or 0.5)
     
-    # Store threshold info in metrics
+    # ✅ Store threshold info
     if args.task == "classification":
         metrics['optimal_threshold'] = best_threshold
         metrics['threshold_score'] = best_score
     
-    return model, pred, proba, metrics, selected
-
-
-def aggregate_oof_predictions(oof_df, args):
-    """Calculate the final result from the pooled predictions."""
-    oof_df = oof_df.sort_values("speaker_id").reset_index(drop=True)
-    y_true = oof_df["y_true"].to_numpy()
-    y_pred = oof_df["y_pred"].to_numpy()
-
-    metrics = score_meta_model(None, y_pred, y_true, args.task)
-    if args.task == "classification" and "y_proba" in oof_df.columns:
-        probs = oof_df["y_proba"].to_numpy()
-        try:
-            metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
-        except Exception:
-            pass
-    return metrics
-
+    return model, pred, proba, metrics, selected 
 
 def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
     """Primary leakage-safe text experiment with 5-fold OOF evaluation."""
+    print(f"\n  Entering leakage_safe_text_cv()")
+    print(f"  trainval_df shape: {trainval_df.shape}")
+    print(f"  Number of speakers: {trainval_df.speaker_id.nunique()}")
+    print(f"  Questions: {args.questions}")
+    print(f"  Top K: {args.top_k}")
+
     out_dir = Path(out_dir)
     cv_dir = out_dir / "leakage_safe_5fold"
     cv_dir.mkdir(parents=True, exist_ok=True)
     questions = [q.upper() for q in args.questions]
+    print(f"  Questions after upper: {questions}")
+    
+    # Check if data exists
+    if trainval_df.empty:
+        print("  ❌ trainval_df is empty!")
+        return None
+
+    # Check if required columns exist
+    required_cols = ['speaker_id', 'label', 'question_id']
+    missing = [c for c in required_cols if c not in trainval_df.columns]
+    if missing:
+        print(f"  ❌ Missing columns: {missing}")
+        return None
+    
+    print(f"  Creating speaker-level folds...")
+    try:
+        folds = make_outer_folds(trainval_df, args)
+        print(f"  Created {len(folds)} folds")
+    except Exception as e:
+        print(f"  ❌ Failed to create folds: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
     folds = make_outer_folds(trainval_df, args)
     oof_rows = []
@@ -1682,101 +1726,355 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
 
     return model, train_features, test_features, selected_cols, test_metrics
 
+# =======================================================================
+# AGGREGATE OOF PREDICTIONS
+# =======================================================================
+
+def aggregate_oof_predictions(oof_df, args):
+    """
+    Calculate aggregate metrics from OOF predictions.
+    
+    Args:
+        oof_df: DataFrame with columns ['speaker_id', 'y_true', 'y_pred', 'y_proba']
+        args: Command line arguments
+    
+    Returns:
+        dict: Aggregate metrics
+    """
+    print("    Aggregating OOF predictions...")
+    
+    # Check if oof_df is valid
+    if oof_df is None or oof_df.empty:
+        print("    ❌ OOF DataFrame is empty!")
+        return {}
+    
+    print(f"    OOF shape: {oof_df.shape}")
+    
+    # Check for required columns
+    required_cols = ['y_true', 'y_pred']
+    missing = [c for c in required_cols if c not in oof_df.columns]
+    if missing:
+        print(f"    ❌ Missing columns: {missing}")
+        return {}
+    
+    # Extract predictions and true labels
+    y_true = oof_df["y_true"].to_numpy()
+    y_pred = oof_df["y_pred"].to_numpy()
+    
+    print(f"    y_true shape: {y_true.shape}, unique: {np.unique(y_true)}")
+    print(f"    y_pred shape: {y_pred.shape}, unique: {np.unique(y_pred)}")
+    
+    # Calculate metrics based on task
+    if args.task == "classification":
+        from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score, confusion_matrix
+        
+        metrics = {}
+        
+        try:
+            metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
+            metrics["macro_f1"] = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
+            metrics["weighted_f1"] = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
+            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
+        except Exception as e:
+            print(f"    ⚠️ Basic metrics failed: {e}")
+        
+        # Binary classification metrics
+        if len(np.unique(y_true)) == 2:
+            try:
+                tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+                metrics["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                metrics["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                metrics["precision"] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                metrics["npv"] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+                metrics["accuracy"] = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+                metrics["f1"] = 2 * (metrics["precision"] * metrics["sensitivity"]) / (metrics["precision"] + metrics["sensitivity"]) if (metrics["precision"] + metrics["sensitivity"]) > 0 else 0.0
+                metrics["confusion_matrix"] = [[int(tn), int(fp)], [int(fn), int(tp)]]
+            except Exception as e:
+                print(f"    ⚠️ Binary metrics failed: {e}")
+        
+        # ROC AUC if probabilities available
+        if "y_proba" in oof_df.columns:
+            try:
+                probs = oof_df["y_proba"].to_numpy()
+                # Clip to [0,1] range
+                probs = np.clip(probs, 0, 1)
+                if len(np.unique(y_true)) == 2:
+                    metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
+                else:
+                    metrics["roc_auc_ovr"] = float(roc_auc_score(y_true, probs, multi_class='ovr', average='macro'))
+            except Exception as e:
+                print(f"    ⚠️ AUC calculation failed: {e}")
+        
+        return metrics
+    
+    else:
+        # Regression metrics
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        
+        metrics = {}
+        
+        try:
+            metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+            metrics["mae"] = float(mean_absolute_error(y_true, y_pred))
+            metrics["r2"] = float(r2_score(y_true, y_pred))
+        except Exception as e:
+            print(f"    ⚠️ Regression metrics failed: {e}")
+        
+        return metrics
 
 # =======================================================================
 # AUDIO-ONLY CV
 # =======================================================================
 
 def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
-    """Train audio-only model with leakage-safe 5-fold CV."""
+    """
+    Train audio-only model with leakage-safe 5-fold CV.
+    
+    This function:
+    1. Uses the same speaker-level folds as the main pipeline
+    2. Trains a meta-model on audio features only
+    3. Finds optimal classification threshold per fold
+    4. Saves OOF predictions and metrics
+    5. Returns aggregate metrics
+    
+    Args:
+        audio_df: DataFrame with audio features (speaker_id + feature columns)
+        trainval_df: DataFrame with speaker labels (speaker_id + label)
+        args: Command line arguments
+        out_dir: Output directory
+    
+    Returns:
+        dict: Contains aggregate_metrics, fold_metrics, oof_predictions, cv_dir
+    """
     out_dir = Path(out_dir)
     audio_dir = out_dir / "audio_only"
     audio_dir.mkdir(parents=True, exist_ok=True)
     
+    # Get audio feature columns (everything except speaker_id)
     audio_feature_cols = get_audio_feature_cols(audio_df)
+    print(f"\n  Audio-only CV with {len(audio_feature_cols)} audio features")
     
-    # Get labels
+    # Get labels for all speakers
     labels = trainval_df.groupby("speaker_id")["label"].first().rename("y_true").reset_index()
     audio_with_labels = audio_df.merge(labels, on="speaker_id", how="inner")
     
     if len(audio_with_labels) < 10:
-        print("  ⚠️ Not enough audio samples for CV")
+        print("  ⚠️ Not enough audio samples for CV (need at least 10)")
         return None
     
-    # Create speaker-level folds
-    folds = make_outer_folds(trainval_df, args)
+    print(f"  Audio samples with labels: {len(audio_with_labels)} speakers")
     
+    # Check class distribution
+    if args.task == "classification":
+        class_counts = audio_with_labels["y_true"].value_counts()
+        print(f"  Class distribution: {dict(class_counts)}")
+        if len(class_counts) < 2:
+            print("  ⚠️ Only one class present in audio data - skipping CV")
+            return None
+    
+    # Create speaker-level folds (leakage-safe)
+    folds = make_outer_folds(trainval_df, args)
+    print(f"  Running {len(folds)}-fold CV")
+    
+    # Storage for OOF predictions and fold metrics
     oof_rows = []
     fold_metrics = []
+    fold_details = []
     
     for fold_idx, (outer_train, outer_val) in enumerate(folds):
         fold_dir = audio_dir / f"fold_{fold_idx}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         
+        # Get speaker IDs for this fold
         train_speakers = set(outer_train.speaker_id)
         val_speakers = set(outer_val.speaker_id)
         
+        print(f"\n  Fold {fold_idx + 1}/{len(folds)}:")
+        print(f"    Train speakers: {len(train_speakers)}")
+        print(f"    Val speakers: {len(val_speakers)}")
+        
+        # Split audio data by speaker
         atr = audio_with_labels[audio_with_labels.speaker_id.isin(train_speakers)].copy()
         ava = audio_with_labels[audio_with_labels.speaker_id.isin(val_speakers)].copy()
         
-        if len(atr) < 5 or len(ava) < 2:
-            print(f"  Fold {fold_idx}: insufficient audio data (train={len(atr)}, val={len(ava)})")
+        # Check if we have enough data
+        if len(atr) < 3 or len(ava) < 2:
+            print(f"    ⚠️ Insufficient audio data: train={len(atr)}, val={len(ava)} - skipping fold")
             continue
         
+        # Prepare features and labels
         Xtr = atr[audio_feature_cols].to_numpy(dtype=float)
         Xva = ava[audio_feature_cols].to_numpy(dtype=float)
         ytr = atr["y_true"].to_numpy()
         yva = ava["y_true"].to_numpy()
         
-        model = make_meta_model(args)
-        model.fit(Xtr, ytr)
+        # Handle NaN values
+        Xtr = np.nan_to_num(Xtr, nan=0.0, posinf=0.0, neginf=0.0)
+        Xva = np.nan_to_num(Xva, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Find optimal threshold for audio-only model
+        print(f"    Training data: Xtr={Xtr.shape}, ytr={ytr.shape}")
         if args.task == "classification":
+            print(f"    Train class distribution: {np.bincount(ytr.astype(int))}")
+        
+        # Create and train meta-model
+        try:
+            model = make_meta_model(args)
+            model.fit(Xtr, ytr)
+            print(f"    Model trained successfully")
+        except Exception as e:
+            print(f"    ❌ Model training failed: {e}")
+            continue
+        
+        # Get predictions with threshold tuning for classification
+        if args.task == "classification":
+            # Find optimal threshold on validation data
             best_threshold, best_score = find_optimal_threshold(
                 model, Xva, yva, metric='f1'
             )
-            print(f"  Audio-only optimal threshold: {best_threshold:.3f} (score: {best_score:.4f})")
-            pred, proba = predict_with_threshold(model, Xva, best_threshold)
+            print(f"    Optimal threshold: {best_threshold:.3f} (F1 score: {best_score:.4f})")
+            
+            # Get predictions with threshold
+            if hasattr(model, "predict_proba"):
+                try:
+                    proba = model.predict_proba(Xva)
+                    if proba.shape[1] == 2:
+                        pred = (proba[:, 1] >= best_threshold).astype(int)
+                    else:
+                        pred = np.argmax(proba, axis=1)
+                    print(f"    Prediction distribution: {np.bincount(pred)}")
+                except Exception as e:
+                    print(f"    ⚠️ Could not get probabilities: {e}")
+                    pred = model.predict(Xva)
+                    proba = None
+            else:
+                pred = model.predict(Xva)
+                proba = None
         else:
+            # Regression - no threshold tuning
             pred = model.predict(Xva)
             proba = None
             best_threshold = None
+            best_score = None
         
-        metrics = score_meta_model(model, Xva, yva, args.task, threshold=best_threshold or 0.5)
-        fold_metrics.append({"fold": fold_idx, **{k: v for k, v in metrics.items() if isinstance(v, (int, float))}})
+        # Calculate metrics with threshold
+        metrics = score_meta_model(
+            model, Xva, yva, args.task, 
+            threshold=best_threshold if best_threshold is not None else 0.5
+        )
         
+        # Store fold metrics (only numeric values)
+        fold_metric_row = {"fold": fold_idx}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                fold_metric_row[k] = float(v)
+        fold_metrics.append(fold_metric_row)
+        
+        # Store details for summary
+        fold_details.append({
+            "fold": fold_idx,
+            "train_speakers": len(train_speakers),
+            "val_speakers": len(val_speakers),
+            "train_samples": len(Xtr),
+            "val_samples": len(Xva),
+            "optimal_threshold": float(best_threshold) if best_threshold is not None else None,
+            "threshold_score": float(best_score) if best_score is not None else None,
+        })
+        
+        # Create output dataframe for this fold
         out_df = ava[["speaker_id", "y_true"]].copy()
         out_df["fold"] = fold_idx
         out_df["y_pred"] = pred
-        if proba is not None and proba.ndim == 2 and proba.shape[1] == 2:
-            out_df["y_proba"] = proba[:, 1]
+        
+        # Save probabilities if available
+        if args.task == "classification" and proba is not None:
+            if proba.ndim == 2 and proba.shape[1] == 2:
+                out_df["y_proba"] = proba[:, 1]
+            elif proba.ndim == 1:
+                out_df["y_proba"] = proba
+            else:
+                # Try to get probabilities again
+                try:
+                    full_proba = model.predict_proba(Xva)
+                    if full_proba.shape[1] == 2:
+                        out_df["y_proba"] = full_proba[:, 1]
+                except:
+                    pass
+        
+        # Add to OOF collection
         oof_rows.append(out_df)
         
+        # Save fold results
         joblib.dump(model, fold_dir / "model.joblib")
         out_df.to_csv(fold_dir / "predictions.csv", index=False)
+        
+        # Save fold metrics
+        with open(fold_dir / "metrics.json", "w") as f:
+            json.dump(convert_to_serializable(metrics), f, indent=2)
+        
+        # Print fold summary
+        if args.task == "classification":
+            print(f"    Fold metrics: accuracy={metrics.get('accuracy', 0):.4f}, "
+                  f"f1={metrics.get('f1', 0):.4f}, "
+                  f"auc={metrics.get('roc_auc', 0):.4f}")
+        else:
+            print(f"    Fold metrics: rmse={metrics.get('rmse', 0):.4f}, "
+                  f"r2={metrics.get('r2', 0):.4f}")
     
+    # Check if we have any results
     if not oof_rows:
-        print("  ❌ No audio-only predictions generated")
+        print("\n  ❌ No audio-only predictions generated - all folds failed")
         return None
     
+    # Aggregate OOF predictions
+    print(f"\n  Aggregating {len(oof_rows)} folds of predictions...")
     oof = pd.concat(oof_rows, ignore_index=True)
+    
+    # Verify no speaker leakage in OOF
+    speaker_counts = oof.groupby("speaker_id").size()
+    if not (speaker_counts == 1).all():
+        print(f"  ⚠️ Warning: Some speakers appear in multiple folds: {speaker_counts[speaker_counts > 1]}")
+        # Keep only one prediction per speaker (first occurrence)
+        oof = oof.drop_duplicates(subset=["speaker_id"], keep="first")
+    
+    print(f"  OOF predictions: {len(oof)} speakers")
+    
+    # Calculate aggregate metrics
     aggregate_metrics = aggregate_oof_predictions(oof, args)
     
-    pd.DataFrame(fold_metrics).to_csv(audio_dir / "fold_metrics.csv", index=False)
+    # Save OOF results
     oof.to_csv(audio_dir / "oof_predictions.csv", index=False)
-    (audio_dir / "aggregate_metrics.json").write_text(
-        json.dumps(convert_to_serializable(aggregate_metrics), indent=2)
-    )
+    
+    # Save fold metrics
+    pd.DataFrame(fold_metrics).to_csv(audio_dir / "fold_metrics.csv", index=False)
+    
+    # Save fold details
+    pd.DataFrame(fold_details).to_csv(audio_dir / "fold_details.csv", index=False)
+    
+    # Save aggregate metrics
+    with open(audio_dir / "aggregate_metrics.json", "w") as f:
+        json.dump(convert_to_serializable(aggregate_metrics), f, indent=2)
+    
+    # Print summary
+    print(f"\n  {'='*50}")
+    print(f"  AUDIO-ONLY CV COMPLETE")
+    print(f"  {'='*50}")
+    if args.task == "classification":
+        print(f"  Aggregate accuracy: {aggregate_metrics.get('accuracy', 0):.4f}")
+        print(f"  Aggregate F1: {aggregate_metrics.get('f1', 0):.4f}")
+        print(f"  Aggregate AUC: {aggregate_metrics.get('roc_auc', 0):.4f}")
+        print(f"  Aggregate macro_f1: {aggregate_metrics.get('macro_f1', 0):.4f}")
+    else:
+        print(f"  Aggregate RMSE: {aggregate_metrics.get('rmse', 0):.4f}")
+        print(f"  Aggregate R²: {aggregate_metrics.get('r2', 0):.4f}")
+    print(f"  {'='*50}")
     
     return {
         "aggregate_metrics": aggregate_metrics,
         "fold_metrics": fold_metrics,
+        "fold_details": fold_details,
         "oof_predictions": oof,
         "cv_dir": audio_dir,
     }
-
-
 # =======================================================================
 # FUSION METHODS (LEAKAGE-SAFE)
 # =======================================================================
