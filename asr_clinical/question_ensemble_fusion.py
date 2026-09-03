@@ -758,16 +758,17 @@ def objective_function_all_questions(
     metadata: dict,
 ) -> float:
     params = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [4, 8]),
-        "epochs": trial.suggest_int("epochs", 1, 3),
-        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
-        "max_length": trial.suggest_categorical("max_length", [128, 256]),
-        "focal_gamma": trial.suggest_float("focal_gamma", 0.5, 5.0, log=True),
-        "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.3),
-        "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.1, 5.0, log=True),
-        "dropout_rate": trial.suggest_float("dropout_rate", 0.0, 0.5),
+        "learning_rate": trial.suggest_float("learning_rate", 5e-6, 1e-5, log=True),  # Lower LR
+        "batch_size": trial.suggest_categorical("batch_size", [4, 8]),  # Keep larger for stability
+        "epochs": trial.suggest_int("epochs", 2, 8),  # 1-2 epochs
+        "patience": 2,
+        "weight_decay": trial.suggest_float("weight_decay", 0.01, 0.1),  # Stronger regularization
+        "dropout_rate": trial.suggest_float("dropout_rate", 0.3, 0.5),  # More dropout
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.05),
+        "max_length": trial.suggest_categorical("max_length", [128]),
+        "focal_gamma": trial.suggest_float("focal_gamma", 1.0, 3.0, log=True),
+        "label_smoothing": trial.suggest_float("label_smoothing", 0.05, 0.2),  # Smoothing helps
+        "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.5, 2.0, log=True),
     }
     
     all_question_scores = []
@@ -805,7 +806,7 @@ def objective_function_all_questions(
                     learning_rate=params["learning_rate"],
                     weight_decay=params["weight_decay"],
                     warmup_ratio=params["warmup_ratio"],
-                    patience=1,
+                    patience=params["patience"],
                     class_weights=args.class_weights,
                     loss=args.loss,
                     focal_gamma=args.focal_gamma,
