@@ -68,6 +68,7 @@ import os
 from imblearn.over_sampling import SMOTE, ADASYN
 from imblearn.combine import SMOTETomek
 from imblearn.pipeline import Pipeline as ImbPipeline
+from sklearn.decomposition import PCA
 
 # Cache directory
 os.environ['HF_HOME'] = '/home/bahman/.cache/huggingface'
@@ -113,27 +114,66 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
     return summed / counts
 
 
-def cleanup_temp_dirs(temp_dir: Path):
+def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
+    """Clean up temporary directories created during hyperparameter search."""
     if not temp_dir.exists():
         return
-    temp_hpo_dir = temp_dir / "temp_hpo"
-    if temp_hpo_dir.exists():
-        shutil.rmtree(temp_hpo_dir)
-    temp_optuna_dir = temp_dir / "temp_hpo_optuna"
-    if temp_optuna_dir.exists():
-        shutil.rmtree(temp_optuna_dir)
+    
+    temp_patterns = [
+        "temp_hpo",
+        "temp_hpo_optuna", 
+        "temp_*",
+        "*_temp",
+        "tmp_*",
+        "cache_*",
+        "optuna_*"
+    ]
+    
+    for pattern in temp_patterns:
+        for d in temp_dir.glob(pattern):
+            if d.is_dir():
+                try:
+                    shutil.rmtree(d)
+                    print(f"  ✓ Removed {d}")
+                except Exception as e:
+                    if force:
+                        try:
+                            for f in d.glob("*"):
+                                try:
+                                    if f.is_file():
+                                        f.unlink()
+                                    elif f.is_dir():
+                                        shutil.rmtree(f)
+                                except:
+                                    pass
+                            shutil.rmtree(d)
+                            print(f"  ✓ Force removed {d}")
+                        except Exception as e2:
+                            print(f"  ⚠️ Could not remove {d}: {e2}")
+                    else:
+                        print(f"  ⚠️ Could not remove {d}: {e}")
+    
+    for f in temp_dir.glob("*.pkl"):
+        try:
+            f.unlink()
+            print(f"  ✓ Removed {f}")
+        except:
+            pass
+    
+    for d in temp_dir.glob("*"):
+        if d.is_dir() and not any(d.iterdir()):
+            try:
+                d.rmdir()
+                print(f"  ✓ Removed empty directory {d}")
+            except:
+                pass
 
 
 # =======================================================================
 # MODEL CREATION FUNCTIONS WITH IMBALANCE HANDLING
 # =======================================================================
 
-
 def create_balanced_pipeline(base_model, args, method='smote'):
-    """
-    Wrap a SINGLE model with SMOTE.
-    Do NOT use this on VotingClassifier.
-    """
     if args.task != "classification":
         return base_model
     
@@ -141,50 +181,31 @@ def create_balanced_pipeline(base_model, args, method='smote'):
     if not use_imbalance:
         return base_model
     
-    # ✅ DON'T WRAP VOTING CLASSIFIER
     if isinstance(base_model, VotingClassifier):
         print("  ⚠️ Skipping SMOTE wrap on VotingClassifier (already applied to individual models)")
         return base_model
     
-    # Get SMOTE parameters
     k_neighbors = min(getattr(args, 'smote_k_neighbors', 3), 5)
     sampling_strategy = getattr(args, 'smote_sampling_strategy', 'auto')
     
-    # Select imbalance method
     if method == 'smote':
-        imbalance = SMOTE(
-            random_state=args.seed,
-            k_neighbors=k_neighbors,
-            sampling_strategy=sampling_strategy
-        )
+        imbalance = SMOTE(random_state=args.seed, k_neighbors=k_neighbors, sampling_strategy=sampling_strategy)
     elif method == 'adasyn':
-        imbalance = ADASYN(
-            random_state=args.seed,
-            n_neighbors=k_neighbors,
-            sampling_strategy=sampling_strategy
-        )
+        imbalance = ADASYN(random_state=args.seed, n_neighbors=k_neighbors, sampling_strategy=sampling_strategy)
     elif method == 'smote_tomek':
-        imbalance = SMOTETomek(
-            random_state=args.seed,
-            sampling_strategy=sampling_strategy
-        )
+        imbalance = SMOTETomek(random_state=args.seed, sampling_strategy=sampling_strategy)
     else:
         return base_model
     
-    # Handle different model types
     if isinstance(base_model, Pipeline):
-        # Extract preprocessors and model
         preprocessors = []
         model_step = None
-        
         for name, step in base_model.steps:
             if name == 'model':
                 model_step = step
             else:
                 preprocessors.append((name, step))
-        
         if model_step is None:
-            # No model step found - use whole pipeline as model
             return ImbPipeline([
                 ('to_float', FunctionTransformer(to_float, validate=False)),
                 ('imputer', SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -192,18 +213,11 @@ def create_balanced_pipeline(base_model, args, method='smote'):
                 ('imbalance', imbalance),
                 ('model', base_model)
             ])
-        
-        # Rebuild with imbalance handling
-        return ImbPipeline([
-            *preprocessors,
-            ('imbalance', imbalance),
-            ('model', model_step)
-        ])
+        return ImbPipeline([*preprocessors, ('imbalance', imbalance), ('model', model_step)])
     
-    elif isinstance(base_model, (RandomForestClassifier, GradientBoostingClassifier, 
-                               HistGradientBoostingClassifier, LogisticRegression, 
-                               SVC, KNeighborsClassifier)):
-        # Standalone classifier - wrap with preprocessors and imbalance
+    elif isinstance(base_model, (RandomForestClassifier, GradientBoostingClassifier,
+                                 HistGradientBoostingClassifier, LogisticRegression,
+                                 SVC, KNeighborsClassifier)):
         return ImbPipeline([
             ('to_float', FunctionTransformer(to_float, validate=False)),
             ('imputer', SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -211,19 +225,7 @@ def create_balanced_pipeline(base_model, args, method='smote'):
             ('imbalance', imbalance),
             ('model', base_model)
         ])
-    
-    elif isinstance(base_model, VotingClassifier):
-        # Voting classifier - wrap the whole thing
-        return ImbPipeline([
-            ('to_float', FunctionTransformer(to_float, validate=False)),
-            ('imputer', SimpleImputer(strategy="constant", fill_value=0.0)),
-            ('scaler', StandardScaler()),
-            ('imbalance', imbalance),
-            ('model', base_model)
-        ])
-    
     else:
-        # Unknown type - wrap as is
         return ImbPipeline([
             ('to_float', FunctionTransformer(to_float, validate=False)),
             ('imputer', SimpleImputer(strategy="constant", fill_value=0.0)),
@@ -335,10 +337,8 @@ def create_gradient_boosting(task, args):
 
 def create_hist_gradient_boosting(task, args):
     if task == "classification":
-        # Get xgb_lr with fallback
         xgb_lr = getattr(args, 'xgb_lr', 0.1)
         max_depth = getattr(args, 'max_depth', None)
-        
         base_model = HistGradientBoostingClassifier(
             max_iter=args.n_estimators,
             learning_rate=xgb_lr,
@@ -407,7 +407,6 @@ def create_elasticnet(task, args):
 
 def create_ensemble_model(task, args):
     ensemble_models = getattr(args, 'ensemble_models', ['linear', 'random_forest', 'hist_gradient_boosting'])
-    
     regression_only_models = ['ridge', 'lasso', 'elasticnet']
     
     if task == "classification":
@@ -434,19 +433,13 @@ def create_ensemble_model(task, args):
     
     estimators = []
     successful_models = []
-    
     print(f"\nCreating ensemble for {task} task with models: {ensemble_models}")
-    
-    # Get SMOTE flag
-    use_smote = getattr(args, 'use_smote', False)
     
     for model_name in ensemble_models:
         if model_name not in model_creators:
             print(f"  ✗ Unknown model '{model_name}', skipping")
             continue
-        
         try:
-            # Create model with SMOTE applied INSIDE (if enabled)
             model = model_creators[model_name](task, args)
             estimators.append((model_name, model))
             successful_models.append(model_name)
@@ -467,9 +460,6 @@ def create_ensemble_model(task, args):
             n_jobs=-1
         )
         print(f"\n✓ Created CLASSIFICATION ensemble with {len(estimators)} models")
-        
-        # ✅ DON'T WRAP ENSEMBLE WITH SMOTE
-        # Each individual model already has SMOTE applied inside it
         return ensemble
     else:
         ensemble = VotingRegressor(
@@ -482,27 +472,19 @@ def create_ensemble_model(task, args):
 
 
 def make_meta_model(args):
-    """Create meta-model with optional SMOTE balancing."""
-    
     use_smote = getattr(args, 'use_smote', False)
     
     if getattr(args, 'use_ensemble', False):
         print("\n" + "=" * 50)
         print("CREATING ENSEMBLE META-MODEL")
         print("=" * 50)
-        
-        # Create ensemble (each model already has SMOTE inside if enabled)
         ensemble = create_ensemble_model(args.task, args)
-        
-        # ✅ DON'T WRAP ENSEMBLE WITH SMOTE AGAIN
         print(f"  ✅ Ensemble created with {len(ensemble.estimators)} models")
         if use_smote and args.task == "classification":
             print("  ℹ️ SMOTE is applied to individual models inside the ensemble")
         return ensemble
     else:
         print(f"\nCreating single meta-model: {args.meta_model}")
-        
-        # Get the base model with SMOTE applied
         if args.meta_model == "linear":
             base_model = create_linear_model(args.task, args)
         elif args.meta_model == "ridge":
@@ -524,8 +506,6 @@ def make_meta_model(args):
         else:
             print(f"Unknown meta_model {args.meta_model}, falling back to linear")
             base_model = create_linear_model(args.task, args)
-        
-        # ✅ SMOTE is already applied inside the model creator
         return base_model
 
 
@@ -534,35 +514,18 @@ def make_meta_model(args):
 # =======================================================================
 
 def find_optimal_threshold(model, X_val, y_val, metric='f1'):
-    """
-    Find optimal threshold for binary classification.
-    
-    Args:
-        model: Fitted classifier with predict_proba
-        X_val: Validation features
-        y_val: Validation labels
-        metric: 'f1', 'balanced_accuracy', or 'youden'
-    
-    Returns:
-        best_threshold: float
-        best_score: float
-    """
     if not hasattr(model, "predict_proba"):
         return 0.5, 0.0
-    
     try:
         y_proba = model.predict_proba(X_val)[:, 1]
     except:
         return 0.5, 0.0
     
-    # Test thresholds from 0.0 to 1.0
     thresholds = np.linspace(0.0, 1.0, 101)
     best_threshold = 0.5
     best_score = -np.inf
-    
     for thresh in thresholds:
         y_pred = (y_proba >= thresh).astype(int)
-        
         if metric == 'f1':
             score = f1_score(y_val, y_pred, zero_division=0)
         elif metric == 'balanced_accuracy':
@@ -574,28 +537,19 @@ def find_optimal_threshold(model, X_val, y_val, metric='f1'):
             score = sensitivity + specificity - 1
         else:
             score = f1_score(y_val, y_pred, zero_division=0)
-        
         if score > best_score:
             best_score = score
             best_threshold = thresh
-    
     return best_threshold, best_score
 
 
 def predict_with_threshold(model, X, threshold=0.5):
-    """
-    Predict using a custom threshold.
-    
-    Returns:
-        pred: 1D array of predictions
-        proba: 2D array of probabilities (if available)
-    """
     if hasattr(model, "predict_proba"):
         try:
             proba = model.predict_proba(X)
             if proba.shape[1] == 2:
                 pred = (proba[:, 1] >= threshold).astype(int)
-                return pred, proba  # ✅ Return 2D probabilities
+                return pred, proba
             else:
                 pred = np.argmax(proba, axis=1)
                 return pred, proba
@@ -610,16 +564,6 @@ def predict_with_threshold(model, X, threshold=0.5):
 # =======================================================================
 
 def score_meta_model(model, x, y, task, threshold=0.5):
-    """
-    Score a meta-model with optional custom threshold.
-    
-    Args:
-        model: Fitted model
-        x: Features
-        y: True labels
-        task: 'classification' or 'regression'
-        threshold: Decision threshold for classification (default: 0.5)
-    """
     if model is None:
         pred = x
         proba = None
@@ -628,7 +572,6 @@ def score_meta_model(model, x, y, task, threshold=0.5):
             try:
                 proba = model.predict_proba(x)
                 if proba.shape[1] == 2:
-                    # Use custom threshold
                     pred = (proba[:, 1] >= threshold).astype(int)
                 else:
                     pred = np.argmax(proba, axis=1)
@@ -641,7 +584,6 @@ def score_meta_model(model, x, y, task, threshold=0.5):
 
     if task == "classification":
         is_binary = len(np.unique(y)) == 2
-        
         metrics = {
             "macro_f1": f1_score(y, pred, average="macro", zero_division=0),
             "weighted_f1": f1_score(y, pred, average="weighted", zero_division=0),
@@ -650,17 +592,14 @@ def score_meta_model(model, x, y, task, threshold=0.5):
             "confusion_matrix": confusion_matrix(y, pred).tolist(),
             "threshold_used": threshold,
         }
-        
         if is_binary:
             tn, fp, fn, tp = confusion_matrix(y, pred).ravel()
-            
             metrics["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             metrics["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
             metrics["precision"] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             metrics["npv"] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
             metrics["accuracy"] = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
             metrics["f1"] = 2 * (metrics["precision"] * metrics["sensitivity"]) / (metrics["precision"] + metrics["sensitivity"]) if (metrics["precision"] + metrics["sensitivity"]) > 0 else 0.0
-            
             if proba is not None:
                 try:
                     if proba.shape[1] == 2:
@@ -669,7 +608,6 @@ def score_meta_model(model, x, y, task, threshold=0.5):
                         metrics["roc_auc_ovr"] = roc_auc_score(y, proba, multi_class='ovr', average='macro')
                 except Exception:
                     metrics["roc_auc"] = 0.0
-        
         return metrics
     else:
         rmse = np.sqrt(mean_squared_error(y, pred))
@@ -682,7 +620,6 @@ def score_meta_model(model, x, y, task, threshold=0.5):
 
 def primary_score(metrics: dict, task: str) -> float:
     if task == "classification":
-        # Use F1 score (which accounts for precision/recall balance)
         return metrics.get("f1", metrics.get("macro_f1", 0.0))
     else:
         return -metrics.get("rmse", float('inf'))
@@ -707,7 +644,6 @@ class SplitManager:
 
     def _validate_or_cleanup_splits(self):
         required_cols = ['question_id', 'label', 'speaker_id']
-        
         final_train = self.splits_dir / "final_train.csv"
         if final_train.exists():
             try:
@@ -719,7 +655,6 @@ class SplitManager:
             except Exception:
                 self._delete_all_splits()
                 return
-        
         for fold_idx in range(self.n_folds):
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
             if train_path.exists():
@@ -742,7 +677,6 @@ class SplitManager:
         train_path = self.splits_dir / "final_train.csv"
         val_path = self.splits_dir / "final_val.csv"
         test_path = self.splits_dir / "final_test.csv"
-
         if train_path.exists() and val_path.exists() and test_path.exists():
             train_df = pd.read_csv(train_path)
             val_df = pd.read_csv(val_path)
@@ -755,23 +689,19 @@ class SplitManager:
             train_df = df.iloc[train_idx].reset_index(drop=True)
             val_df = df.iloc[val_idx].reset_index(drop=True)
             test_df = pd.DataFrame()
-            
             train_df.to_csv(train_path, index=False)
             val_df.to_csv(val_path, index=False)
             empty_test = pd.DataFrame(columns=df.columns)
             empty_test.to_csv(test_path, index=False)
-            
             return train_df, val_df, test_df
-        
+
         trainval_idx, test_idx = self._speaker_split(df, self.test_frac, self.seed)
         trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
         test_df = df.iloc[test_idx].reset_index(drop=True)
-
         rel_val_frac = self.val_frac / (self.train_frac + self.val_frac)
         train_idx, val_idx = self._speaker_split(trainval_df, rel_val_frac, self.seed + 1)
         train_df = trainval_df.iloc[train_idx].reset_index(drop=True)
         val_df = trainval_df.iloc[val_idx].reset_index(drop=True)
-
         for df_out, path in zip([train_df, val_df, test_df],
                                 [train_path, val_path, test_path]):
             df_out.to_csv(path, index=False)
@@ -785,23 +715,18 @@ class SplitManager:
             if not (train_path.exists() and val_path.exists()):
                 need_create = True
                 break
-        
         if need_create:
             return self._create_fold_splits(train_df, test_df)
-        
         folds = []
         for fold_idx in range(self.n_folds):
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
             val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
             test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
-            
             if not test_copy_path.exists() and not test_df.empty:
                 test_df.to_csv(test_copy_path, index=False)
-            
             fold_train = pd.read_csv(train_path)
             fold_val = pd.read_csv(val_path)
             folds.append((fold_train, fold_val))
-        
         return folds
 
     def _create_fold_splits(self, train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
@@ -809,54 +734,42 @@ class SplitManager:
         for col in required_cols:
             if col not in train_df.columns:
                 raise ValueError(f"Required column '{col}' not found in training data.")
-        
         speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
         speakers.columns = ["speaker_id", "label"]
-
         if self.task == "classification":
             kf = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=self.seed)
             fold_splits = list(kf.split(speakers, speakers["label"]))
         else:
             kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.seed)
             fold_splits = list(kf.split(speakers))
-
         folds = []
         for fold_idx, (train_speaker_idx, val_speaker_idx) in enumerate(fold_splits):
             train_speakers = speakers.iloc[train_speaker_idx]["speaker_id"].values
             val_speakers = speakers.iloc[val_speaker_idx]["speaker_id"].values
-            
             fold_train = train_df[train_df["speaker_id"].isin(train_speakers)].reset_index(drop=True)
             fold_val = train_df[train_df["speaker_id"].isin(val_speakers)].reset_index(drop=True)
-            
             train_path = self.splits_dir / f"fold{fold_idx}_train.csv"
             val_path = self.splits_dir / f"fold{fold_idx}_val.csv"
             fold_train.to_csv(train_path, index=False)
             fold_val.to_csv(val_path, index=False)
-            
             if not test_df.empty:
                 test_copy_path = self.splits_dir / f"fold{fold_idx}_test.csv"
                 test_df.to_csv(test_copy_path, index=False)
-            
             folds.append((fold_train, fold_val))
-        
         return folds
 
     def _speaker_split(self, df: pd.DataFrame, test_size: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
         if test_size <= 0:
             return np.arange(len(df)), np.array([], dtype=int)
-        
         if test_size >= 1:
             return np.array([], dtype=int), np.arange(len(df))
-        
         df_work = df.copy()
         label_col = df_work["label"]
         if isinstance(label_col, pd.DataFrame):
             label_col = label_col.iloc[:, 0]
         df_work["label"] = label_col
-
         speaker_labels = df_work.groupby("speaker_id")["label"].first().reset_index()
         speaker_labels.columns = ["speaker_id", "label"]
-
         if self.task == "classification":
             splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
             train_speaker_idx, test_speaker_idx = next(
@@ -865,7 +778,6 @@ class SplitManager:
         else:
             splitter = ShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
             train_speaker_idx, test_speaker_idx = next(splitter.split(speaker_labels))
-
         train_speakers = speaker_labels.iloc[train_speaker_idx]["speaker_id"].values
         test_speakers = speaker_labels.iloc[test_speaker_idx]["speaker_id"].values
         train_idx = df_work[df_work["speaker_id"].isin(train_speakers)].index.to_numpy()
@@ -882,30 +794,21 @@ def load_audio_features(csv_path: str, speaker_col: str = "speaker_id",
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Audio features CSV not found: {csv_path}")
-    
     audio_df = pd.read_csv(csv_path)
-    
     if speaker_col not in audio_df.columns:
         raise ValueError(f"Speaker column '{speaker_col}' not found in audio CSV.")
-    
     if exclude_cols is None:
         exclude_cols = [speaker_col, 'session_id', 'utterance_id', 'question_id', 'label', 'y_true', 'target']
-    
     numeric_cols = audio_df.select_dtypes(include=[np.number]).columns.tolist()
     feature_cols = [c for c in numeric_cols if c not in exclude_cols]
-    
     if not feature_cols:
         raise ValueError("No numeric feature columns found in audio CSV.")
-    
     keep_cols = [speaker_col] + feature_cols
     audio_df = audio_df[keep_cols].copy()
-    
     if audio_df.duplicated(subset=[speaker_col]).any():
         audio_df = audio_df.groupby(speaker_col).mean().reset_index()
-    
     if speaker_col != 'speaker_id':
         audio_df.rename(columns={speaker_col: 'speaker_id'}, inplace=True)
-    
     return audio_df
 
 
@@ -927,17 +830,13 @@ def hyperparameter_search_optuna_all_questions(
     print("=" * 60)
     print("Starting Optuna hyperparameter search on ALL QUESTIONS")
     print("=" * 60)
-    
     folds = split_manager.get_fold_splits(train_df, test_df)
     folds = folds[:args.hpo_folds]
     all_questions = [q.upper() for q in args.questions]
-    
     print(f"Optimizing across {len(all_questions)} questions with {len(folds)}-fold CV")
     print(f"Total trials: {args.hpo_n_trials}")
-    
     sampler = TPESampler(seed=args.seed, n_startup_trials=5)
     pruner = MedianPruner(n_startup_trials=3, n_warmup_steps=2)
-    
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
@@ -945,7 +844,6 @@ def hyperparameter_search_optuna_all_questions(
         study_name=f"{args.task}_hpo_all_questions",
         load_if_exists=True
     )
-    
     objective_partial = partial(
         objective_function_all_questions,
         folds=folds,
@@ -953,7 +851,6 @@ def hyperparameter_search_optuna_all_questions(
         args=args,
         metadata=metadata,
     )
-    
     study.optimize(
         objective_partial,
         n_trials=args.hpo_n_trials,
@@ -961,14 +858,12 @@ def hyperparameter_search_optuna_all_questions(
         show_progress_bar=True,
         n_jobs=1
     )
-    
     best_params = study.best_params
     best_params.update({
         "max_length": best_params.get("max_length", args.max_length),
         "weight_decay": best_params.get("weight_decay", args.weight_decay),
         "warmup_ratio": best_params.get("warmup_ratio", args.warmup_ratio),
     })
-    
     return best_params
 
 
@@ -992,21 +887,15 @@ def objective_function_all_questions(
         "label_smoothing": trial.suggest_float("label_smoothing", 0.05, 0.2),
         "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.5, 2.0, log=True),
     }
-    
     all_question_scores = []
-    
     for fold_idx, (fold_train, fold_val) in enumerate(folds):
         fold_question_scores = []
-        
         for question in all_questions:
             q_fold_train = fold_train[fold_train["question_id"] == question].reset_index(drop=True)
             q_fold_val = fold_val[fold_val["question_id"] == question].reset_index(drop=True)
-            
             if len(q_fold_train) < 10 or len(q_fold_val) < 3:
                 continue
-            
             temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}_{question}"
-            
             try:
                 temp_cfg = TrainConfig(
                     asr_file=args.asr_file,
@@ -1035,7 +924,6 @@ def objective_function_all_questions(
                     filter_questions=[question],
                     min_text_chars=args.min_text_chars,
                 )
-                
                 metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
                 if metrics is not None:
                     score = primary_score(metrics, args.task)
@@ -1047,18 +935,14 @@ def objective_function_all_questions(
                     shutil.rmtree(temp_out)
                 except:
                     pass
-        
         if fold_question_scores:
             fold_avg_score = np.mean(fold_question_scores)
             all_question_scores.append(fold_avg_score)
             trial.report(np.mean(all_question_scores), fold_idx)
-            
             if trial.should_prune():
                 raise optuna.TrialPruned()
-    
     if not all_question_scores:
         return float('-inf')
-    
     return np.mean(all_question_scores)
 
 
@@ -1099,7 +983,6 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
                 enc = {k: v.to(device) for k, v in enc.items()}
                 outputs = model(**enc)
                 logits = outputs.logits.cpu().numpy()
-                
                 if cfg.task == "classification":
                     batch_preds = np.argmax(logits, axis=1)
                     preds.extend(batch_preds)
@@ -1112,17 +995,13 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
 
         preds = np.array(preds)
         labels = np.array(labels)
-        
         if len(preds) != len(labels):
             return None
-        
         if cfg.task == "classification":
             result = {"macro_f1": f1_score(labels, preds, average="macro", zero_division=0)}
         else:
             result = {"rmse": np.sqrt(mean_squared_error(labels, preds))}
-        
         return result
-        
     except Exception as e:
         print(f"Evaluation failed: {e}")
         return None
@@ -1150,7 +1029,9 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
                         max_length=max_length, return_tensors="pt")
         enc = {k: v.to(device) for k, v in enc.items()}
         outputs = model(**enc, output_hidden_states=True)
-        embeddings = mean_pool(outputs.hidden_states[-1], enc["attention_mask"]).cpu().numpy()
+        #embeddings = mean_pool(outputs.hidden_states[-1], enc["attention_mask"]).cpu().numpy()
+        # CLS token (first token) embedding
+        embeddings = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
 
         for row_idx, embedding in enumerate(embeddings):
             meta = batch_df.iloc[row_idx]
@@ -1171,13 +1052,12 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
 
 
 # =======================================================================
-# FEATURE TABLE BUILDING Smart Fill - Use Question Averages
-# Instead of filling with zeros, fill with the question's average embedding:
+# FEATURE TABLE BUILDING - SMART FILL WITH AVERAGES
 # =======================================================================
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     tables = []
-    question_means = {}  # Store mean embedding per question
+    question_means = {}
     
     for q in questions:
         path = embedding_paths.get(q)
@@ -1195,6 +1075,7 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
                 print(f"⚠️ WARNING: No embedding columns for question {q}")
                 continue
                 
+            # Group by speaker_id, keep as index
             grouped = emb_df.groupby("speaker_id", as_index=True).agg(
                 y_true=("y_true", "first"),
                 **{col: (col, "mean") for col in emb_cols},
@@ -1202,7 +1083,7 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
             grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
             grouped[f"{q}__present"] = 1.0
             
-            # Store mean embedding for this question (for filling)
+            # Store mean for filling
             question_means[q] = grouped[[f"{q}__{col}" for col in emb_cols]].mean()
             
             print(f"  ✓ {q}: {len(grouped)} speakers")
@@ -1222,7 +1103,7 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
     
     print(f"  After OUTER join: {len(merged)} speakers")
     
-    # Fill missing values with question means (not zeros)
+    # Fill missing values with question means
     for q in questions:
         if q in question_means:
             q_cols = [c for c in merged.columns if c.startswith(f"{q}__")]
@@ -1230,15 +1111,18 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
                 if col in question_means[q]:
                     merged[col] = merged[col].fillna(question_means[q][col])
     
-    merged = merged.reset_index()
+    # DO NOT reset index - keep speaker_id as index
     feature_cols = [c for c in merged.columns if "__" in c]
-    merged[feature_cols] = merged[feature_cols].fillna(0.0)  # Fallback
+    merged[feature_cols] = merged[feature_cols].fillna(0.0)
     return merged, feature_cols
 
 
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
+    # Ensure speaker_id is index for all
     for df in [val_df, test_df]:
         if df is not None and not df.empty:
+            if 'speaker_id' in df.columns:
+                df.set_index('speaker_id', inplace=True)
             for col in feature_cols:
                 if col not in df.columns:
                     df[col] = 0.0
@@ -1261,18 +1145,13 @@ def question_groups(feature_cols):
 # =======================================================================
 
 def make_outer_folds(df: pd.DataFrame, args):
-    """Create speaker-level outer folds. No row from a speaker can cross folds."""
     speakers = df.groupby("speaker_id")["label"].first().reset_index()
     speakers.columns = ["speaker_id", "label"]
     if args.task == "classification":
-        splitter = StratifiedKFold(
-            n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed
-        )
+        splitter = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
         splits = splitter.split(speakers, speakers["label"])
     else:
-        splitter = KFold(
-            n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed
-        )
+        splitter = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
         splits = splitter.split(speakers)
 
     folds = []
@@ -1324,7 +1203,6 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
 def safe_question_train_and_embed(train_df, val_df, metadata, args,
                                    best_hparams, question, fold_dir,
                                    include_val=True):
-    """Train one question model using ONLY train_df and create train/val embeddings."""
     q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
     q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
     if q_train.empty:
@@ -1353,11 +1231,6 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
 
 def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                              questions, fold_dir):
-    """Nested, training-only question ranking.
-    
-    A small speaker-level split is made inside the outer training set.
-    Outer validation is never inspected.
-    """
     speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
     if len(speakers) < 6:
         return {q: 0.0 for q in questions}
@@ -1438,23 +1311,31 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
     if not selected:
         raise ValueError("No selected features available for meta-model")
 
-    model = make_meta_model(args)
     Xtr = train_features[selected].to_numpy(dtype=float)
     Xva = val_features[selected].to_numpy(dtype=float)
     ytr = train_features["y_true"].to_numpy()
     yva = val_features["y_true"].to_numpy()
     
-    model.fit(Xtr, ytr)
+    # Apply PCA if requested
+    n_pca = getattr(args, 'pca_text_components', 0)
+    if n_pca > 0:
+        n_components = min(n_pca, Xtr.shape[0] - 1, Xtr.shape[1])
+        if n_components > 1:
+            pca = PCA(n_components=n_components, random_state=args.seed)
+            Xtr = pca.fit_transform(Xtr)
+            Xva = pca.transform(Xva)
+            print(f"  PCA reduced features from {Xtr.shape[1]} to {n_components}")
+        else:
+            print(f"  ⚠️ PCA skipped: not enough samples or features")
+
+    model = make_meta_model(args)
+    model.fit(Xtr_pca, ytr)
     
-    # Get predictions and probabilities
     if args.task == "classification":
-        # Find optimal threshold
         best_threshold, best_score = find_optimal_threshold(
             model, Xva, yva, metric='f1'
         )
         print(f"  Optimal threshold: {best_threshold:.3f} (score: {best_score:.4f})")
-        
-        # Get predictions with threshold
         if hasattr(model, "predict_proba"):
             try:
                 proba = model.predict_proba(Xva)
@@ -1462,7 +1343,6 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
                     pred = (proba[:, 1] >= best_threshold).astype(int)
                 else:
                     pred = np.argmax(proba, axis=1)
-                # ✅ proba is 2D - will be saved correctly
             except:
                 pred = model.predict(Xva)
                 proba = None
@@ -1475,16 +1355,79 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
         best_threshold = None
     
     metrics = score_meta_model(model, Xva, yva, args.task, threshold=best_threshold or 0.5)
-    
-    # ✅ Store threshold info
     if args.task == "classification":
         metrics['optimal_threshold'] = best_threshold
         metrics['threshold_score'] = best_score
     
     return model, pred, proba, metrics, selected 
 
+
+def aggregate_oof_predictions(oof_df, args):
+    print("    Aggregating OOF predictions...")
+    if oof_df is None or oof_df.empty:
+        print("    ❌ OOF DataFrame is empty!")
+        return {}
+    print(f"    OOF shape: {oof_df.shape}")
+    required_cols = ['y_true', 'y_pred']
+    missing = [c for c in required_cols if c not in oof_df.columns]
+    if missing:
+        print(f"    ❌ Missing columns: {missing}")
+        return {}
+    y_true = oof_df["y_true"].to_numpy()
+    y_pred = oof_df["y_pred"].to_numpy()
+    print(f"    y_true shape: {y_true.shape}, unique: {np.unique(y_true)}")
+    print(f"    y_pred shape: {y_pred.shape}, unique: {np.unique(y_pred)}")
+    
+    if args.task == "classification":
+        from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score, confusion_matrix
+        metrics = {}
+        try:
+            metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
+            metrics["macro_f1"] = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
+            metrics["weighted_f1"] = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
+            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
+        except Exception as e:
+            print(f"    ⚠️ Basic metrics failed: {e}")
+        if len(np.unique(y_true)) == 2:
+            try:
+                tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+                metrics["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                metrics["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                metrics["precision"] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                metrics["npv"] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+                metrics["accuracy"] = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+                metrics["f1"] = 2 * (metrics["precision"] * metrics["sensitivity"]) / (metrics["precision"] + metrics["sensitivity"]) if (metrics["precision"] + metrics["sensitivity"]) > 0 else 0.0
+                metrics["confusion_matrix"] = [[int(tn), int(fp)], [int(fn), int(tp)]]
+            except Exception as e:
+                print(f"    ⚠️ Binary metrics failed: {e}")
+        if "y_proba" in oof_df.columns:
+            try:
+                probs = oof_df["y_proba"].to_numpy()
+                probs = np.clip(probs, 0, 1)
+                if len(np.unique(y_true)) == 2:
+                    metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
+                else:
+                    metrics["roc_auc_ovr"] = float(roc_auc_score(y_true, probs, multi_class='ovr', average='macro'))
+            except Exception as e:
+                print(f"    ⚠️ AUC calculation failed: {e}")
+        return metrics
+    else:
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        metrics = {}
+        try:
+            metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+            metrics["mae"] = float(mean_absolute_error(y_true, y_pred))
+            metrics["r2"] = float(r2_score(y_true, y_pred))
+        except Exception as e:
+            print(f"    ⚠️ Regression metrics failed: {e}")
+        return metrics
+
+
+# =======================================================================
+# TEXT CV (LEAKAGE-SAFE) - Fixed Index Handling
+# =======================================================================
+
 def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
-    """Primary leakage-safe text experiment with 5-fold OOF evaluation."""
     print(f"\n  Entering leakage_safe_text_cv()")
     print(f"  trainval_df shape: {trainval_df.shape}")
     print(f"  Number of speakers: {trainval_df.speaker_id.nunique()}")
@@ -1497,12 +1440,10 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
     questions = [q.upper() for q in args.questions]
     print(f"  Questions after upper: {questions}")
     
-    # Check if data exists
     if trainval_df.empty:
         print("  ❌ trainval_df is empty!")
         return None
 
-    # Check if required columns exist
     required_cols = ['speaker_id', 'label', 'question_id']
     missing = [c for c in required_cols if c not in trainval_df.columns]
     if missing:
@@ -1519,7 +1460,6 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
         traceback.print_exc()
         return None
 
-    folds = make_outer_folds(trainval_df, args)
     oof_rows = []
     fold_rows = []
     fold_question_rows = []
@@ -1533,7 +1473,6 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
               f"Validation speakers: {outer_val.speaker_id.nunique()}")
         print("=" * 70)
 
-        # Nested ranking: outer validation is not visible here.
         q_scores = safe_question_cv_scores(
             outer_train, metadata, args, best_hparams, questions, fold_dir
         )
@@ -1548,7 +1487,6 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
                                        "inner_score": s,
                                        "selected": q in selected_questions})
 
-        # Retrain selected question models on ALL outer-training speakers only.
         train_paths = {}
         val_paths = {}
         for q in selected_questions:
@@ -1568,10 +1506,10 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
             fold_train_features, fold_val_features, pd.DataFrame(), fold_cols
         )
 
-        # Ensure speaker uniqueness after aggregation.
-        if fold_train_features["speaker_id"].duplicated().any() or fold_val_features["speaker_id"].duplicated().any():
+        # Check duplicates using index (speaker_id)
+        if fold_train_features.index.duplicated().any() or fold_val_features.index.duplicated().any():
             raise RuntimeError(f"Fold {fold_idx}: duplicate speaker after aggregation")
-        if set(fold_train_features.speaker_id) & set(fold_val_features.speaker_id):
+        if set(fold_train_features.index) & set(fold_val_features.index):
             raise RuntimeError(f"Fold {fold_idx}: speaker leakage after feature aggregation")
 
         model, pred, proba, metrics, selected_cols = fit_meta_model_for_fold(
@@ -1584,7 +1522,8 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
             if isinstance(v, (int, float, np.integer, np.floating))
         }})
 
-        val_out = fold_val_features[["speaker_id", "y_true"]].copy()
+        # Reset index to get speaker_id as a column for saving
+        val_out = fold_val_features.reset_index()[["speaker_id", "y_true"]].copy()
         val_out["fold"] = fold_idx
         val_out["y_pred"] = pred
         if args.task == "classification" and proba is not None and proba.ndim == 2 and proba.shape[1] == 2:
@@ -1613,7 +1552,6 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
         json.dumps(convert_to_serializable(aggregate_metrics), indent=2)
     )
 
-    # Fold metric mean/std
     numeric_fold = pd.DataFrame(fold_rows)
     if not numeric_fold.empty:
         summary = {}
@@ -1644,13 +1582,11 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
 
 def train_production_text_model(trainval_df, test_df, metadata, args,
                                  best_hparams, cv_result, out_dir):
-    """Train deployment model only after CV is complete."""
     out_dir = Path(out_dir)
     prod_dir = out_dir / "production_model"
     prod_dir.mkdir(parents=True, exist_ok=True)
     questions = [q.upper() for q in args.questions]
 
-    # Aggregate inner scores over folds and choose the most stable questions.
     qs = pd.read_csv(cv_result["cv_dir"] / "question_selection_all_folds.csv")
     qs = qs[np.isfinite(pd.to_numeric(qs["inner_score"], errors="coerce"))].copy()
     if qs.empty:
@@ -1664,7 +1600,6 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
         out_dir / "selected_questions.csv", index=False
     )
 
-    # Production question models see training+validation only.
     train_paths = {}
     test_paths = {}
     for q in selected_questions:
@@ -1697,23 +1632,55 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
 
     selected_cols = [c for c in feature_cols
                      if c.split("__", 1)[0] in set(selected_questions)]
+
+    X_train = train_features[selected_cols].to_numpy(dtype=float)
+    y_train = train_features["y_true"].to_numpy()
+    n_pca = getattr(args, 'pca_text_components', 0)
+    if n_pca > 0 and X_train.shape[1] > n_pca:
+        n_components = min(n_pca, X_train.shape[0] - 1, X_train.shape[1])
+        if n_components > 1:
+            pca = PCA(n_components=n_components, random_state=args.seed)
+            X_train = pca.fit_transform(X_train)
+            joblib.dump(pca, out_dir / "pca_model.joblib")
+            print(f"  Production PCA reduced text features to {n_components}")
+        else:
+            print(f"  ⚠️ Production PCA skipped")
+    
+
     model = make_meta_model(args)
-    model.fit(train_features[selected_cols].to_numpy(dtype=float),
-              train_features["y_true"].to_numpy())
+    model.fit(X_train, y_train)
+
     joblib.dump(model, out_dir / "meta_model.joblib")
     pd.DataFrame({"feature": selected_cols}).to_csv(
         out_dir / "selected_embedding_features.csv", index=False
     )
 
+    if args.task == "classification":
+        # Average the thresholds from CV folds
+        threshold_file = cv_result["cv_dir"] / "fold_metrics.csv"
+        if threshold_file.exists():
+            fold_df = pd.read_csv(threshold_file)
+            if "optimal_threshold" in fold_df.columns:
+                avg_threshold = fold_df["optimal_threshold"].mean()
+                with open(out_dir / "optimal_threshold.json", "w") as f:
+                    json.dump({"threshold": avg_threshold}, f)
+                print(f"  Using average threshold from CV: {avg_threshold:.3f}")
+        else:
+            avg_threshold = 0.5
+            print("  No CV thresholds found, using default 0.5")
+
     if not test_features.empty:
         Xtest = test_features[selected_cols].to_numpy(dtype=float)
         ytest = test_features["y_true"].to_numpy()
+        if n_pca > 0 and hasattr(pca, 'components_'):
+            Xtest = pca.transform(Xtest)
+
         test_metrics = score_meta_model(model, Xtest, ytest, args.task)
         (out_dir / "meta_test_metrics.json").write_text(
             json.dumps(convert_to_serializable(test_metrics), indent=2)
         )
         pred = model.predict(Xtest)
-        pred_df = test_features[["speaker_id", "y_true"]].copy()
+        pred_df = test_features.reset_index()[["speaker_id", "y_true"]].copy()
         pred_df["y_pred"] = pred
         if args.task == "classification" and hasattr(model, "predict_proba"):
             try:
@@ -1728,135 +1695,19 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
 
     return model, train_features, test_features, selected_cols, test_metrics
 
-# =======================================================================
-# AGGREGATE OOF PREDICTIONS
-# =======================================================================
-
-def aggregate_oof_predictions(oof_df, args):
-    """
-    Calculate aggregate metrics from OOF predictions.
-    
-    Args:
-        oof_df: DataFrame with columns ['speaker_id', 'y_true', 'y_pred', 'y_proba']
-        args: Command line arguments
-    
-    Returns:
-        dict: Aggregate metrics
-    """
-    print("    Aggregating OOF predictions...")
-    
-    # Check if oof_df is valid
-    if oof_df is None or oof_df.empty:
-        print("    ❌ OOF DataFrame is empty!")
-        return {}
-    
-    print(f"    OOF shape: {oof_df.shape}")
-    
-    # Check for required columns
-    required_cols = ['y_true', 'y_pred']
-    missing = [c for c in required_cols if c not in oof_df.columns]
-    if missing:
-        print(f"    ❌ Missing columns: {missing}")
-        return {}
-    
-    # Extract predictions and true labels
-    y_true = oof_df["y_true"].to_numpy()
-    y_pred = oof_df["y_pred"].to_numpy()
-    
-    print(f"    y_true shape: {y_true.shape}, unique: {np.unique(y_true)}")
-    print(f"    y_pred shape: {y_pred.shape}, unique: {np.unique(y_pred)}")
-    
-    # Calculate metrics based on task
-    if args.task == "classification":
-        from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score, confusion_matrix
-        
-        metrics = {}
-        
-        try:
-            metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
-            metrics["macro_f1"] = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
-            metrics["weighted_f1"] = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
-            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
-        except Exception as e:
-            print(f"    ⚠️ Basic metrics failed: {e}")
-        
-        # Binary classification metrics
-        if len(np.unique(y_true)) == 2:
-            try:
-                tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-                metrics["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                metrics["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-                metrics["precision"] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                metrics["npv"] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
-                metrics["accuracy"] = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
-                metrics["f1"] = 2 * (metrics["precision"] * metrics["sensitivity"]) / (metrics["precision"] + metrics["sensitivity"]) if (metrics["precision"] + metrics["sensitivity"]) > 0 else 0.0
-                metrics["confusion_matrix"] = [[int(tn), int(fp)], [int(fn), int(tp)]]
-            except Exception as e:
-                print(f"    ⚠️ Binary metrics failed: {e}")
-        
-        # ROC AUC if probabilities available
-        if "y_proba" in oof_df.columns:
-            try:
-                probs = oof_df["y_proba"].to_numpy()
-                # Clip to [0,1] range
-                probs = np.clip(probs, 0, 1)
-                if len(np.unique(y_true)) == 2:
-                    metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
-                else:
-                    metrics["roc_auc_ovr"] = float(roc_auc_score(y_true, probs, multi_class='ovr', average='macro'))
-            except Exception as e:
-                print(f"    ⚠️ AUC calculation failed: {e}")
-        
-        return metrics
-    
-    else:
-        # Regression metrics
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-        
-        metrics = {}
-        
-        try:
-            metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-            metrics["mae"] = float(mean_absolute_error(y_true, y_pred))
-            metrics["r2"] = float(r2_score(y_true, y_pred))
-        except Exception as e:
-            print(f"    ⚠️ Regression metrics failed: {e}")
-        
-        return metrics
 
 # =======================================================================
 # AUDIO-ONLY CV
 # =======================================================================
 
 def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
-    """
-    Train audio-only model with leakage-safe 5-fold CV.
-    
-    This function:
-    1. Uses the same speaker-level folds as the main pipeline
-    2. Trains a meta-model on audio features only
-    3. Finds optimal classification threshold per fold
-    4. Saves OOF predictions and metrics
-    5. Returns aggregate metrics
-    
-    Args:
-        audio_df: DataFrame with audio features (speaker_id + feature columns)
-        trainval_df: DataFrame with speaker labels (speaker_id + label)
-        args: Command line arguments
-        out_dir: Output directory
-    
-    Returns:
-        dict: Contains aggregate_metrics, fold_metrics, oof_predictions, cv_dir
-    """
     out_dir = Path(out_dir)
     audio_dir = out_dir / "audio_only"
     audio_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get audio feature columns (everything except speaker_id)
     audio_feature_cols = get_audio_feature_cols(audio_df)
     print(f"\n  Audio-only CV with {len(audio_feature_cols)} audio features")
     
-    # Get labels for all speakers
     labels = trainval_df.groupby("speaker_id")["label"].first().rename("y_true").reset_index()
     audio_with_labels = audio_df.merge(labels, on="speaker_id", how="inner")
     
@@ -1866,7 +1717,6 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
     
     print(f"  Audio samples with labels: {len(audio_with_labels)} speakers")
     
-    # Check class distribution
     if args.task == "classification":
         class_counts = audio_with_labels["y_true"].value_counts()
         print(f"  Class distribution: {dict(class_counts)}")
@@ -1874,11 +1724,9 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
             print("  ⚠️ Only one class present in audio data - skipping CV")
             return None
     
-    # Create speaker-level folds (leakage-safe)
     folds = make_outer_folds(trainval_df, args)
     print(f"  Running {len(folds)}-fold CV")
     
-    # Storage for OOF predictions and fold metrics
     oof_rows = []
     fold_metrics = []
     fold_details = []
@@ -1887,7 +1735,6 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
         fold_dir = audio_dir / f"fold_{fold_idx}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         
-        # Get speaker IDs for this fold
         train_speakers = set(outer_train.speaker_id)
         val_speakers = set(outer_val.speaker_id)
         
@@ -1895,22 +1742,18 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
         print(f"    Train speakers: {len(train_speakers)}")
         print(f"    Val speakers: {len(val_speakers)}")
         
-        # Split audio data by speaker
         atr = audio_with_labels[audio_with_labels.speaker_id.isin(train_speakers)].copy()
         ava = audio_with_labels[audio_with_labels.speaker_id.isin(val_speakers)].copy()
         
-        # Check if we have enough data
         if len(atr) < 3 or len(ava) < 2:
             print(f"    ⚠️ Insufficient audio data: train={len(atr)}, val={len(ava)} - skipping fold")
             continue
         
-        # Prepare features and labels
         Xtr = atr[audio_feature_cols].to_numpy(dtype=float)
         Xva = ava[audio_feature_cols].to_numpy(dtype=float)
         ytr = atr["y_true"].to_numpy()
         yva = ava["y_true"].to_numpy()
         
-        # Handle NaN values
         Xtr = np.nan_to_num(Xtr, nan=0.0, posinf=0.0, neginf=0.0)
         Xva = np.nan_to_num(Xva, nan=0.0, posinf=0.0, neginf=0.0)
         
@@ -1918,7 +1761,6 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
         if args.task == "classification":
             print(f"    Train class distribution: {np.bincount(ytr.astype(int))}")
         
-        # Create and train meta-model
         try:
             model = make_meta_model(args)
             model.fit(Xtr, ytr)
@@ -1927,15 +1769,12 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
             print(f"    ❌ Model training failed: {e}")
             continue
         
-        # Get predictions with threshold tuning for classification
         if args.task == "classification":
-            # Find optimal threshold on validation data
             best_threshold, best_score = find_optimal_threshold(
                 model, Xva, yva, metric='f1'
             )
             print(f"    Optimal threshold: {best_threshold:.3f} (F1 score: {best_score:.4f})")
             
-            # Get predictions with threshold
             if hasattr(model, "predict_proba"):
                 try:
                     proba = model.predict_proba(Xva)
@@ -1952,26 +1791,22 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
                 pred = model.predict(Xva)
                 proba = None
         else:
-            # Regression - no threshold tuning
             pred = model.predict(Xva)
             proba = None
             best_threshold = None
             best_score = None
         
-        # Calculate metrics with threshold
         metrics = score_meta_model(
             model, Xva, yva, args.task, 
             threshold=best_threshold if best_threshold is not None else 0.5
         )
         
-        # Store fold metrics (only numeric values)
         fold_metric_row = {"fold": fold_idx}
         for k, v in metrics.items():
             if isinstance(v, (int, float, np.integer, np.floating)):
                 fold_metric_row[k] = float(v)
         fold_metrics.append(fold_metric_row)
         
-        # Store details for summary
         fold_details.append({
             "fold": fold_idx,
             "train_speakers": len(train_speakers),
@@ -1982,19 +1817,16 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
             "threshold_score": float(best_score) if best_score is not None else None,
         })
         
-        # Create output dataframe for this fold
         out_df = ava[["speaker_id", "y_true"]].copy()
         out_df["fold"] = fold_idx
         out_df["y_pred"] = pred
         
-        # Save probabilities if available
         if args.task == "classification" and proba is not None:
             if proba.ndim == 2 and proba.shape[1] == 2:
                 out_df["y_proba"] = proba[:, 1]
             elif proba.ndim == 1:
                 out_df["y_proba"] = proba
             else:
-                # Try to get probabilities again
                 try:
                     full_proba = model.predict_proba(Xva)
                     if full_proba.shape[1] == 2:
@@ -2002,18 +1834,14 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
                 except:
                     pass
         
-        # Add to OOF collection
         oof_rows.append(out_df)
         
-        # Save fold results
         joblib.dump(model, fold_dir / "model.joblib")
         out_df.to_csv(fold_dir / "predictions.csv", index=False)
         
-        # Save fold metrics
         with open(fold_dir / "metrics.json", "w") as f:
             json.dump(convert_to_serializable(metrics), f, indent=2)
         
-        # Print fold summary
         if args.task == "classification":
             print(f"    Fold metrics: accuracy={metrics.get('accuracy', 0):.4f}, "
                   f"f1={metrics.get('f1', 0):.4f}, "
@@ -2022,41 +1850,29 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
             print(f"    Fold metrics: rmse={metrics.get('rmse', 0):.4f}, "
                   f"r2={metrics.get('r2', 0):.4f}")
     
-    # Check if we have any results
     if not oof_rows:
         print("\n  ❌ No audio-only predictions generated - all folds failed")
         return None
     
-    # Aggregate OOF predictions
     print(f"\n  Aggregating {len(oof_rows)} folds of predictions...")
     oof = pd.concat(oof_rows, ignore_index=True)
     
-    # Verify no speaker leakage in OOF
     speaker_counts = oof.groupby("speaker_id").size()
     if not (speaker_counts == 1).all():
         print(f"  ⚠️ Warning: Some speakers appear in multiple folds: {speaker_counts[speaker_counts > 1]}")
-        # Keep only one prediction per speaker (first occurrence)
         oof = oof.drop_duplicates(subset=["speaker_id"], keep="first")
     
     print(f"  OOF predictions: {len(oof)} speakers")
     
-    # Calculate aggregate metrics
     aggregate_metrics = aggregate_oof_predictions(oof, args)
     
-    # Save OOF results
     oof.to_csv(audio_dir / "oof_predictions.csv", index=False)
-    
-    # Save fold metrics
     pd.DataFrame(fold_metrics).to_csv(audio_dir / "fold_metrics.csv", index=False)
-    
-    # Save fold details
     pd.DataFrame(fold_details).to_csv(audio_dir / "fold_details.csv", index=False)
     
-    # Save aggregate metrics
     with open(audio_dir / "aggregate_metrics.json", "w") as f:
         json.dump(convert_to_serializable(aggregate_metrics), f, indent=2)
     
-    # Print summary
     print(f"\n  {'='*50}")
     print(f"  AUDIO-ONLY CV COMPLETE")
     print(f"  {'='*50}")
@@ -2077,12 +1893,13 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
         "oof_predictions": oof,
         "cv_dir": audio_dir,
     }
+
+
 # =======================================================================
-# FUSION METHODS (LEAKAGE-SAFE)
+# FUSION METHODS (LEAKAGE-SAFE) - FIXED INDEX HANDLING
 # =======================================================================
 
 def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hparams, out_dir):
-    """Leakage-safe audio/text fusion using the same five outer speaker folds."""
     if audio_df is None or audio_df.empty:
         return {}
 
@@ -2119,9 +1936,11 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         speakers_tr = set(tr.speaker_id)
         speakers_va = set(va.speaker_id)
 
-        # Audio table is merged only after splitting by speaker.
+        # Audio: set index to speaker_id
         atr = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_tr)].copy()
         ava = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_va)].copy()
+        atr = atr.set_index("speaker_id")
+        ava = ava.set_index("speaker_id")
 
         # Build fold-safe text representation.
         q_scores = safe_question_cv_scores(tr, metadata, args, best_hparams, questions, fold_dir)
@@ -2142,27 +1961,38 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         vf, _ = build_feature_table(vpaths, list(vpaths))
         tf, vf, _ = align_feature_tables(tf, vf, pd.DataFrame(), tc)
         
-        # Speaker-level audio + text tables
-        atr = atr.drop_duplicates("speaker_id").set_index("speaker_id")
-        ava = ava.drop_duplicates("speaker_id").set_index("speaker_id")
-        tf = tf.drop_duplicates("speaker_id").set_index("speaker_id")
-        vf = vf.drop_duplicates("speaker_id").set_index("speaker_id")
-        
+        # Now tf and vf have speaker_id as index; atr and ava also have speaker_id as index
+        # Find common speakers
         common_tr = tf.index.intersection(atr.index)
         common_va = vf.index.intersection(ava.index)
-        tf, atr = tf.loc[common_tr], atr.loc[common_tr]
-        vf, ava = vf.loc[common_va], ava.loc[common_va]
+        tf = tf.loc[common_tr]
+        atr = atr.loc[common_tr]
+        vf = vf.loc[common_va]
+        ava = ava.loc[common_va]
         
         ytr = tf["y_true"].to_numpy()
         yva = vf["y_true"].to_numpy()
         tx = [c for c in tf.columns if "__" in c]
         ax = [c for c in atr.columns if c not in ("y_true",)]
-        Xtr_t, Xva_t = tf[tx].to_numpy(float), vf[tx].to_numpy(float)
-        Xtr_a, Xva_a = atr[ax].to_numpy(float), ava[ax].to_numpy(float)
+        Xtr_t = tf[tx].to_numpy(float)
+        Xva_t = vf[tx].to_numpy(float)
+
+        n_pca = getattr(args, 'pca_text_components', 0)
+        if n_pca > 0 and Xtr_t.shape[1] > n_pca:
+            n_components = min(n_pca, Xtr_t.shape[0] - 1, Xtr_t.shape[1])
+            if n_components > 1:
+                pca = PCA(n_components=n_components, random_state=args.seed)
+                Xtr_t = pca.fit_transform(Xtr_t)
+                Xva_t = pca.transform(Xva_t)
+                print(f"    PCA reduced text features to {n_components}")
+
+        Xtr_a = atr[ax].to_numpy(float)
+        Xva_a = ava[ax].to_numpy(float)
         Xtr = np.hstack([Xtr_t, Xtr_a])
         Xva = np.hstack([Xva_t, Xva_a])
 
-        def fit_predict(kind, X_train, X_val):
+        # ✅ FIXED: fit_predict now accepts y_train and y_val
+        def fit_predict(kind, X_train, X_val, y_train, y_val):
             if kind == "mlp":
                 from sklearn.neural_network import MLPClassifier, MLPRegressor
                 scaler = StandardScaler()
@@ -2175,15 +2005,15 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     m = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
                                      random_state=args.seed + fold_idx,
                                      early_stopping=True, validation_fraction=0.1)
-                m.fit(A, ytr)
+                m.fit(A, y_train)
                 return m, m.predict(B), m.predict_proba(B) if hasattr(m, "predict_proba") else None
             
             m = make_meta_model(args)
-            m.fit(X_train, ytr)
+            m.fit(X_train, y_train)
             
-            # Find optimal threshold for this model
             if args.task == "classification":
-                best_threshold, _ = find_optimal_threshold(m, X_val, ytr, metric='f1')
+                # ✅ Use y_val (validation labels) for threshold tuning
+                best_threshold, _ = find_optimal_threshold(m, X_val, y_val, metric='f1')
                 p, pr = predict_with_threshold(m, X_val, best_threshold)
                 return m, p, pr
             else:
@@ -2201,8 +2031,8 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         
         for method in methods:
             if method in ("late", "confidence", "interaction", "moe"):
-                mt, pt, prt = fit_predict("base", Xtr_t, Xva_t)
-                ma, pa, pra = fit_predict("base", Xtr_a, Xva_a)
+                mt, pt, prt = fit_predict("base", Xtr_t, Xva_t, ytr, yva)
+                ma, pa, pra = fit_predict("base", Xtr_a, Xva_a, ytr, yva)
                 if args.task == "classification" and prt is not None and pra is not None:
                     if method == "confidence":
                         conf_t = np.max(mt.predict_proba(Xtr_t), axis=1).mean()
@@ -2219,7 +2049,7 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     proba = None
             else:
                 m, pred, proba_full = fit_predict("mlp" if method == "mlp" else "base",
-                                                  *method_inputs[method])
+                                                  *method_inputs[method], ytr, yva)
                 proba = proba_full[:, 1] if (args.task == "classification" and proba_full is not None and proba_full.shape[1] == 2) else None
 
             metrics = score_meta_model(None, pred, yva, args.task)
@@ -2251,65 +2081,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         )
 
     return result
-
-def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
-    """Clean up temporary directories created during hyperparameter search."""
-    if not temp_dir.exists():
-        return
-    
-    # List of temp directories to clean
-    temp_patterns = [
-        "temp_hpo",
-        "temp_hpo_optuna", 
-        "temp_*",
-        "*_temp",
-        "tmp_*",
-        "cache_*",
-        "optuna_*"
-    ]
-    
-    for pattern in temp_patterns:
-        for d in temp_dir.glob(pattern):
-            if d.is_dir():
-                try:
-                    shutil.rmtree(d)
-                    print(f"  ✓ Removed {d}")
-                except Exception as e:
-                    if force:
-                        # Try harder - delete files individually
-                        try:
-                            for f in d.glob("*"):
-                                try:
-                                    if f.is_file():
-                                        f.unlink()
-                                    elif f.is_dir():
-                                        shutil.rmtree(f)
-                                except:
-                                    pass
-                            shutil.rmtree(d)
-                            print(f"  ✓ Force removed {d}")
-                        except Exception as e2:
-                            print(f"  ⚠️ Could not remove {d}: {e2}")
-                    else:
-                        print(f"  ⚠️ Could not remove {d}: {e}")
-    
-    # Also remove any .pkl cache files
-    for f in temp_dir.glob("*.pkl"):
-        try:
-            f.unlink()
-            print(f"  ✓ Removed {f}")
-        except:
-            pass
-    
-    # Remove empty directories
-    for d in temp_dir.glob("*"):
-        if d.is_dir() and not any(d.iterdir()):
-            try:
-                d.rmdir()
-                print(f"  ✓ Removed empty directory {d}")
-            except:
-                pass
-
 
 # =======================================================================
 # MAIN
@@ -2391,6 +2162,33 @@ def build_parser():
                         default="smote",
                         help="Imbalance handling method (default: smote)")
     
+    # Add missing attributes
+    parser.add_argument("--xgb-lr", type=float, default=0.1,
+                        help="Learning rate for XGBoost/HistGradientBoosting")
+    parser.add_argument("--logreg-C", type=float, default=1.0,
+                        help="Regularization strength for logistic regression")
+    parser.add_argument("--ridge-alpha", type=float, default=1.0,
+                        help="Alpha for Ridge regression")
+    parser.add_argument("--svm-kernel", type=str, default="rbf",
+                        help="Kernel for SVM")
+    parser.add_argument("--svm-C", type=float, default=1.0,
+                        help="C for SVM")
+    parser.add_argument("--svm-gamma", type=str, default="scale",
+                        help="Gamma for SVM")
+    parser.add_argument("--svm-epsilon", type=float, default=0.1,
+                        help="Epsilon for SVR")
+    parser.add_argument("--knn-neighbors", type=int, default=5,
+                        help="Number of neighbors for KNN")
+    parser.add_argument("--elasticnet-alpha", type=float, default=1.0,
+                        help="Alpha for ElasticNet")
+    parser.add_argument("--elasticnet-l1-ratio", type=float, default=0.5,
+                        help="L1 ratio for ElasticNet")
+    parser.add_argument("--lasso-alpha", type=float, default=1.0,
+                        help="Alpha for Lasso")
+
+    parser.add_argument("--pca-text-components", type=int, default=0,
+                    help="Number of PCA components to use (0 = no PCA)")
+    
     return parser
 
 
@@ -2438,7 +2236,7 @@ def main():
         )
         print(f"Loaded {len(get_audio_feature_cols(audio_df))} audio features for {len(audio_df)} speakers")
 
-    # HPO using training data only
+    # HPO
     best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
     if best_hparams_path.exists() and not args.force_hpo:
         best_hparams = json.loads(best_hparams_path.read_text())
@@ -2465,9 +2263,7 @@ def main():
         if key in best_hparams:
             setattr(args, key, best_hparams[key])
 
-    # ============================================================
-    # AUDIO-ONLY CV
-    # ============================================================
+    # Audio-only CV
     audio_only_result = None
     if audio_df is not None:
         print("\n" + "=" * 60)
@@ -2477,9 +2273,7 @@ def main():
         if audio_only_result:
             print(f"  Audio-only aggregate macro_f1: {audio_only_result['aggregate_metrics'].get('macro_f1', 0):.4f}")
 
-    # ============================================================
-    # TEXT 5-FOLD OOF CV
-    # ============================================================
+    # Text CV
     print("\n" + "=" * 60)
     print("📝 TEXT 5-FOLD OOF CV")
     print("=" * 60)
@@ -2493,9 +2287,7 @@ def main():
     )
     cv_result["oof_predictions"].to_csv(out_dir / "cv_oof_predictions.csv", index=False)
 
-    # ============================================================
-    # PRODUCTION MODEL / HELD-OUT TEST
-    # ============================================================
+    # Production model
     if not final_test.empty:
         print("\nTraining production model on train+validation only...")
         _, train_features, test_features, selected_cols, test_metrics = train_production_text_model(
@@ -2510,9 +2302,7 @@ def main():
             trainval, pd.DataFrame(), metadata, args, best_hparams, cv_result, out_dir
         )
 
-    # ============================================================
-    # AUDIO/TEXT FUSION -- same outer folds
-    # ============================================================
+    # Fusion
     if audio_df is not None:
         try:
             print("\n" + "=" * 60)
