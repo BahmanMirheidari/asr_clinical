@@ -1329,7 +1329,7 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
             print(f"  ⚠️ PCA skipped: not enough samples or features")
 
     model = make_meta_model(args)
-    model.fit(Xtr_pca, ytr)
+    model.fit(Xtr, ytr)
     
     if args.task == "classification":
         best_threshold, best_score = find_optimal_threshold(
@@ -1635,6 +1635,7 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
 
     X_train = train_features[selected_cols].to_numpy(dtype=float)
     y_train = train_features["y_true"].to_numpy()
+    pca = None   # ✅ initialize
     n_pca = getattr(args, 'pca_text_components', 0)
     if n_pca > 0 and X_train.shape[1] > n_pca:
         n_components = min(n_pca, X_train.shape[0] - 1, X_train.shape[1])
