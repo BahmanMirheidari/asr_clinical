@@ -876,16 +876,16 @@ def objective_function_all_questions(
 ) -> float:
     params = {
         "learning_rate": trial.suggest_float("learning_rate", 5e-6, 1e-5, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [4, 8]),
-        "epochs": trial.suggest_int("epochs", 2, 8),
-        "patience": 2,
+        "batch_size": trial.suggest_categorical("batch_size", [2, 4, 8, 16]),
+        "epochs": trial.suggest_int("epochs", 5, 15),
+        "patience": 3,
         "weight_decay": trial.suggest_float("weight_decay", 0.01, 0.1),
-        "dropout_rate": trial.suggest_float("dropout_rate", 0.3, 0.5),
+        "dropout_rate": trial.suggest_float("dropout_rate", 0.05, 0.25),
         "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.05),
-        "max_length": trial.suggest_categorical("max_length", [128]),
-        "focal_gamma": trial.suggest_float("focal_gamma", 1.0, 3.0, log=True),
+        "max_length": trial.suggest_categorical("max_length", [64,128,256,512]),
+        "focal_gamma": trial.suggest_float("focal_gamma", 1.0, 2.0, log=True),
         "label_smoothing": trial.suggest_float("label_smoothing", 0.05, 0.2),
-        "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.5, 2.0, log=True),
+        "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.1, 1.0, log=True),
     }
     all_question_scores = []
     for fold_idx, (fold_train, fold_val) in enumerate(folds):
@@ -2100,7 +2100,7 @@ def build_parser():
     parser.add_argument("--train-frac", type=float, default=0.8)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
-    parser.add_argument("--n-cv-folds", type=int, default=5)
+    parser.add_argument("--n-cv-folds", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     
     parser.add_argument("--max-length", type=int, default=256)
@@ -2110,7 +2110,7 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     
-    parser.add_argument("--hpo-n-trials", type=int, default=30)
+    parser.add_argument("--hpo-n-trials", type=int, default=10)
     parser.add_argument("--hpo-timeout", type=int, default=None)
     parser.add_argument("--hpo-folds", type=int, default=5)
     parser.add_argument("--force-hpo", action="store_true")
