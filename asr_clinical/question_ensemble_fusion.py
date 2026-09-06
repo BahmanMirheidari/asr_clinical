@@ -6,7 +6,7 @@ import random
 import shutil
 from pathlib import Path
 from itertools import product
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any, Union, Set
 from dataclasses import dataclass
 import warnings
 warnings.filterwarnings('ignore')
@@ -18,7 +18,8 @@ import torch
 from sklearn.ensemble import (
     RandomForestClassifier, RandomForestRegressor,
     GradientBoostingClassifier, GradientBoostingRegressor,
-    VotingClassifier, VotingRegressor
+    VotingClassifier, VotingRegressor,
+    StackingClassifier, StackingRegressor
 )
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import (
@@ -46,6 +47,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import FunctionTransformer
 from sklearn.base import ClassifierMixin, RegressorMixin
 from sklearn.cluster import KMeans
+from sklearn.cross_decomposition import CCA
 
 from xgboost import XGBClassifier, XGBRegressor
 from transformers import AutoModelForSequenceClassification
@@ -64,13 +66,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 
-# Import imbalance handling
 from imblearn.over_sampling import SMOTE, ADASYN
 from imblearn.combine import SMOTETomek
 from imblearn.pipeline import Pipeline as ImbPipeline
-from sklearn.decomposition import PCA
 
-# Cache directory
 os.environ['HF_HOME'] = '/home/bahman/.cache/huggingface'
 os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers'
 
@@ -115,10 +114,8 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
 
 
 def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
-    """Clean up temporary directories created during hyperparameter search."""
     if not temp_dir.exists():
         return
-    
     temp_patterns = [
         "temp_hpo",
         "temp_hpo_optuna", 
@@ -128,7 +125,6 @@ def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
         "cache_*",
         "optuna_*"
     ]
-    
     for pattern in temp_patterns:
         for d in temp_dir.glob(pattern):
             if d.is_dir():
@@ -152,14 +148,12 @@ def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
                             print(f"  ⚠️ Could not remove {d}: {e2}")
                     else:
                         print(f"  ⚠️ Could not remove {d}: {e}")
-    
     for f in temp_dir.glob("*.pkl"):
         try:
             f.unlink()
             print(f"  ✓ Removed {f}")
         except:
             pass
-    
     for d in temp_dir.glob("*"):
         if d.is_dir() and not any(d.iterdir()):
             try:
@@ -169,25 +163,29 @@ def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
                 pass
 
 
+def load_subgroup_ids(filepath: Path) -> Set[str]:
+    if not filepath.exists():
+        raise FileNotFoundError(f"Subgroup file not found: {filepath}")
+    with open(filepath, 'r') as f:
+        ids = [line.strip() for line in f if line.strip()]
+    return set(ids)
+
+
 # =======================================================================
-# MODEL CREATION FUNCTIONS WITH IMBALANCE HANDLING
+# MODEL CREATION FUNCTIONS
 # =======================================================================
 
 def create_balanced_pipeline(base_model, args, method='smote'):
     if args.task != "classification":
         return base_model
-    
     use_imbalance = getattr(args, 'use_smote', False)
     if not use_imbalance:
         return base_model
-    
     if isinstance(base_model, VotingClassifier):
-        print("  ⚠️ Skipping SMOTE wrap on VotingClassifier (already applied to individual models)")
+        print("  ⚠️ Skipping SMOTE wrap on VotingClassifier")
         return base_model
-    
     k_neighbors = min(getattr(args, 'smote_k_neighbors', 3), 5)
     sampling_strategy = getattr(args, 'smote_sampling_strategy', 'auto')
-    
     if method == 'smote':
         imbalance = SMOTE(random_state=args.seed, k_neighbors=k_neighbors, sampling_strategy=sampling_strategy)
     elif method == 'adasyn':
@@ -196,7 +194,6 @@ def create_balanced_pipeline(base_model, args, method='smote'):
         imbalance = SMOTETomek(random_state=args.seed, sampling_strategy=sampling_strategy)
     else:
         return base_model
-    
     if isinstance(base_model, Pipeline):
         preprocessors = []
         model_step = None
@@ -214,7 +211,6 @@ def create_balanced_pipeline(base_model, args, method='smote'):
                 ('model', base_model)
             ])
         return ImbPipeline([*preprocessors, ('imbalance', imbalance), ('model', model_step)])
-    
     elif isinstance(base_model, (RandomForestClassifier, GradientBoostingClassifier,
                                  HistGradientBoostingClassifier, LogisticRegression,
                                  SVC, KNeighborsClassifier)):
@@ -408,17 +404,14 @@ def create_elasticnet(task, args):
 def create_ensemble_model(task, args):
     ensemble_models = getattr(args, 'ensemble_models', ['linear', 'random_forest', 'hist_gradient_boosting'])
     regression_only_models = ['ridge', 'lasso', 'elasticnet']
-    
     if task == "classification":
         invalid_models = [m for m in ensemble_models if m in regression_only_models]
         if invalid_models:
             print(f"Warning: Removing regression-only models from classification ensemble: {invalid_models}")
             ensemble_models = [m for m in ensemble_models if m not in regression_only_models]
-    
     if not ensemble_models:
         print("Error: No valid models for ensemble. Falling back to linear model.")
         return create_linear_model(task, args)
-    
     model_creators = {
         'linear': create_linear_model,
         'ridge': create_ridge,
@@ -430,11 +423,9 @@ def create_ensemble_model(task, args):
         'hist_gradient_boosting': create_hist_gradient_boosting,
         'knn': create_knn,
     }
-    
     estimators = []
     successful_models = []
     print(f"\nCreating ensemble for {task} task with models: {ensemble_models}")
-    
     for model_name in ensemble_models:
         if model_name not in model_creators:
             print(f"  ✗ Unknown model '{model_name}', skipping")
@@ -446,11 +437,9 @@ def create_ensemble_model(task, args):
             print(f"  ✓ Added {model_name} to ensemble")
         except Exception as e:
             print(f"  ✗ Failed to create {model_name}: {e}")
-    
     if not estimators:
         print("\nNo valid ensemble models. Falling back to linear model.")
         return create_linear_model(task, args)
-    
     if task == "classification":
         voting_type = getattr(args, 'ensemble_voting', 'soft')
         ensemble = VotingClassifier(
@@ -473,7 +462,6 @@ def create_ensemble_model(task, args):
 
 def make_meta_model(args):
     use_smote = getattr(args, 'use_smote', False)
-    
     if getattr(args, 'use_ensemble', False):
         print("\n" + "=" * 50)
         print("CREATING ENSEMBLE META-MODEL")
@@ -520,7 +508,6 @@ def find_optimal_threshold(model, X_val, y_val, metric='f1'):
         y_proba = model.predict_proba(X_val)[:, 1]
     except:
         return 0.5, 0.0
-    
     thresholds = np.linspace(0.0, 1.0, 101)
     best_threshold = 0.5
     best_score = -np.inf
@@ -560,7 +547,7 @@ def predict_with_threshold(model, X, threshold=0.5):
 
 
 # =======================================================================
-# SCORING FUNCTIONS
+# SCORING FUNCTIONS (with subgroup support)
 # =======================================================================
 
 def score_meta_model(model, x, y, task, threshold=0.5):
@@ -581,7 +568,6 @@ def score_meta_model(model, x, y, task, threshold=0.5):
         else:
             pred = model.predict(x)
             proba = None
-
     if task == "classification":
         is_binary = len(np.unique(y)) == 2
         metrics = {
@@ -623,6 +609,45 @@ def primary_score(metrics: dict, task: str) -> float:
         return metrics.get("f1", metrics.get("macro_f1", 0.0))
     else:
         return -metrics.get("rmse", float('inf'))
+
+
+def compute_subgroup_metrics(df, args, subgroup_ids=None):
+    """
+    Compute metrics for all, subgroup, and non-subgroup.
+    Returns a dict with keys 'all', 'subgroup', 'non_subgroup' (if subgroup_ids provided).
+    """
+    if df.empty:
+        return {}
+    def _metrics(sub):
+        if sub.empty:
+            return {}
+        y_true = sub["y_true"].to_numpy()
+        y_pred = sub["y_pred"].to_numpy()
+        # Ensure int for classification if needed
+        if args.task == "classification":
+            y_true = y_true.astype(int)
+            y_pred = y_pred.astype(int)
+        metrics = score_meta_model(None, y_pred, y_true, args.task)
+        if args.task == "classification" and "y_proba" in sub.columns:
+            try:
+                probs = sub["y_proba"].to_numpy()
+                probs = np.clip(probs, 0, 1)
+                if len(np.unique(y_true)) == 2:
+                    metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
+                else:
+                    metrics["roc_auc_ovr"] = float(roc_auc_score(y_true, probs, multi_class='ovr', average='macro'))
+            except Exception:
+                pass
+        return metrics
+    results = {"all": _metrics(df)}
+    if subgroup_ids is not None:
+        sub_mask = df["speaker_id"].isin(subgroup_ids)
+        results["subgroup"] = _metrics(df[sub_mask])
+        results["non_subgroup"] = _metrics(df[~sub_mask])
+    else:
+        results["subgroup"] = None
+        results["non_subgroup"] = None
+    return results
 
 
 # =======================================================================
@@ -682,7 +707,6 @@ class SplitManager:
             val_df = pd.read_csv(val_path)
             test_df = pd.read_csv(test_path)
             return train_df, val_df, test_df
-
         if self.test_frac == 0:
             rel_val_frac = self.val_frac / (self.train_frac + self.val_frac)
             train_idx, val_idx = self._speaker_split(df, rel_val_frac, self.seed)
@@ -694,7 +718,6 @@ class SplitManager:
             empty_test = pd.DataFrame(columns=df.columns)
             empty_test.to_csv(test_path, index=False)
             return train_df, val_df, test_df
-
         trainval_idx, test_idx = self._speaker_split(df, self.test_frac, self.seed)
         trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
         test_df = df.iloc[test_idx].reset_index(drop=True)
@@ -950,7 +973,6 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
     from transformers import AutoModelForSequenceClassification
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
-    
     model_dir = Path(cfg.output_dir) / "model"
     if not (model_dir.exists() and saved_model_exists(model_dir)):
         try:
@@ -958,18 +980,15 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
         except Exception as e:
             print(f"Training failed: {e}")
             return None
-
     try:
         device = choose_device()
         tokenizer = load_tokenizer(str(model_dir))
         model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
         model.eval()
-
         texts = val_df["text"].tolist()
         labels = val_df["label"].values
         preds = []
         batch_size = min(cfg.eval_batch_size, len(texts))
-
         with torch.no_grad():
             for start in range(0, len(texts), batch_size):
                 batch_texts = texts[start:start+batch_size]
@@ -992,7 +1011,6 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
                     else:
                         batch_preds = logits.flatten()
                     preds.extend(batch_preds.tolist())
-
         preds = np.array(preds)
         labels = np.array(labels)
         if len(preds) != len(labels):
@@ -1015,12 +1033,10 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
 def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path, max_length: int):
     if output_csv.exists() and not args.force_embeddings:
         return pd.read_csv(output_csv)
-
     device = choose_device()
     tokenizer = load_tokenizer(str(model_dir))
     model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
     model.eval()
-
     rows = []
     texts = df["text"].tolist()
     for start in range(0, len(texts), args.embedding_batch_size):
@@ -1029,10 +1045,7 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
                         max_length=max_length, return_tensors="pt")
         enc = {k: v.to(device) for k, v in enc.items()}
         outputs = model(**enc, output_hidden_states=True)
-        #embeddings = mean_pool(outputs.hidden_states[-1], enc["attention_mask"]).cpu().numpy()
-        # CLS token (first token) embedding
         embeddings = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
-
         for row_idx, embedding in enumerate(embeddings):
             meta = batch_df.iloc[row_idx]
             row = {
@@ -1044,7 +1057,6 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
             }
             row.update({f"emb_{i}": float(v) for i, v in enumerate(embedding)})
             rows.append(row)
-
     emb_df = pd.DataFrame(rows)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     emb_df.to_csv(output_csv, index=False)
@@ -1052,13 +1064,12 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
 
 
 # =======================================================================
-# FEATURE TABLE BUILDING - SMART FILL WITH AVERAGES
+# FEATURE TABLE BUILDING
 # =======================================================================
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
     tables = []
     question_means = {}
-    
     for q in questions:
         path = embedding_paths.get(q)
         if path is None or not Path(path).exists():
@@ -1069,56 +1080,41 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
             if emb_df.empty:
                 print(f"⚠️ WARNING: Empty embedding file for question {q}")
                 continue
-                
             emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
             if not emb_cols:
                 print(f"⚠️ WARNING: No embedding columns for question {q}")
                 continue
-                
-            # Group by speaker_id, keep as index
             grouped = emb_df.groupby("speaker_id", as_index=True).agg(
                 y_true=("y_true", "first"),
                 **{col: (col, "mean") for col in emb_cols},
             )
             grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
             grouped[f"{q}__present"] = 1.0
-            
-            # Store mean for filling
             question_means[q] = grouped[[f"{q}__{col}" for col in emb_cols]].mean()
-            
             print(f"  ✓ {q}: {len(grouped)} speakers")
             tables.append(grouped)
         except Exception as e:
             print(f"Error processing embeddings for question {q}: {e}")
             continue
-    
     if not tables:
         raise ValueError("No embedding tables available.")
-    
-    # OUTER join to keep all speakers
     merged = tables[0]
     for t in tables[1:]:
         merged = merged.join(t.drop(columns=["y_true"]), how="outer")
         merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
-    
     print(f"  After OUTER join: {len(merged)} speakers")
-    
-    # Fill missing values with question means
     for q in questions:
         if q in question_means:
             q_cols = [c for c in merged.columns if c.startswith(f"{q}__")]
             for col in q_cols:
                 if col in question_means[q]:
                     merged[col] = merged[col].fillna(question_means[q][col])
-    
-    # DO NOT reset index - keep speaker_id as index
     feature_cols = [c for c in merged.columns if "__" in c]
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
     return merged, feature_cols
 
 
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
-    # Ensure speaker_id is index for all
     for df in [val_df, test_df]:
         if df is not None and not df.empty:
             if 'speaker_id' in df.columns:
@@ -1141,7 +1137,7 @@ def question_groups(feature_cols):
 
 
 # =======================================================================
-# SPEAKER-LEVEL FOLD CREATION (LEAKAGE-SAFE)
+# SPEAKER-LEVEL FOLD CREATION
 # =======================================================================
 
 def make_outer_folds(df: pd.DataFrame, args):
@@ -1153,7 +1149,6 @@ def make_outer_folds(df: pd.DataFrame, args):
     else:
         splitter = KFold(n_splits=args.n_cv_folds, shuffle=True, random_state=args.seed)
         splits = splitter.split(speakers)
-
     folds = []
     for fold_idx, (tr_idx, va_idx) in enumerate(splits):
         tr_sp = set(speakers.iloc[tr_idx]["speaker_id"])
@@ -1167,7 +1162,7 @@ def make_outer_folds(df: pd.DataFrame, args):
 
 
 # =======================================================================
-# QUESTION MODEL TRAINING (LEAKAGE-SAFE)
+# QUESTION MODEL TRAINING
 # =======================================================================
 
 def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dict) -> TrainConfig:
@@ -1207,16 +1202,13 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
     q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
     if q_train.empty:
         return None, None, None
-
     q_dir = Path(fold_dir) / "question_models" / question
     model_dir = q_dir / "model"
     q_dir.mkdir(parents=True, exist_ok=True)
     cfg = make_question_cfg(args, question, q_dir, best_hparams)
-
     train_one_fold(q_train, q_val, cfg, metadata, q_dir)
     if not saved_model_exists(model_dir):
         raise FileNotFoundError(f"Missing question model: {model_dir}")
-
     train_emb = q_dir / "embeddings_train.csv"
     val_emb = q_dir / "embeddings_val.csv"
     extract_embeddings(model_dir, q_train, args, train_emb,
@@ -1234,7 +1226,6 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
     speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
     if len(speakers) < 6:
         return {q: 0.0 for q in questions}
-
     if args.task == "classification":
         counts = speakers["label"].value_counts()
         if counts.min() < 2:
@@ -1244,12 +1235,10 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
     else:
         inner = KFold(n_splits=2, shuffle=True, random_state=args.seed + 7919)
         split = next(inner.split(speakers))
-
     tr_sp = set(speakers.iloc[split[0]]["speaker_id"])
     va_sp = set(speakers.iloc[split[1]]["speaker_id"])
     inner_train = train_df[train_df["speaker_id"].isin(tr_sp)].reset_index(drop=True)
     inner_val = train_df[train_df["speaker_id"].isin(va_sp)].reset_index(drop=True)
-
     scores = {}
     score_dir = Path(fold_dir) / "inner_question_selection"
     for q in questions:
@@ -1301,7 +1290,7 @@ def select_questions_from_scores(scores, args):
 
 
 # =======================================================================
-# META-MODEL TRAINING (LEAKAGE-SAFE)
+# META-MODEL TRAINING
 # =======================================================================
 
 def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
@@ -1310,13 +1299,14 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
                 if c.split("__", 1)[0] in set(selected_questions)]
     if not selected:
         raise ValueError("No selected features available for meta-model")
-
     Xtr = train_features[selected].to_numpy(dtype=float)
     Xva = val_features[selected].to_numpy(dtype=float)
     ytr = train_features["y_true"].to_numpy()
     yva = val_features["y_true"].to_numpy()
-    
-    # Apply PCA if requested
+    # Ensure int for classification
+    if args.task == "classification":
+        ytr = ytr.astype(int)
+        yva = yva.astype(int)
     n_pca = getattr(args, 'pca_text_components', 0)
     if n_pca > 0:
         n_components = min(n_pca, Xtr.shape[0] - 1, Xtr.shape[1])
@@ -1327,10 +1317,8 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
             print(f"  PCA reduced features from {Xtr.shape[1]} to {n_components}")
         else:
             print(f"  ⚠️ PCA skipped: not enough samples or features")
-
     model = make_meta_model(args)
     model.fit(Xtr, ytr)
-    
     if args.task == "classification":
         best_threshold, best_score = find_optimal_threshold(
             model, Xva, yva, metric='f1'
@@ -1353,16 +1341,18 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
         pred = model.predict(Xva)
         proba = None
         best_threshold = None
-    
     metrics = score_meta_model(model, Xva, yva, args.task, threshold=best_threshold or 0.5)
     if args.task == "classification":
         metrics['optimal_threshold'] = best_threshold
         metrics['threshold_score'] = best_score
-    
-    return model, pred, proba, metrics, selected 
+    return model, pred, proba, metrics, selected
 
 
-def aggregate_oof_predictions(oof_df, args):
+# =======================================================================
+# AGGREGATE PREDICTIONS WITH SUBGROUP
+# =======================================================================
+
+def aggregate_oof_predictions(oof_df, args, subgroup_ids: Set[str] = None):
     print("    Aggregating OOF predictions...")
     if oof_df is None or oof_df.empty:
         print("    ❌ OOF DataFrame is empty!")
@@ -1373,61 +1363,14 @@ def aggregate_oof_predictions(oof_df, args):
     if missing:
         print(f"    ❌ Missing columns: {missing}")
         return {}
-    y_true = oof_df["y_true"].to_numpy()
-    y_pred = oof_df["y_pred"].to_numpy()
-    print(f"    y_true shape: {y_true.shape}, unique: {np.unique(y_true)}")
-    print(f"    y_pred shape: {y_pred.shape}, unique: {np.unique(y_pred)}")
-    
-    if args.task == "classification":
-        from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score, confusion_matrix
-        metrics = {}
-        try:
-            metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
-            metrics["macro_f1"] = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
-            metrics["weighted_f1"] = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
-            metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
-        except Exception as e:
-            print(f"    ⚠️ Basic metrics failed: {e}")
-        if len(np.unique(y_true)) == 2:
-            try:
-                tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-                metrics["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                metrics["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-                metrics["precision"] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                metrics["npv"] = tn / (tn + fn) if (tn + fn) > 0 else 0.0
-                metrics["accuracy"] = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
-                metrics["f1"] = 2 * (metrics["precision"] * metrics["sensitivity"]) / (metrics["precision"] + metrics["sensitivity"]) if (metrics["precision"] + metrics["sensitivity"]) > 0 else 0.0
-                metrics["confusion_matrix"] = [[int(tn), int(fp)], [int(fn), int(tp)]]
-            except Exception as e:
-                print(f"    ⚠️ Binary metrics failed: {e}")
-        if "y_proba" in oof_df.columns:
-            try:
-                probs = oof_df["y_proba"].to_numpy()
-                probs = np.clip(probs, 0, 1)
-                if len(np.unique(y_true)) == 2:
-                    metrics["roc_auc"] = float(roc_auc_score(y_true, probs))
-                else:
-                    metrics["roc_auc_ovr"] = float(roc_auc_score(y_true, probs, multi_class='ovr', average='macro'))
-            except Exception as e:
-                print(f"    ⚠️ AUC calculation failed: {e}")
-        return metrics
-    else:
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-        metrics = {}
-        try:
-            metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-            metrics["mae"] = float(mean_absolute_error(y_true, y_pred))
-            metrics["r2"] = float(r2_score(y_true, y_pred))
-        except Exception as e:
-            print(f"    ⚠️ Regression metrics failed: {e}")
-        return metrics
+    return compute_subgroup_metrics(oof_df, args, subgroup_ids)
 
 
 # =======================================================================
-# TEXT CV (LEAKAGE-SAFE) - Fixed Index Handling
+# TEXT CV (with subgroup)
 # =======================================================================
 
-def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
+def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, subgroup_ids=None):
     print(f"\n  Entering leakage_safe_text_cv()")
     print(f"  trainval_df shape: {trainval_df.shape}")
     print(f"  Number of speakers: {trainval_df.speaker_id.nunique()}")
@@ -1506,7 +1449,6 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
             fold_train_features, fold_val_features, pd.DataFrame(), fold_cols
         )
 
-        # Check duplicates using index (speaker_id)
         if fold_train_features.index.duplicated().any() or fold_val_features.index.duplicated().any():
             raise RuntimeError(f"Fold {fold_idx}: duplicate speaker after aggregation")
         if set(fold_train_features.index) & set(fold_val_features.index):
@@ -1522,7 +1464,6 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
             if isinstance(v, (int, float, np.integer, np.floating))
         }})
 
-        # Reset index to get speaker_id as a column for saving
         val_out = fold_val_features.reset_index()[["speaker_id", "y_true"]].copy()
         val_out["fold"] = fold_idx
         val_out["y_pred"] = pred
@@ -1544,7 +1485,7 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
     if not (counts == 1).all():
         raise RuntimeError("OOF aggregation failed: a speaker occurs in multiple folds")
 
-    aggregate_metrics = aggregate_oof_predictions(oof, args)
+    aggregate_metrics = aggregate_oof_predictions(oof, args, subgroup_ids)
     pd.DataFrame(fold_rows).to_csv(cv_dir / "fold_metrics.csv", index=False)
     pd.DataFrame(fold_question_rows).to_csv(cv_dir / "question_selection_all_folds.csv", index=False)
     oof.to_csv(cv_dir / "oof_predictions.csv", index=False)
@@ -1577,11 +1518,11 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir):
 
 
 # =======================================================================
-# TRAIN PRODUCTION MODEL (HELD-OUT TEST)
+# TRAIN PRODUCTION MODEL (with subgroup test metrics)
 # =======================================================================
 
 def train_production_text_model(trainval_df, test_df, metadata, args,
-                                 best_hparams, cv_result, out_dir):
+                                 best_hparams, cv_result, out_dir, subgroup_ids=None):
     out_dir = Path(out_dir)
     prod_dir = out_dir / "production_model"
     prod_dir.mkdir(parents=True, exist_ok=True)
@@ -1635,7 +1576,9 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
 
     X_train = train_features[selected_cols].to_numpy(dtype=float)
     y_train = train_features["y_true"].to_numpy()
-    pca = None   # ✅ initialize
+    if args.task == "classification":
+        y_train = y_train.astype(int)
+    pca = None
     n_pca = getattr(args, 'pca_text_components', 0)
     if n_pca > 0 and X_train.shape[1] > n_pca:
         n_components = min(n_pca, X_train.shape[0] - 1, X_train.shape[1])
@@ -1646,7 +1589,6 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
             print(f"  Production PCA reduced text features to {n_components}")
         else:
             print(f"  ⚠️ Production PCA skipped")
-    
 
     model = make_meta_model(args)
     model.fit(X_train, y_train)
@@ -1657,7 +1599,6 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
     )
 
     if args.task == "classification":
-        # Average the thresholds from CV folds
         threshold_file = cv_result["cv_dir"] / "fold_metrics.csv"
         if threshold_file.exists():
             fold_df = pd.read_csv(threshold_file)
@@ -1669,17 +1610,22 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
         else:
             avg_threshold = 0.5
             print("  No CV thresholds found, using default 0.5")
+    else:
+        avg_threshold = None
 
     if not test_features.empty:
         Xtest = test_features[selected_cols].to_numpy(dtype=float)
         ytest = test_features["y_true"].to_numpy()
+        if args.task == "classification":
+            ytest = ytest.astype(int)
         if n_pca > 0 and hasattr(pca, 'components_'):
             Xtest = pca.transform(Xtest)
 
-        test_metrics = score_meta_model(model, Xtest, ytest, args.task)
+        test_metrics_all = score_meta_model(model, Xtest, ytest, args.task, threshold=avg_threshold or 0.5)
         (out_dir / "meta_test_metrics.json").write_text(
-            json.dumps(convert_to_serializable(test_metrics), indent=2)
+            json.dumps(convert_to_serializable(test_metrics_all), indent=2)
         )
+
         pred = model.predict(Xtest)
         pred_df = test_features.reset_index()[["speaker_id", "y_true"]].copy()
         pred_df["y_pred"] = pred
@@ -1691,6 +1637,15 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
             except Exception:
                 pass
         pred_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
+
+        if subgroup_ids is not None:
+            test_metrics_subgroup = compute_subgroup_metrics(pred_df, args, subgroup_ids)
+            (out_dir / "meta_test_metrics_subgroup.json").write_text(
+                json.dumps(convert_to_serializable(test_metrics_subgroup), indent=2)
+            )
+            test_metrics = test_metrics_subgroup
+        else:
+            test_metrics = {"all": test_metrics_all}
     else:
         test_metrics = None
 
@@ -1698,10 +1653,10 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
 
 
 # =======================================================================
-# AUDIO-ONLY CV
+# AUDIO-ONLY CV (with subgroup)
 # =======================================================================
 
-def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
+def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None):
     out_dir = Path(out_dir)
     audio_dir = out_dir / "audio_only"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -1754,6 +1709,9 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
         Xva = ava[audio_feature_cols].to_numpy(dtype=float)
         ytr = atr["y_true"].to_numpy()
         yva = ava["y_true"].to_numpy()
+        if args.task == "classification":
+            ytr = ytr.astype(int)
+            yva = yva.astype(int)
         
         Xtr = np.nan_to_num(Xtr, nan=0.0, posinf=0.0, neginf=0.0)
         Xva = np.nan_to_num(Xva, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1865,7 +1823,7 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
     
     print(f"  OOF predictions: {len(oof)} speakers")
     
-    aggregate_metrics = aggregate_oof_predictions(oof, args)
+    aggregate_metrics = aggregate_oof_predictions(oof, args, subgroup_ids)
     
     oof.to_csv(audio_dir / "oof_predictions.csv", index=False)
     pd.DataFrame(fold_metrics).to_csv(audio_dir / "fold_metrics.csv", index=False)
@@ -1878,13 +1836,13 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
     print(f"  AUDIO-ONLY CV COMPLETE")
     print(f"  {'='*50}")
     if args.task == "classification":
-        print(f"  Aggregate accuracy: {aggregate_metrics.get('accuracy', 0):.4f}")
-        print(f"  Aggregate F1: {aggregate_metrics.get('f1', 0):.4f}")
-        print(f"  Aggregate AUC: {aggregate_metrics.get('roc_auc', 0):.4f}")
-        print(f"  Aggregate macro_f1: {aggregate_metrics.get('macro_f1', 0):.4f}")
+        print(f"  Aggregate accuracy: {aggregate_metrics.get('all', {}).get('accuracy', 0):.4f}")
+        print(f"  Aggregate F1: {aggregate_metrics.get('all', {}).get('f1', 0):.4f}")
+        print(f"  Aggregate AUC: {aggregate_metrics.get('all', {}).get('roc_auc', 0):.4f}")
+        print(f"  Aggregate macro_f1: {aggregate_metrics.get('all', {}).get('macro_f1', 0):.4f}")
     else:
-        print(f"  Aggregate RMSE: {aggregate_metrics.get('rmse', 0):.4f}")
-        print(f"  Aggregate R²: {aggregate_metrics.get('r2', 0):.4f}")
+        print(f"  Aggregate RMSE: {aggregate_metrics.get('all', {}).get('rmse', 0):.4f}")
+        print(f"  Aggregate R²: {aggregate_metrics.get('all', {}).get('r2', 0):.4f}")
     print(f"  {'='*50}")
     
     return {
@@ -1897,10 +1855,10 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir):
 
 
 # =======================================================================
-# FUSION METHODS (LEAKAGE-SAFE) - FIXED INDEX HANDLING
+# FUSION METHODS (all fully implemented, with subgroup, fixed indexing)
 # =======================================================================
 
-def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hparams, out_dir):
+def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids=None):
     if audio_df is None or audio_df.empty:
         return {}
 
@@ -1910,17 +1868,27 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
     
     methods = getattr(args, "fusion_methods", ["all"])
     novel = getattr(args, "fusion_novel", "none")
+    base_methods = ["text_only", "audio_only", "early", "late", "confidence", "stacking", "moe", "interaction", "dynamic", "cca", "mlp"]
     if "all" in methods:
-        methods = ["text_only", "audio_only", "early", "late", "model_based"]
-    if novel in ("confidence", "all"):
-        methods.append("confidence")
-    if novel in ("interaction", "all"):
-        methods.append("interaction")
-    if novel in ("moe", "all"):
-        methods.append("moe")
-    if novel in ("mlp", "all"):
-        methods.append("mlp")
-    methods = list(dict.fromkeys(methods))
+        methods = base_methods.copy()
+    else:
+        if novel in ("confidence", "all") and "confidence" not in methods:
+            methods.append("confidence")
+        if novel in ("interaction", "all") and "interaction" not in methods:
+            methods.append("interaction")
+        if novel in ("moe", "all") and "moe" not in methods:
+            methods.append("moe")
+        if novel in ("mlp", "all") and "mlp" not in methods:
+            methods.append("mlp")
+        if novel in ("stacking", "all") and "stacking" not in methods:
+            methods.append("stacking")
+        if novel in ("dynamic", "all") and "dynamic" not in methods:
+            methods.append("dynamic")
+        if novel in ("cca", "all") and "cca" not in methods:
+            methods.append("cca")
+    methods = list(dict.fromkeys([m for m in methods if m in base_methods]))
+    if not methods:
+        methods = ["early"]
 
     result = {}
     for method in methods:
@@ -1937,13 +1905,11 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         speakers_tr = set(tr.speaker_id)
         speakers_va = set(va.speaker_id)
 
-        # Audio: set index to speaker_id
         atr = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_tr)].copy()
         ava = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_va)].copy()
         atr = atr.set_index("speaker_id")
         ava = ava.set_index("speaker_id")
 
-        # Build fold-safe text representation.
         q_scores = safe_question_cv_scores(tr, metadata, args, best_hparams, questions, fold_dir)
         selected_q = select_questions_from_scores(q_scores, args)
         tpaths, vpaths = {}, {}
@@ -1962,8 +1928,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         vf, _ = build_feature_table(vpaths, list(vpaths))
         tf, vf, _ = align_feature_tables(tf, vf, pd.DataFrame(), tc)
         
-        # Now tf and vf have speaker_id as index; atr and ava also have speaker_id as index
-        # Find common speakers
         common_tr = tf.index.intersection(atr.index)
         common_va = vf.index.intersection(ava.index)
         tf = tf.loc[common_tr]
@@ -1973,6 +1937,11 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         
         ytr = tf["y_true"].to_numpy()
         yva = vf["y_true"].to_numpy()
+        # Fix: ensure integer labels for classification to avoid indexing errors
+        if args.task == "classification":
+            ytr = ytr.astype(int)
+            yva = yva.astype(int)
+            
         tx = [c for c in tf.columns if "__" in c]
         ax = [c for c in atr.columns if c not in ("y_true",)]
         Xtr_t = tf[tx].to_numpy(float)
@@ -1992,88 +1961,195 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         Xtr = np.hstack([Xtr_t, Xtr_a])
         Xva = np.hstack([Xva_t, Xva_a])
 
-        # ✅ FIXED: fit_predict now accepts y_train and y_val
-        def fit_predict(kind, X_train, X_val, y_train, y_val):
-            if kind == "mlp":
-                from sklearn.neural_network import MLPClassifier, MLPRegressor
-                scaler = StandardScaler()
-                A, B = scaler.fit_transform(X_train), scaler.transform(X_val)
-                if args.task == "classification":
-                    m = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500,
-                                      random_state=args.seed + fold_idx,
-                                      early_stopping=True, validation_fraction=0.1)
-                else:
-                    m = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
-                                     random_state=args.seed + fold_idx,
-                                     early_stopping=True, validation_fraction=0.1)
-                m.fit(A, y_train)
-                return m, m.predict(B), m.predict_proba(B) if hasattr(m, "predict_proba") else None
-            
+        def fit_predict_base(X_train, X_val, y_train, y_val):
             m = make_meta_model(args)
             m.fit(X_train, y_train)
-            
             if args.task == "classification":
-                # ✅ Use y_val (validation labels) for threshold tuning
-                best_threshold, _ = find_optimal_threshold(m, X_val, y_val, metric='f1')
-                p, pr = predict_with_threshold(m, X_val, best_threshold)
-                return m, p, pr
+                best_th, _ = find_optimal_threshold(m, X_val, y_val, metric='f1')
+                p, pr = predict_with_threshold(m, X_val, best_th)
+                return m, p, pr, best_th
             else:
                 p = m.predict(X_val)
                 pr = m.predict_proba(X_val) if hasattr(m, "predict_proba") else None
-                return m, p, pr
+                return m, p, pr, None
 
-        method_inputs = {
-            "text_only": (Xtr_t, Xva_t),
-            "audio_only": (Xtr_a, Xva_a),
-            "early": (Xtr, Xva),
-            "model_based": (Xtr, Xva),
-            "mlp": (Xtr, Xva),
-        }
-        
+        m_text, pred_text, proba_text, th_text = fit_predict_base(Xtr_t, Xva_t, ytr, yva)
+        m_audio, pred_audio, proba_audio, th_audio = fit_predict_base(Xtr_a, Xva_a, ytr, yva)
+
         for method in methods:
-            if method in ("late", "confidence", "interaction", "moe"):
-                mt, pt, prt = fit_predict("base", Xtr_t, Xva_t, ytr, yva)
-                ma, pa, pra = fit_predict("base", Xtr_a, Xva_a, ytr, yva)
-                if args.task == "classification" and prt is not None and pra is not None:
-                    if method == "confidence":
-                        conf_t = np.max(mt.predict_proba(Xtr_t), axis=1).mean()
-                        conf_a = np.max(ma.predict_proba(Xtr_a), axis=1).mean()
-                        wt = conf_t / max(conf_t + conf_a, 1e-12)
+            if method == "text_only":
+                pred = pred_text
+                proba = proba_text
+            elif method == "audio_only":
+                pred = pred_audio
+                proba = proba_audio
+            elif method == "early":
+                m_early, pred, proba, _ = fit_predict_base(Xtr, Xva, ytr, yva)
+            elif method == "late":
+                if args.task == "classification" and proba_text is not None and proba_audio is not None:
+                    proba = (proba_text + proba_audio) / 2.0
+                    if proba.shape[1] == 2:
+                        pred = np.argmax(proba, axis=1)
                     else:
-                        wt = 0.5
-                    pprob = wt * prt + (1.0 - wt) * pra
-                    pred = np.argmax(pprob, axis=1)
-                    proba = pprob[:, 1] if pprob.shape[1] == 2 else None
+                        pred = np.argmax(proba, axis=1)
                 else:
-                    wt = 0.5
-                    pred = wt * pt + (1.0 - wt) * pa
+                    pred = (pred_text + pred_audio) / 2.0
+                    if args.task == "classification":
+                        pred = np.round(pred).astype(int)
+                    proba = None
+            elif method == "confidence":
+                if args.task == "classification" and proba_text is not None and proba_audio is not None:
+                    conf_t = np.max(m_text.predict_proba(Xtr_t), axis=1).mean()
+                    conf_a = np.max(m_audio.predict_proba(Xtr_a), axis=1).mean()
+                    wt = conf_t / (conf_t + conf_a + 1e-12)
+                    proba = wt * proba_text + (1 - wt) * proba_audio
+                    if proba.shape[1] == 2:
+                        pred = np.argmax(proba, axis=1)
+                    else:
+                        pred = np.argmax(proba, axis=1)
+                else:
+                    pred = (pred_text + pred_audio) / 2.0
+                    if args.task == "classification":
+                        pred = np.round(pred).astype(int)
+                    proba = None
+            elif method == "dynamic":
+                if args.task == "classification" and proba_text is not None and proba_audio is not None:
+                    ent_t = -np.sum(proba_text * np.log(proba_text + 1e-12), axis=1)
+                    ent_a = -np.sum(proba_audio * np.log(proba_audio + 1e-12), axis=1)
+                    conf_t = 1 - ent_t / np.log(proba_text.shape[1])
+                    conf_a = 1 - ent_a / np.log(proba_audio.shape[1])
+                    wt = conf_t / (conf_t + conf_a + 1e-12)
+                    wt = wt[:, None]
+                    proba = wt * proba_text + (1 - wt) * proba_audio
+                    if proba.shape[1] == 2:
+                        pred = np.argmax(proba, axis=1)
+                    else:
+                        pred = np.argmax(proba, axis=1)
+                else:
+                    pred = (pred_text + pred_audio) / 2.0
+                    if args.task == "classification":
+                        pred = np.round(pred).astype(int)
+                    proba = None
+            elif method == "moe":
+                from sklearn.linear_model import LogisticRegression
+                gate_input = np.hstack([Xtr_t, Xtr_a])
+                if args.task == "classification":
+                    prob_t = m_text.predict_proba(Xtr_t)
+                    prob_a = m_audio.predict_proba(Xtr_a)
+                    ytr_onehot = np.eye(prob_t.shape[1])[ytr]  # ytr is int now
+                    score_t = np.sum(prob_t * ytr_onehot, axis=1)
+                    score_a = np.sum(prob_a * ytr_onehot, axis=1)
+                    gate_target = (score_t > score_a).astype(int)
+                    gate = LogisticRegression(random_state=args.seed)
+                    gate.fit(gate_input, gate_target)
+                    gate_input_val = np.hstack([Xva_t, Xva_a])
+                    gate_proba = gate.predict_proba(gate_input_val)
+                    wt = gate_proba[:, 1]
+                    wt = wt[:, None]
+                    proba = wt * proba_text + (1 - wt) * proba_audio
+                    if proba.shape[1] == 2:
+                        pred = np.argmax(proba, axis=1)
+                    else:
+                        pred = np.argmax(proba, axis=1)
+                else:
+                    res_t = np.abs(m_text.predict(Xtr_t) - ytr)
+                    res_a = np.abs(m_audio.predict(Xtr_a) - ytr)
+                    wt = np.exp(-res_t) / (np.exp(-res_t) + np.exp(-res_a) + 1e-12)
+                    wt = wt[:, None]
+                    pred = wt * m_text.predict(Xva_t) + (1 - wt) * m_audio.predict(Xva_a)
+                    proba = None
+            elif method == "interaction":
+                n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0]-1)
+                if n_comp > 1:
+                    pca_t = PCA(n_components=n_comp, random_state=args.seed)
+                    pca_a = PCA(n_components=n_comp, random_state=args.seed)
+                    Xtr_t_pca = pca_t.fit_transform(Xtr_t)
+                    Xtr_a_pca = pca_a.fit_transform(Xtr_a)
+                    Xva_t_pca = pca_t.transform(Xva_t)
+                    Xva_a_pca = pca_a.transform(Xva_a)
+                    Xtr_inter = Xtr_t_pca * Xtr_a_pca
+                    Xva_inter = Xva_t_pca * Xva_a_pca
+                    Xtr_fused = np.hstack([Xtr_t, Xtr_a, Xtr_inter])
+                    Xva_fused = np.hstack([Xva_t, Xva_a, Xva_inter])
+                else:
+                    Xtr_fused = np.hstack([Xtr_t, Xtr_a])
+                    Xva_fused = np.hstack([Xva_t, Xva_a])
+                m_inter, pred, proba, _ = fit_predict_base(Xtr_fused, Xva_fused, ytr, yva)
+            elif method == "stacking":
+                if args.task == "classification":
+                    Xtr_stack = np.hstack([m_text.predict_proba(Xtr_t), m_audio.predict_proba(Xtr_a)])
+                    Xva_stack = np.hstack([m_text.predict_proba(Xva_t), m_audio.predict_proba(Xva_a)])
+                else:
+                    Xtr_stack = np.hstack([m_text.predict(Xtr_t).reshape(-1,1), m_audio.predict(Xtr_a).reshape(-1,1)])
+                    Xva_stack = np.hstack([m_text.predict(Xva_t).reshape(-1,1), m_audio.predict(Xva_a).reshape(-1,1)])
+                m_stack, pred, proba, _ = fit_predict_base(Xtr_stack, Xva_stack, ytr, yva)
+            elif method == "cca":
+                try:
+                    n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0]-1)
+                    if n_comp > 1:
+                        cca = CCA(n_components=n_comp, random_state=args.seed)
+                        Xtr_t_cca, Xtr_a_cca = cca.fit_transform(Xtr_t, Xtr_a)
+                        Xva_t_cca, Xva_a_cca = cca.transform(Xva_t, Xva_a)
+                        Xtr_fused = np.hstack([Xtr_t_cca, Xtr_a_cca])
+                        Xva_fused = np.hstack([Xva_t_cca, Xva_a_cca])
+                        m_cca, pred, proba, _ = fit_predict_base(Xtr_fused, Xva_fused, ytr, yva)
+                    else:
+                        m_cca, pred, proba, _ = fit_predict_base(Xtr, Xva, ytr, yva)
+                except Exception as e:
+                    print(f"  CCA failed, falling back to early fusion: {e}")
+                    m_cca, pred, proba, _ = fit_predict_base(Xtr, Xva, ytr, yva)
+            elif method == "mlp":
+                from sklearn.neural_network import MLPClassifier, MLPRegressor
+                scaler = StandardScaler()
+                Xtr_scaled = scaler.fit_transform(Xtr)
+                Xva_scaled = scaler.transform(Xva)
+                if args.task == "classification":
+                    mlp = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500,
+                                        random_state=args.seed+fold_idx,
+                                        early_stopping=True, validation_fraction=0.1)
+                else:
+                    mlp = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500,
+                                       random_state=args.seed+fold_idx,
+                                       early_stopping=True, validation_fraction=0.1)
+                mlp.fit(Xtr_scaled, ytr)
+                if args.task == "classification":
+                    if hasattr(mlp, "predict_proba"):
+                        proba = mlp.predict_proba(Xva_scaled)
+                        if proba.shape[1] == 2:
+                            best_th, _ = find_optimal_threshold(mlp, Xva_scaled, yva, metric='f1')
+                            pred = (proba[:, 1] >= best_th).astype(int)
+                        else:
+                            pred = np.argmax(proba, axis=1)
+                    else:
+                        pred = mlp.predict(Xva_scaled)
+                        proba = None
+                else:
+                    pred = mlp.predict(Xva_scaled)
                     proba = None
             else:
-                m, pred, proba_full = fit_predict("mlp" if method == "mlp" else "base",
-                                                  *method_inputs[method], ytr, yva)
-                proba = proba_full[:, 1] if (args.task == "classification" and proba_full is not None and proba_full.shape[1] == 2) else None
+                continue
 
             metrics = score_meta_model(None, pred, yva, args.task)
-            if proba is not None:
+            if proba is not None and args.task == "classification" and len(np.unique(yva)) == 2:
                 try:
-                    metrics["roc_auc"] = float(roc_auc_score(yva, proba))
+                    metrics["roc_auc"] = float(roc_auc_score(yva, proba[:,1] if proba.ndim==2 and proba.shape[1]==2 else proba))
                 except Exception:
                     pass
             result[method]["fold_metrics"].append(metrics)
             rows = pd.DataFrame({"speaker_id": vf.index.to_numpy(),
                                  "y_true": yva, "y_pred": pred, "fold": fold_idx})
-            if proba is not None:
-                rows["y_proba"] = proba
+            if proba is not None and args.task == "classification" and proba.ndim == 2 and proba.shape[1] == 2:
+                rows["y_proba"] = proba[:, 1]
             result[method]["predictions"].append(rows)
 
     for method in methods:
         if not result[method]["predictions"]:
             print(f"  No predictions for {method}, skipping")
             continue
-        pred = pd.concat(result[method]["predictions"], ignore_index=True)
-        agg = aggregate_oof_predictions(pred, args)
+        pred_df = pd.concat(result[method]["predictions"], ignore_index=True)
+        agg = aggregate_oof_predictions(pred_df, args, subgroup_ids)
         result[method]["aggregate_metrics"] = agg
-        pred.to_csv(fusion_dir / f"{method}_oof_predictions.csv", index=False)
+        pred_df.to_csv(fusion_dir / f"{method}_oof_predictions.csv", index=False)
         pd.DataFrame(result[method]["fold_metrics"]).to_csv(
             fusion_dir / f"{method}_fold_metrics.csv", index=False
         )
@@ -2082,6 +2158,7 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         )
 
     return result
+
 
 # =======================================================================
 # MAIN
@@ -2145,51 +2222,35 @@ def build_parser():
     parser.add_argument("--audio-features-csv", type=str, default=None)
     parser.add_argument("--audio-feature-cols", nargs="+", default=None)
     parser.add_argument("--fusion-methods", nargs="+", 
-                        choices=["early", "late", "model_based", "text_only", "audio_only", "all"],
+                        choices=["early", "late", "confidence", "stacking", "moe", "interaction", 
+                                 "dynamic", "cca", "mlp", "text_only", "audio_only", "all"],
                         default=["all"])
     parser.add_argument("--fusion-novel", 
-                        choices=["none", "confidence", "interaction", "moe", "mlp", "all"],
+                        choices=["none", "confidence", "interaction", "moe", "mlp", "stacking", 
+                                 "dynamic", "cca", "all"],
                         default="none")
     
-    # SMOTE arguments
-    parser.add_argument("--use-smote", action="store_true",
-                        help="Use SMOTE for imbalanced classification")
-    parser.add_argument("--smote-k-neighbors", type=int, default=3,
-                        help="Number of nearest neighbors for SMOTE (default: 3)")
-    parser.add_argument("--smote-sampling-strategy", type=str, default="auto",
-                        help="SMOTE sampling strategy: 'auto', 'minority', or float (default: 'auto')")
-    parser.add_argument("--smote-method", 
-                        choices=["smote", "adasyn", "smote_tomek"],
-                        default="smote",
-                        help="Imbalance handling method (default: smote)")
+    parser.add_argument("--use-smote", action="store_true")
+    parser.add_argument("--smote-k-neighbors", type=int, default=3)
+    parser.add_argument("--smote-sampling-strategy", type=str, default="auto")
+    parser.add_argument("--smote-method", choices=["smote", "adasyn", "smote_tomek"], default="smote")
     
-    # Add missing attributes
-    parser.add_argument("--xgb-lr", type=float, default=0.1,
-                        help="Learning rate for XGBoost/HistGradientBoosting")
-    parser.add_argument("--logreg-C", type=float, default=1.0,
-                        help="Regularization strength for logistic regression")
-    parser.add_argument("--ridge-alpha", type=float, default=1.0,
-                        help="Alpha for Ridge regression")
-    parser.add_argument("--svm-kernel", type=str, default="rbf",
-                        help="Kernel for SVM")
-    parser.add_argument("--svm-C", type=float, default=1.0,
-                        help="C for SVM")
-    parser.add_argument("--svm-gamma", type=str, default="scale",
-                        help="Gamma for SVM")
-    parser.add_argument("--svm-epsilon", type=float, default=0.1,
-                        help="Epsilon for SVR")
-    parser.add_argument("--knn-neighbors", type=int, default=5,
-                        help="Number of neighbors for KNN")
-    parser.add_argument("--elasticnet-alpha", type=float, default=1.0,
-                        help="Alpha for ElasticNet")
-    parser.add_argument("--elasticnet-l1-ratio", type=float, default=0.5,
-                        help="L1 ratio for ElasticNet")
-    parser.add_argument("--lasso-alpha", type=float, default=1.0,
-                        help="Alpha for Lasso")
+    parser.add_argument("--xgb-lr", type=float, default=0.1)
+    parser.add_argument("--logreg-C", type=float, default=1.0)
+    parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument("--svm-kernel", type=str, default="rbf")
+    parser.add_argument("--svm-C", type=float, default=1.0)
+    parser.add_argument("--svm-gamma", type=str, default="scale")
+    parser.add_argument("--svm-epsilon", type=float, default=0.1)
+    parser.add_argument("--knn-neighbors", type=int, default=5)
+    parser.add_argument("--elasticnet-alpha", type=float, default=1.0)
+    parser.add_argument("--elasticnet-l1-ratio", type=float, default=0.5)
+    parser.add_argument("--lasso-alpha", type=float, default=1.0)
+    parser.add_argument("--pca-text-components", type=int, default=0)
 
-    parser.add_argument("--pca-text-components", type=int, default=0,
-                    help="Number of PCA components to use (0 = no PCA)")
-    
+    parser.add_argument("--subgroup-file", type=str, default=None,
+                        help="Path to a text file with speaker IDs (one per line) defining the subgroup (e.g., D).")
+
     return parser
 
 
@@ -2200,12 +2261,16 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     splits_dir = Path(args.splits_dir)
 
+    subgroup_ids = None
+    if args.subgroup_file:
+        subgroup_ids = load_subgroup_ids(Path(args.subgroup_file))
+        print(f"Loaded {len(subgroup_ids)} subgroup speaker IDs from {args.subgroup_file}")
+
     print("\n" + "=" * 72)
     print("LEAKAGE-SAFE SPEECH/TEXT + AUDIO PIPELINE")
     print("5-fold speaker-level OOF evaluation")
     print("=" * 72)
 
-    # Load data
     questions = [q.upper() for q in args.questions]
     df, metadata = load_examples(
         args.asr_file, args.demo_file, args.target_column, args.task,
@@ -2214,7 +2279,6 @@ def main():
     )
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
 
-    # Create splits
     split_mgr = SplitManager(
         splits_dir, args.task, args.train_frac, args.val_frac, args.test_frac,
         args.seed, args.n_cv_folds
@@ -2228,7 +2292,6 @@ def main():
         if test_speakers & set(trainval.speaker_id):
             raise RuntimeError("Initial train/test speaker leakage detected")
 
-    # Load audio features
     audio_df = None
     if args.audio_features_csv:
         audio_df = load_audio_features(
@@ -2237,7 +2300,6 @@ def main():
         )
         print(f"Loaded {len(get_audio_feature_cols(audio_df))} audio features for {len(audio_df)} speakers")
 
-    # HPO
     best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
     if best_hparams_path.exists() and not args.force_hpo:
         best_hparams = json.loads(best_hparams_path.read_text())
@@ -2264,53 +2326,48 @@ def main():
         if key in best_hparams:
             setattr(args, key, best_hparams[key])
 
-    # Audio-only CV
     audio_only_result = None
     if audio_df is not None:
         print("\n" + "=" * 60)
         print("🚀 AUDIO-ONLY 5-FOLD CV")
         print("=" * 60)
-        audio_only_result = train_audio_only_cv(audio_df, trainval, args, out_dir)
+        audio_only_result = train_audio_only_cv(audio_df, trainval, args, out_dir, subgroup_ids)
         if audio_only_result:
-            print(f"  Audio-only aggregate macro_f1: {audio_only_result['aggregate_metrics'].get('macro_f1', 0):.4f}")
+            print(f"  Audio-only aggregate macro_f1: {audio_only_result['aggregate_metrics'].get('all', {}).get('macro_f1', 0):.4f}")
 
-    # Text CV
     print("\n" + "=" * 60)
     print("📝 TEXT 5-FOLD OOF CV")
     print("=" * 60)
     cv_result = leakage_safe_text_cv(
-        trainval, metadata, args, best_hparams, out_dir
+        trainval, metadata, args, best_hparams, out_dir, subgroup_ids
     )
 
-    # Save top-level results
     (out_dir / "cv_aggregate_metrics.json").write_text(
         json.dumps(convert_to_serializable(cv_result["aggregate_metrics"]), indent=2)
     )
     cv_result["oof_predictions"].to_csv(out_dir / "cv_oof_predictions.csv", index=False)
 
-    # Production model
     if not final_test.empty:
         print("\nTraining production model on train+validation only...")
         _, train_features, test_features, selected_cols, test_metrics = train_production_text_model(
-            trainval, final_test, metadata, args, best_hparams, cv_result, out_dir
+            trainval, final_test, metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
         )
         if test_metrics is not None:
-            print("\nHELD-OUT TEST RESULT")
+            print("\nHELD-OUT TEST RESULT (with subgroup breakdown if provided):")
             print(json.dumps(convert_to_serializable(test_metrics), indent=2))
     else:
         print("\nNo held-out test set. OOF CV is the evaluation result.")
         train_production_text_model(
-            trainval, pd.DataFrame(), metadata, args, best_hparams, cv_result, out_dir
+            trainval, pd.DataFrame(), metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
         )
 
-    # Fusion
     if audio_df is not None:
         try:
             print("\n" + "=" * 60)
             print("🔊 AUDIO/TEXT FUSION 5-FOLD CV")
             print("=" * 60)
             fusion_result = run_leakage_safe_fusion_cv(
-                trainval, audio_df, metadata, args, best_hparams, out_dir
+                trainval, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids
             )
             if fusion_result:
                 fusion_summary = {
@@ -2320,13 +2377,13 @@ def main():
                 (out_dir / "fusion_results" / "leakage_safe_5fold_summary.json").write_text(
                     json.dumps(convert_to_serializable(fusion_summary), indent=2)
                 )
-                
                 print("\n📊 FUSION RESULTS COMPARISON:")
                 for method, metrics in fusion_summary.items():
-                    if "macro_f1" in metrics:
-                        print(f"  {method}: macro_f1 = {metrics['macro_f1']:.4f}")
-                    if "roc_auc" in metrics:
-                        print(f"    AUC = {metrics['roc_auc']:.4f}")
+                    all_m = metrics.get("all", {})
+                    if "macro_f1" in all_m:
+                        print(f"  {method}: macro_f1 = {all_m['macro_f1']:.4f}")
+                    if "roc_auc" in all_m:
+                        print(f"    AUC = {all_m['roc_auc']:.4f}")
         except Exception as exc:
             print(f"Fusion pipeline failed: {exc}")
             import traceback
@@ -2341,6 +2398,8 @@ def main():
     print(f"Authoritative pooled CV metrics:      {out_dir / 'cv_aggregate_metrics.json'}")
     if not final_test.empty:
         print(f"Held-out test metrics:               {out_dir / 'meta_test_metrics.json'}")
+        if subgroup_ids is not None:
+            print(f"Subgroup test metrics:               {out_dir / 'meta_test_metrics_subgroup.json'}")
     if audio_df is not None:
         print(f"Fusion results:                       {out_dir / 'fusion_results'}")
     print("=" * 72)
