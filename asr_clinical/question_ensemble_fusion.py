@@ -1561,17 +1561,19 @@ def select_questions_from_scores(scores, args):
 # =======================================================================
 # ADAPTIVE WEIGHTING FOR FUSION
 # =======================================================================
-
 def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, subgroup_ids=None):
-    """
-    Compute adaptive weights for text and audio modalities based on CV performance.
-    """
     print("\n" + "=" * 60)
     print("📊 COMPUTING ADAPTIVE WEIGHTS")
     print("=" * 60)
 
-    # Get audio-only performance
+    # Get audio-only performance (already on common subset)
     audio_only_result = train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids)
+
+    # ---- FIX: filter trainval to only speakers that are also in audio_df ----
+    audio_speakers = set(audio_df['speaker_id'])
+    trainval_speakers = set(trainval_df['speaker_id'])
+    common_speakers = audio_speakers.intersection(trainval_speakers)
+    trainval_common = trainval_df[trainval_df['speaker_id'].isin(common_speakers)]
 
     # Load best_hparams
     best_hparams_path = Path(out_dir) / "best_hyperparams_all_questions.json"
@@ -1589,9 +1591,9 @@ def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, sub
             "patience": args.patience,
         }
 
-    # Get text-only performance - pass metadata
+    # Run text-only CV on the common subset
     text_only_result = leakage_safe_text_cv(
-        trainval_df, metadata, args, best_hparams, out_dir, subgroup_ids
+        trainval_common, metadata, args, best_hparams, out_dir, subgroup_ids
     )
 
     audio_perf = 0.0
@@ -3472,7 +3474,7 @@ def build_parser():
     parser.add_argument("--train-frac", type=float, default=0.8)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
-    parser.add_argument("--n-cv-folds", type=int, default=10)
+    parser.add_argument("--n-cv-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--max-length", type=int, default=256)
