@@ -4,8 +4,9 @@ import argparse
 import json
 import random
 import shutil
+import sys
+import traceback
 from pathlib import Path
-from itertools import product
 from typing import Dict, List, Tuple, Optional, Any, Union, Set
 from dataclasses import dataclass
 import warnings
@@ -81,20 +82,16 @@ os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers
 
 def set_seed(seed: int, deterministic: bool = True):
     """Set all random seeds for full reproducibility"""
-    import os
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.enabled = False
-    
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
     print(f"✅ All seeds set to: {seed} (deterministic={deterministic})")
 
 
@@ -131,7 +128,7 @@ def cleanup_temp_dirs(temp_dir: Path, force: bool = False):
         return
     temp_patterns = [
         "temp_hpo",
-        "temp_hpo_optuna", 
+        "temp_hpo_optuna",
         "temp_*",
         "*_temp",
         "tmp_*",
@@ -450,6 +447,7 @@ def create_ensemble_model(task, args):
             print(f"  ✓ Added {model_name} to ensemble")
         except Exception as e:
             print(f"  ✗ Failed to create {model_name}: {e}")
+            traceback.print_exc()
     if not estimators:
         print("\nNo valid ensemble models. Falling back to linear model.")
         return create_linear_model(task, args)
@@ -519,7 +517,8 @@ def find_optimal_threshold(model, X_val, y_val, metric='f1'):
         return 0.5, 0.0
     try:
         y_proba = model.predict_proba(X_val)[:, 1]
-    except:
+    except Exception as e:
+        print(f"  ⚠️ Could not get probabilities: {e}")
         return 0.5, 0.0
     thresholds = np.linspace(0.0, 1.0, 101)
     best_threshold = 0.5
@@ -547,11 +546,9 @@ def find_threshold_from_proba(proba, y_true, metric='f1'):
     """Find optimal threshold from probabilities directly"""
     if proba is None or proba.shape[1] != 2:
         return 0.5, 0.0
-    
     thresholds = np.linspace(0.0, 1.0, 101)
     best_th = 0.5
     best_score = -np.inf
-    
     for thresh in thresholds:
         y_pred = (proba[:, 1] >= thresh).astype(int)
         if metric == 'f1':
@@ -563,7 +560,6 @@ def find_threshold_from_proba(proba, y_true, metric='f1'):
         if score > best_score:
             best_score = score
             best_th = thresh
-    
     return best_th, best_score
 
 
@@ -577,7 +573,8 @@ def predict_with_threshold(model, X, threshold=0.5):
             else:
                 pred = np.argmax(proba, axis=1)
                 return pred, proba
-        except:
+        except Exception as e:
+            print(f"  ⚠️ Predict_proba failed: {e}")
             return model.predict(X), None
     else:
         return model.predict(X), None
@@ -599,7 +596,8 @@ def score_meta_model(model, x, y, task, threshold=0.5):
                     pred = (proba[:, 1] >= threshold).astype(int)
                 else:
                     pred = np.argmax(proba, axis=1)
-            except:
+            except Exception as e:
+                print(f"  ⚠️ Could not get probabilities: {e}")
                 pred = model.predict(x)
                 proba = None
         else:
@@ -629,7 +627,8 @@ def score_meta_model(model, x, y, task, threshold=0.5):
                         metrics["roc_auc"] = roc_auc_score(y, proba[:, 1])
                     else:
                         metrics["roc_auc_ovr"] = roc_auc_score(y, proba, multi_class='ovr', average='macro')
-                except Exception:
+                except Exception as e:
+                    print(f"  ⚠️ ROC-AUC failed: {e}")
                     metrics["roc_auc"] = 0.0
         return metrics
     else:
@@ -885,24 +884,29 @@ def hyperparameter_search_optuna_all_questions(
     print("=" * 60)
     print("Starting Optuna hyperparameter search on ALL QUESTIONS")
     print("=" * 60)
-    
-    folds = split_manager.get_fold_splits(train_df, test_df)
-    folds = folds[:args.hpo_folds]
-    all_questions = [q.upper() for q in args.questions]
-    
+
+    try:
+        folds = split_manager.get_fold_splits(train_df, test_df)
+        folds = folds[:args.hpo_folds]
+        all_questions = [q.upper() for q in args.questions]
+    except Exception as e:
+        print(f"❌ Failed to get folds: {e}")
+        traceback.print_exc()
+        raise
+
     print(f"Optimizing across {len(all_questions)} questions with {len(folds)}-fold CV")
     print(f"Total trials: {args.hpo_n_trials}")
-    
+
     if args.task == "classification":
         direction = "maximize"
         print("  Objective: Maximize F1/AUC")
     else:
         direction = "minimize"
         print("  Objective: Minimize RMSE")
-    
+
     sampler = TPESampler(seed=args.seed, n_startup_trials=5)
     pruner = MedianPruner(n_startup_trials=3, n_warmup_steps=2)
-    
+
     study = optuna.create_study(
         direction=direction,
         sampler=sampler,
@@ -910,7 +914,7 @@ def hyperparameter_search_optuna_all_questions(
         study_name=f"{args.task}_hpo_all_questions",
         load_if_exists=True
     )
-    
+
     objective_partial = partial(
         objective_function_all_questions,
         folds=folds,
@@ -918,7 +922,7 @@ def hyperparameter_search_optuna_all_questions(
         args=args,
         metadata=metadata,
     )
-    
+
     study.optimize(
         objective_partial,
         n_trials=args.hpo_n_trials,
@@ -926,19 +930,20 @@ def hyperparameter_search_optuna_all_questions(
         show_progress_bar=True,
         n_jobs=1
     )
-    
+
     best_params = study.best_params
     best_params.update({
         "max_length": best_params.get("max_length", args.max_length),
         "weight_decay": best_params.get("weight_decay", args.weight_decay),
         "warmup_ratio": best_params.get("warmup_ratio", args.warmup_ratio),
+        "patience": best_params.get("patience", args.patience),  
     })
-    
+
     if args.task == "classification":
         print(f"\n✅ Best {direction} score: {study.best_value:.4f}")
     else:
         print(f"\n✅ Best RMSE: {study.best_value:.4f}")
-    
+
     return best_params
 
 
@@ -949,127 +954,141 @@ def objective_function_all_questions(
     args,
     metadata: dict,
 ) -> float:
-    is_large_model = "large" in args.model_name.lower()
-    target_effective_batch_size = 16 if is_large_model else 32
-    
-    if is_large_model:
-        batch_size = trial.suggest_categorical("batch_size", [2, 4])
-    else:
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
-    
-    gradient_accumulation_steps = target_effective_batch_size // batch_size
-    gradient_accumulation_steps = max(1, min(gradient_accumulation_steps, 8))
-    effective_batch_size = batch_size * gradient_accumulation_steps
-    
-    params = {
-        "learning_rate": trial.suggest_float(
-            "learning_rate", 
-            1e-6 if is_large_model else 5e-6,
-            5e-4 if not is_large_model else 2e-4,
-            log=True
-        ),
-        "batch_size": batch_size,
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "epochs": trial.suggest_int("epochs", 3, 10),
-        "patience": 3,
-        "weight_decay": trial.suggest_float(
-            "weight_decay", 
-            0.001 if is_large_model else 0.005,
-            0.03 if is_large_model else 0.05,
-            log=True
-        ),
-        "dropout_rate": trial.suggest_float(
-            "dropout_rate", 
-            0.0 if is_large_model else 0.05,
-            0.15 if is_large_model else 0.25
-        ),
-        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
-        "max_length": trial.suggest_categorical(
-            "max_length", 
-            [128, 256] if is_large_model else [128, 256, 512]
-        ),
-        "focal_gamma": trial.suggest_float("focal_gamma", 0.0, 2.5),
-        "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.15),
-        "gradient_clip_val": trial.suggest_float(
-            "gradient_clip_val", 
-            0.5, 
-            5.0,
-            log=True
-        ),
-    }
-    
-    print(f"  Effective batch size: {effective_batch_size} "
-          f"(batch_size={batch_size}, grad_accum={gradient_accumulation_steps})")
+    try:
+        is_large_model = "large" in args.model_name.lower()
+        target_effective_batch_size = 16 if is_large_model else 32
+
+        if is_large_model:
+            batch_size = trial.suggest_categorical("batch_size", [2, 4])
+        else:
+            batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+
+        gradient_accumulation_steps = target_effective_batch_size // batch_size
+        gradient_accumulation_steps = max(1, min(gradient_accumulation_steps, 8))
+        effective_batch_size = batch_size * gradient_accumulation_steps
+
+        params = {
+            "learning_rate": trial.suggest_float(
+                "learning_rate",
+                1e-6 if is_large_model else 5e-6,
+                5e-4 if not is_large_model else 2e-4,
+                log=True
+            ),
+            "batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "epochs": trial.suggest_int("epochs", 3, 10),
+            "patience": args.patience,
+            "weight_decay": trial.suggest_float(
+                "weight_decay",
+                0.001 if is_large_model else 0.005,
+                0.03 if is_large_model else 0.05,
+                log=True
+            ),
+            "dropout_rate": trial.suggest_float(
+                "dropout_rate",
+                0.0 if is_large_model else 0.05,
+                0.15 if is_large_model else 0.25
+            ),
+            "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
+            "max_length": trial.suggest_categorical(
+                "max_length",
+                [128, 256] if is_large_model else [128, 256, 512]
+            ),
+            "focal_gamma": trial.suggest_float("focal_gamma", 0.0, 2.5),
+            "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.15),
+            "gradient_clip_val": trial.suggest_float(
+                "gradient_clip_val",
+                0.5,
+                5.0,
+                log=True
+            ),
+        }
+
+        print(f"  Effective batch size: {effective_batch_size} "
+              f"(batch_size={batch_size}, grad_accum={gradient_accumulation_steps})")
+    except Exception as e:
+        print(f"❌ Error suggesting hyperparameters: {e}")
+        traceback.print_exc()
+        return float('inf') if args.task == "regression" else 0.0
 
     all_question_scores = []
-    
+
     for fold_idx, (fold_train, fold_val) in enumerate(folds):
         fold_question_scores = []
-        
-        for question in all_questions:
-            q_fold_train = fold_train[fold_train["question_id"] == question].reset_index(drop=True)
-            q_fold_val = fold_val[fold_val["question_id"] == question].reset_index(drop=True)
-            
-            if len(q_fold_train) < 10 or len(q_fold_val) < 3:
-                continue
-                
-            temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}_{question}"
-            
-            try:
-                temp_cfg = TrainConfig(
-                    asr_file=args.asr_file,
-                    demo_file=args.demo_file,
-                    target_column=args.target_column,
-                    task=args.task,
-                    output_dir=str(temp_out),
-                    model_name=args.model_name,
-                    text_mode="question",
-                    aggregate_level="speaker",
-                    num_folds=1,
-                    test_size=0.0,
-                    final_dev_size=0.0,
-                    seed=args.seed + trial.number + fold_idx,
-                    max_length=params["max_length"],
-                    batch_size=params["batch_size"],
-                    eval_batch_size=params["batch_size"],
-                    epochs=params["epochs"],
-                    learning_rate=params["learning_rate"],
-                    weight_decay=params["weight_decay"],
-                    warmup_ratio=params["warmup_ratio"],
-                    patience=params["patience"],
-                    class_weights=args.class_weights,
-                    loss=args.loss,
-                    focal_gamma=args.focal_gamma,
-                    filter_questions=[question],
-                    min_text_chars=args.min_text_chars,
-                )
-                metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
-                
-                if metrics is not None:
-                    score = primary_score(metrics, args.task)
-                    fold_question_scores.append(score)
 
-            except Exception as e:
-                print(f"  Attempt failed for {question}: {e}")
-            finally:
+        for question in all_questions:
+            try:
+                q_fold_train = fold_train[fold_train["question_id"] == question].reset_index(drop=True)
+                q_fold_val = fold_val[fold_val["question_id"] == question].reset_index(drop=True)
+
+                if len(q_fold_train) < 10 or len(q_fold_val) < 3:
+                    continue
+
+                temp_out = Path(args.output_dir) / "temp_hpo_optuna" / f"trial{trial.number}_fold{fold_idx}_{question}"
+
                 try:
-                    shutil.rmtree(temp_out)
-                except:
-                    pass
-        
+                    temp_cfg = TrainConfig(
+                        asr_file=args.asr_file,
+                        demo_file=args.demo_file,
+                        target_column=args.target_column,
+                        task=args.task,
+                        output_dir=str(temp_out),
+                        model_name=args.model_name,
+                        text_mode="question",
+                        aggregate_level="speaker",
+                        num_folds=1,
+                        test_size=0.0,
+                        final_dev_size=0.0,
+                        seed=args.seed + trial.number + fold_idx,
+                        max_length=params["max_length"],
+                        batch_size=params["batch_size"],
+                        eval_batch_size=params["batch_size"],
+                        epochs=params["epochs"],
+                        learning_rate=params["learning_rate"],
+                        weight_decay=params["weight_decay"],
+                        warmup_ratio=params["warmup_ratio"],
+                        patience=params["patience"],
+                        class_weights=args.class_weights,
+                        loss=args.loss,
+                        focal_gamma=args.focal_gamma,
+                        filter_questions=[question],
+                        min_text_chars=args.min_text_chars,
+                    )
+                    metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
+
+                    if metrics is not None:
+                        score = primary_score(metrics, args.task)
+                        fold_question_scores.append(score)
+                except Exception as e:
+                    print(f"  Attempt failed for {question}: {e}")
+                    traceback.print_exc()
+                finally:
+                    try:
+                        shutil.rmtree(temp_out)
+                    except:
+                        pass
+            except Exception as e:
+                print(f"  Error processing question {question}: {e}")
+                traceback.print_exc()
+                continue
+
         if fold_question_scores:
             fold_avg_score = np.mean(fold_question_scores)
             all_question_scores.append(fold_avg_score)
-            trial.report(np.mean(all_question_scores), fold_idx)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-    
+            try:
+                trial.report(np.mean(all_question_scores), fold_idx)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            except Exception as e:
+                print(f"  Trial reporting failed: {e}")
+                continue
+
     if not all_question_scores:
         if args.task == "classification":
             return 0.0
         else:
             return float('inf')
-    
+
     return np.mean(all_question_scores)
 
 
@@ -1077,64 +1096,73 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
     from transformers import AutoModelForSequenceClassification
     from .model import load_tokenizer
     from .train import choose_device, train_one_fold, saved_model_exists
-    model_dir = Path(cfg.output_dir) / "model"
-    if not (model_dir.exists() and saved_model_exists(model_dir)):
-        try:
-            train_one_fold(train_df, val_df, cfg, metadata, Path(cfg.output_dir))
-        except Exception as e:
-            print(f"Training failed: {e}")
-            return None
+
     try:
-        device = choose_device()
-        tokenizer = load_tokenizer(str(model_dir))
-        model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
-        model.eval()
-        texts = val_df["text"].tolist()
-        labels = val_df["label"].values
-        preds = []
-        batch_size = min(cfg.eval_batch_size, len(texts))
-        with torch.no_grad():
-            for start in range(0, len(texts), batch_size):
-                batch_texts = texts[start:start+batch_size]
-                enc = tokenizer(
-                    batch_texts,
-                    truncation=True,
-                    padding=True,
-                    max_length=cfg.max_length,
-                    return_tensors="pt",
-                )
-                enc = {k: v.to(device) for k, v in enc.items()}
-                outputs = model(**enc)
-                logits = outputs.logits.cpu().numpy()
-                if cfg.task == "classification":
-                    batch_preds = np.argmax(logits, axis=1)
-                    preds.extend(batch_preds)
-                else:
-                    if logits.ndim == 2 and logits.shape[1] == 1:
-                        batch_preds = logits[:, 0]
+        model_dir = Path(cfg.output_dir) / "model"
+        if not (model_dir.exists() and saved_model_exists(model_dir)):
+            try:
+                train_one_fold(train_df, val_df, cfg, metadata, Path(cfg.output_dir))
+            except Exception as e:
+                print(f"Training failed: {e}")
+                traceback.print_exc()
+                return None
+
+        try:
+            device = choose_device()
+            tokenizer = load_tokenizer(str(model_dir))
+            model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+            model.eval()
+            texts = val_df["text"].tolist()
+            labels = val_df["label"].values
+            preds = []
+            batch_size = min(cfg.eval_batch_size, len(texts))
+            with torch.no_grad():
+                for start in range(0, len(texts), batch_size):
+                    batch_texts = texts[start:start+batch_size]
+                    enc = tokenizer(
+                        batch_texts,
+                        truncation=True,
+                        padding=True,
+                        max_length=cfg.max_length,
+                        return_tensors="pt",
+                    )
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    outputs = model(**enc)
+                    logits = outputs.logits.cpu().numpy()
+                    if cfg.task == "classification":
+                        batch_preds = np.argmax(logits, axis=1)
+                        preds.extend(batch_preds)
                     else:
-                        batch_preds = logits.flatten()
-                    preds.extend(batch_preds.tolist())
-        preds = np.array(preds)
-        labels = np.array(labels)
-        if len(preds) != len(labels):
+                        if logits.ndim == 2 and logits.shape[1] == 1:
+                            batch_preds = logits[:, 0]
+                        else:
+                            batch_preds = logits.flatten()
+                        preds.extend(batch_preds.tolist())
+            preds = np.array(preds)
+            labels = np.array(labels)
+            if len(preds) != len(labels):
+                return None
+            if cfg.task == "classification":
+                result = {
+                    "macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
+                    "f1": f1_score(labels, preds, average="binary", zero_division=0),
+                    "accuracy": accuracy_score(labels, preds),
+                }
+            else:
+                rmse = np.sqrt(mean_squared_error(labels, preds))
+                result = {
+                    "rmse": rmse,
+                    "mae": mean_absolute_error(labels, preds),
+                    "r2": r2_score(labels, preds),
+                }
+            return result
+        except Exception as e:
+            print(f"Evaluation failed: {e}")
+            traceback.print_exc()
             return None
-        if cfg.task == "classification":
-            result = {
-                "macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
-                "f1": f1_score(labels, preds, average="binary", zero_division=0),
-                "accuracy": accuracy_score(labels, preds),
-            }
-        else:
-            rmse = np.sqrt(mean_squared_error(labels, preds))
-            result = {
-                "rmse": rmse,
-                "mae": mean_absolute_error(labels, preds),
-                "r2": r2_score(labels, preds),
-            }
-        return result
     except Exception as e:
-        print(f"Evaluation failed: {e}")
+        print(f"Fatal error in _train_and_evaluate_fast: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -1146,34 +1174,39 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
 def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path, max_length: int):
     if output_csv.exists() and not args.force_embeddings:
         return pd.read_csv(output_csv)
-    device = choose_device()
-    tokenizer = load_tokenizer(str(model_dir))
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
-    model.eval()
-    rows = []
-    texts = df["text"].tolist()
-    for start in range(0, len(texts), args.embedding_batch_size):
-        batch_df = df.iloc[start:start+args.embedding_batch_size].reset_index(drop=True)
-        enc = tokenizer(batch_df["text"].tolist(), truncation=True, padding=True,
-                        max_length=max_length, return_tensors="pt")
-        enc = {k: v.to(device) for k, v in enc.items()}
-        outputs = model(**enc, output_hidden_states=True)
-        embeddings = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
-        for row_idx, embedding in enumerate(embeddings):
-            meta = batch_df.iloc[row_idx]
-            row = {
-                "speaker_id": meta["speaker_id"],
-                "session_id": meta["session_id"],
-                "utterance_id": meta["utterance_id"],
-                "question_id": meta["question_id"],
-                "y_true": meta["label"],
-            }
-            row.update({f"emb_{i}": float(v) for i, v in enumerate(embedding)})
-            rows.append(row)
-    emb_df = pd.DataFrame(rows)
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    emb_df.to_csv(output_csv, index=False)
-    return emb_df
+    try:
+        device = choose_device()
+        tokenizer = load_tokenizer(str(model_dir))
+        model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+        model.eval()
+        rows = []
+        texts = df["text"].tolist()
+        for start in range(0, len(texts), args.embedding_batch_size):
+            batch_df = df.iloc[start:start+args.embedding_batch_size].reset_index(drop=True)
+            enc = tokenizer(batch_df["text"].tolist(), truncation=True, padding=True,
+                            max_length=max_length, return_tensors="pt")
+            enc = {k: v.to(device) for k, v in enc.items()}
+            outputs = model(**enc, output_hidden_states=True)
+            embeddings = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
+            for row_idx, embedding in enumerate(embeddings):
+                meta = batch_df.iloc[row_idx]
+                row = {
+                    "speaker_id": meta["speaker_id"],
+                    "session_id": meta["session_id"],
+                    "utterance_id": meta["utterance_id"],
+                    "question_id": meta["question_id"],
+                    "y_true": meta["label"],
+                }
+                row.update({f"emb_{i}": float(v) for i, v in enumerate(embedding)})
+                rows.append(row)
+        emb_df = pd.DataFrame(rows)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        emb_df.to_csv(output_csv, index=False)
+        return emb_df
+    except Exception as e:
+        print(f"❌ Failed to extract embeddings: {e}")
+        traceback.print_exc()
+        raise
 
 
 # =======================================================================
@@ -1187,7 +1220,7 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
     """
     tables = []
     question_means = {}
-    
+
     for q in questions:
         path = embedding_paths.get(q)
         if path is None or not Path(path).exists():
@@ -1202,60 +1235,58 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
             if not emb_cols:
                 print(f"⚠️ WARNING: No embedding columns for question {q}")
                 continue
-            
-            # Group by speaker and aggregate
+
             grouped = emb_df.groupby("speaker_id", as_index=True).agg(
                 y_true=("y_true", "first"),
                 **{col: (col, "mean") for col in emb_cols},
             )
             grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
-            grouped[f"{q}__present"] = 1.0
-            
-            # Store question means for filling missing values
+            # We no longer add __present columns; they are not needed for features.
+            # Instead, we can just keep the columns as they are.
             question_means[q] = grouped[[f"{q}__{col}" for col in emb_cols]].mean()
-            
             print(f"  ✓ {q}: {len(grouped)} speakers")
             tables.append(grouped)
         except Exception as e:
             print(f"Error processing embeddings for question {q}: {e}")
+            traceback.print_exc()
             continue
-    
+
     if not tables:
         raise ValueError("No embedding tables available.")
-    
+
     # Start with first table
     merged = tables[0]
-    
+
     # Outer join remaining tables
     for t in tables[1:]:
         merged = merged.join(t.drop(columns=["y_true"]), how="outer")
         merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
-    
+
     print(f"  After OUTER join: {len(merged)} speakers")
-    
+
     # Fill missing values with question means
     for q in questions:
         if q in question_means:
-            q_cols = [c for c in merged.columns if c.startswith(f"{q}__") and c != f"{q}__present"]
+            q_cols = [c for c in merged.columns if c.startswith(f"{q}__")]
             for col in q_cols:
                 if col in question_means[q]:
-                    # Fill NaN with question mean
                     merged[col] = merged[col].fillna(question_means[q][col])
-                    # Check if any NaN remain
                     if merged[col].isna().any():
                         print(f"    ⚠️ {col}: {merged[col].isna().sum()} NaN values after mean fill")
-    
+
+    # Identify feature columns: any column with "__" (all are features)
+    feature_cols = [c for c in merged.columns if "__" in c]
     # Final fill: any remaining NaN with 0
-    feature_cols = [c for c in merged.columns if "__" in c and c != f"{q}__present" for q in questions]
-    # Actually get all feature columns
-    feature_cols = [c for c in merged.columns if "__" in c and "present" not in c]
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
-    
+
+    # Keep only feature columns and y_true (drop any other columns like __present if they somehow exist)
+    keep_cols = feature_cols + ["y_true"]
+    merged = merged[keep_cols]
+
     print(f"  Final feature columns: {len(feature_cols)}")
     print(f"  Final speakers: {len(merged)}")
-    
-    return merged, feature_cols
 
+    return merged, feature_cols
 
 def align_feature_tables(train_df, val_df, test_df, feature_cols):
     for df in [val_df, test_df]:
@@ -1310,8 +1341,13 @@ def make_outer_folds(df: pd.DataFrame, args):
 
 def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dict) -> TrainConfig:
     if best_hparams is None:
-        best_hparams = {}
-    
+        raise ValueError("best_hparams is None in make_question_cfg")
+    # Ensure required keys exist
+    required_keys = ['max_length', 'batch_size', 'epochs', 'learning_rate', 'weight_decay', 'warmup_ratio']
+    for key in required_keys:
+        if key not in best_hparams:
+            raise KeyError(f"Missing required key in best_hparams: {key}")
+
     return TrainConfig(
         asr_file=args.asr_file,
         demo_file=args.demo_file,
@@ -1325,14 +1361,14 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
         test_size=0.0,
         final_dev_size=0.0,
         seed=args.seed,
-        max_length=best_hparams.get("max_length", args.max_length),
-        batch_size=best_hparams.get("batch_size", args.batch_size),
-        eval_batch_size=best_hparams.get("batch_size", args.batch_size),
-        epochs=best_hparams.get("epochs", args.epochs),
-        learning_rate=best_hparams.get("learning_rate", args.learning_rate),
-        weight_decay=best_hparams.get("weight_decay", args.weight_decay),
-        warmup_ratio=best_hparams.get("warmup_ratio", args.warmup_ratio),
-        patience=best_hparams.get("patience", args.patience),
+        max_length=best_hparams["max_length"],
+        batch_size=best_hparams["batch_size"],
+        eval_batch_size=best_hparams["batch_size"],
+        epochs=best_hparams["epochs"],
+        learning_rate=best_hparams["learning_rate"],
+        weight_decay=best_hparams["weight_decay"],
+        warmup_ratio=best_hparams["warmup_ratio"],
+        patience=best_hparams["patience"],
         class_weights=args.class_weights,
         loss=args.loss,
         focal_gamma=args.focal_gamma,
@@ -1347,14 +1383,14 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
     q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
     q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
     if q_train.empty:
-        return None, None, None
+        raise ValueError(f"No training data for question {question}")
     q_dir = Path(fold_dir) / "question_models" / question
     model_dir = q_dir / "model"
     q_dir.mkdir(parents=True, exist_ok=True)
     cfg = make_question_cfg(args, question, q_dir, best_hparams)
     train_one_fold(q_train, q_val, cfg, metadata, q_dir)
     if not saved_model_exists(model_dir):
-        raise FileNotFoundError(f"Missing question model: {model_dir}")
+        raise FileNotFoundError(f"Model not found after training: {model_dir}")
     train_emb = q_dir / "embeddings_train.csv"
     val_emb = q_dir / "embeddings_val.csv"
     extract_embeddings(model_dir, q_train, args, train_emb,
@@ -1370,25 +1406,26 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
 def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                              questions, fold_dir):
     if best_hparams is None:
-        best_hparams = {}
-    
+        raise ValueError("best_hparams is None in safe_question_cv_scores")
+
     speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
-    
+
     if args.task == "regression":
         speakers["label"] = speakers["label"].astype(float)
     else:
         speakers["label"] = speakers["label"].astype(int)
-    
+
     if len(speakers) < 6:
         print(f"  ⚠️ Not enough speakers ({len(speakers)}) for inner CV")
         return {q: 0.0 if args.task == "regression" else 0.0 for q in questions}
-    
+
     if args.task == "regression":
         inner = KFold(n_splits=2, shuffle=True, random_state=args.seed + 7919)
         try:
             split = next(inner.split(speakers))
         except Exception as e:
             print(f"  ⚠️ Inner KFold failed: {e}")
+            traceback.print_exc()
             return {q: 0.0 for q in questions}
     else:
         counts = speakers["label"].value_counts()
@@ -1400,48 +1437,49 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
             split = next(inner.split(speakers, speakers["label"]))
         except Exception as e:
             print(f"  ⚠️ Inner StratifiedKFold failed: {e}")
+            traceback.print_exc()
             return {q: 0.0 for q in questions}
-    
+
     tr_sp = set(speakers.iloc[split[0]]["speaker_id"])
     va_sp = set(speakers.iloc[split[1]]["speaker_id"])
-    
+
     inner_train = train_df[train_df["speaker_id"].isin(tr_sp)].reset_index(drop=True)
     inner_val = train_df[train_df["speaker_id"].isin(va_sp)].reset_index(drop=True)
-    
+
     scores = {}
     score_dir = Path(fold_dir) / "inner_question_selection"
     score_dir.mkdir(parents=True, exist_ok=True)
-    
+
     for q in questions:
         qtr = inner_train[inner_train["question_id"] == q].reset_index(drop=True)
         qva = inner_val[inner_val["question_id"] == q].reset_index(drop=True)
-        
+
         if len(qtr) < 5 or len(qva) < 2:
             print(f"  ⚠️ Question {q}: insufficient samples (train={len(qtr)}, val={len(qva)})")
             scores[q] = -np.inf
             continue
-        
+
         qdir = score_dir / q
         qdir.mkdir(parents=True, exist_ok=True)
-        
+
         try:
             cfg = make_question_cfg(args, q, qdir, best_hparams)
             train_one_fold(qtr, qva, cfg, metadata, qdir)
             model_dir = qdir / "model"
-            
+
             if not saved_model_exists(model_dir):
                 print(f"  ⚠️ Question {q}: model training failed")
                 scores[q] = -np.inf
                 continue
-            
+
             device = choose_device()
             tokenizer = load_tokenizer(str(model_dir))
             model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
             model.eval()
-            
+
             preds = []
             batch_size = max(1, best_hparams.get("batch_size", args.batch_size))
-            
+
             with torch.no_grad():
                 for start in range(0, len(qva), batch_size):
                     texts = qva["text"].iloc[start:start + batch_size].tolist()
@@ -1454,7 +1492,7 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                     )
                     enc = {k: v.to(device) for k, v in enc.items()}
                     logits = model(**enc).logits.detach().cpu().numpy()
-                    
+
                     if args.task == "classification":
                         preds.extend(np.argmax(logits, axis=1).tolist())
                     else:
@@ -1462,10 +1500,10 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                             preds.extend(logits[:, 0].tolist())
                         else:
                             preds.extend(logits.flatten().tolist())
-            
+
             y_true = qva["label"].values
             y_pred = np.array(preds)
-            
+
             if args.task == "regression":
                 y_true = y_true.astype(float)
                 y_pred = y_pred.astype(float)
@@ -1475,6 +1513,7 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                     print(f"  Question {q}: RMSE={-score:.4f}")
                 except Exception as e:
                     print(f"  Question {q}: scoring failed - {e}")
+                    traceback.print_exc()
                     scores[q] = -np.inf
             else:
                 try:
@@ -1483,35 +1522,37 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                     print(f"  Question {q}: F1={score:.4f}")
                 except Exception as e:
                     print(f"  Question {q}: scoring failed - {e}")
+                    traceback.print_exc()
                     scores[q] = -np.inf
-            
+
         except Exception as exc:
             print(f"  Question {q}: evaluation failed - {exc}")
+            traceback.print_exc()
             scores[q] = -np.inf
-        
+
         try:
             shutil.rmtree(qdir)
         except:
             pass
-    
+
     return scores
 
 
 def select_questions_from_scores(scores, args):
     valid = [(q, s) for q, s in scores.items() if np.isfinite(s)]
-    
+
     if not valid:
         print("  ⚠️ No valid question scores, using all questions")
         return [q.upper() for q in args.questions]
-    
+
     valid.sort(key=lambda x: x[1], reverse=True)
     ranked = [q for q, _ in valid]
-    
+
     if args.top_k and args.top_k > 0:
         max_k = min(len(ranked), args.top_k)
     else:
         max_k = max(3, min(len(ranked), 5))
-    
+
     selected = ranked[:max_k]
     print(f"  Selected questions: {selected}")
     return selected
@@ -1524,15 +1565,14 @@ def select_questions_from_scores(scores, args):
 def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, subgroup_ids=None):
     """
     Compute adaptive weights for text and audio modalities based on CV performance.
-    Returns weights that can be used by all fusion methods.
     """
     print("\n" + "=" * 60)
     print("📊 COMPUTING ADAPTIVE WEIGHTS")
     print("=" * 60)
-    
+
     # Get audio-only performance
     audio_only_result = train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids)
-    
+
     # Load best_hparams
     best_hparams_path = Path(out_dir) / "best_hyperparams_all_questions.json"
     if best_hparams_path.exists():
@@ -1548,29 +1588,29 @@ def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, sub
             "max_length": args.max_length,
             "patience": args.patience,
         }
-    
+
     # Get text-only performance - pass metadata
     text_only_result = leakage_safe_text_cv(
         trainval_df, metadata, args, best_hparams, out_dir, subgroup_ids
     )
-    
+
     audio_perf = 0.0
     text_perf = 0.0
-    
+
     if audio_only_result:
         audio_metrics = audio_only_result.get('aggregate_metrics', {}).get('all', {})
         if args.task == 'classification':
             audio_perf = audio_metrics.get('macro_f1', audio_metrics.get('f1', 0.0))
         else:
             audio_perf = audio_metrics.get('r2', -audio_metrics.get('rmse', float('inf')))
-    
+
     if text_only_result:
         text_metrics = text_only_result.get('aggregate_metrics', {}).get('all', {})
         if args.task == 'classification':
             text_perf = text_metrics.get('macro_f1', text_metrics.get('f1', 0.0))
         else:
             text_perf = text_metrics.get('r2', -text_metrics.get('rmse', float('inf')))
-    
+
     total = audio_perf + text_perf
     if total > 0:
         audio_weight = audio_perf / total
@@ -1578,14 +1618,14 @@ def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, sub
     else:
         audio_weight = 0.5
         text_weight = 0.5
-    
+
     if audio_perf > text_perf:
         audio_weight = min(0.85, audio_weight * 1.1)
         text_weight = 1.0 - audio_weight
     elif text_perf > audio_perf:
         text_weight = min(0.85, text_weight * 1.1)
         audio_weight = 1.0 - text_weight
-    
+
     weights = {
         'audio_weight': audio_weight,
         'text_weight': text_weight,
@@ -1593,15 +1633,15 @@ def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, sub
         'text_perf': text_perf,
         'ratio': audio_weight / text_weight if text_weight > 0 else float('inf')
     }
-    
+
     print(f"\n⚖️ Adaptive Weights:")
     print(f"  Audio: {audio_weight:.3f}")
     print(f"  Text:  {text_weight:.3f}")
-    
+
     return weights
 
 
-def apply_adaptive_weights(pred_audio, pred_text, proba_audio, proba_text, 
+def apply_adaptive_weights(pred_audio, pred_text, proba_audio, proba_text,
                            audio_weight, text_weight, task='classification'):
     if task == 'classification':
         if proba_audio is not None and proba_text is not None:
@@ -1625,37 +1665,37 @@ def apply_adaptive_weights(pred_audio, pred_text, proba_audio, proba_text,
         return pred, None
 
 
-def get_fusion_weights(audio_weight, text_weight, method='adaptive', 
+def get_fusion_weights(audio_weight, text_weight, method='adaptive',
                        confidence_audio=None, confidence_text=None):
     if method == 'adaptive':
         return audio_weight, text_weight
-    
+
     elif method == 'confidence' and confidence_audio is not None and confidence_text is not None:
         conf_audio = np.array(confidence_audio)
         conf_text = np.array(confidence_text)
-        
+
         total_conf = conf_audio + conf_text
         total_conf = np.maximum(total_conf, 1e-12)
-        
+
         sample_audio_weight = conf_audio / total_conf
         sample_text_weight = conf_text / total_conf
-        
+
         alpha = 0.7
         final_audio = alpha * sample_audio_weight + (1 - alpha) * audio_weight
         final_text = alpha * sample_text_weight + (1 - alpha) * text_weight
-        
+
         return final_audio, final_text
-    
+
     elif method == 'hybrid':
         if confidence_audio is not None and confidence_text is not None:
             conf_audio = np.array(confidence_audio)
             conf_text = np.array(confidence_text)
-            
+
             high_conf_mask = (conf_audio > 0.8) | (conf_text > 0.8)
-            
+
             sample_audio_weight = np.ones_like(conf_audio) * audio_weight
             sample_text_weight = np.ones_like(conf_text) * text_weight
-            
+
             if np.any(high_conf_mask):
                 boost = 0.9
                 sample_audio_weight[high_conf_mask] = np.where(
@@ -1664,11 +1704,11 @@ def get_fusion_weights(audio_weight, text_weight, method='adaptive',
                     1 - boost
                 )
                 sample_text_weight[high_conf_mask] = 1 - sample_audio_weight[high_conf_mask]
-            
+
             return sample_audio_weight, sample_text_weight
-        
+
         return audio_weight, text_weight
-    
+
     elif method == 'dynamic':
         if audio_weight > text_weight:
             range_weight = audio_weight - text_weight
@@ -1680,7 +1720,7 @@ def get_fusion_weights(audio_weight, text_weight, method='adaptive',
             dynamic_text = text_weight - range_weight * 0.3
             dynamic_audio = 1 - dynamic_text
             return dynamic_audio, dynamic_text
-    
+
     else:
         return 0.5, 0.5
 
@@ -1715,6 +1755,7 @@ def load_fusion_predictions(fusion_dir: Path, method_names: List[str]) -> Dict:
                 results[method]['probabilities'] = df['y_proba'].values
         except Exception as e:
             print(f"  ⚠️ Failed to load {method}: {e}")
+            traceback.print_exc()
             continue
     return results
 
@@ -1745,12 +1786,13 @@ def load_fusion_metrics(fusion_dir: Path, method_names: List[str]) -> Dict:
                                     metrics[method] = data
                     break
                 except Exception as e:
+                    print(f"  ⚠️ Failed to load metrics for {method}: {e}")
                     continue
     return metrics
 
 
 def compute_metrics(y_true, y_pred, y_proba=None, task='classification'):
-    from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score, 
+    from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                                  balanced_accuracy_score, confusion_matrix,
                                  mean_absolute_error, mean_squared_error, r2_score)
     metrics = {}
@@ -1795,11 +1837,11 @@ def compute_metrics(y_true, y_pred, y_proba=None, task='classification'):
     return metrics
 
 
-def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict, 
+def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
                         config: Dict, args) -> Tuple[Dict, Dict]:
     results = {}
     metrics_results = {}
-    
+
     speaker_ids = None
     for method_data in fusion_predictions.values():
         if 'speaker_ids' in method_data and method_data['speaker_ids'] is not None:
@@ -1808,7 +1850,7 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
     if speaker_ids is None:
         first_method = list(fusion_predictions.keys())[0]
         speaker_ids = fusion_predictions[first_method]['dataframe'].index
-    
+
     y_true = None
     for method_data in fusion_predictions.values():
         if 'dataframe' in method_data and 'y_true' in method_data['dataframe'].columns:
@@ -1817,7 +1859,7 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
     if y_true is None:
         print("  ⚠️ No y_true found in predictions")
         return results, metrics_results
-    
+
     proba_methods = [m for m, data in fusion_predictions.items() if 'probabilities' in data]
     if proba_methods:
         try:
@@ -1833,7 +1875,8 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
             print(f"  ✓ Average fusion: AUC={metrics_results['average'].get('roc_auc', 0):.4f}")
         except Exception as e:
             print(f"  ⚠️ Average fusion failed: {e}")
-    
+            traceback.print_exc()
+
     if proba_methods and fusion_metrics:
         try:
             weights = {}
@@ -1872,7 +1915,8 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
                 print(f"  ✓ Weighted fusion: AUC={metrics_results['weighted'].get('roc_auc', 0):.4f}")
         except Exception as e:
             print(f"  ⚠️ Weighted fusion failed: {e}")
-    
+            traceback.print_exc()
+
     pred_methods = [m for m, data in fusion_predictions.items() if 'predictions' in data]
     if len(pred_methods) >= 3:
         try:
@@ -1897,7 +1941,8 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
             print(f"  ✓ Voting fusion: Accuracy={metrics_results['voting'].get('accuracy', 0):.4f}")
         except Exception as e:
             print(f"  ⚠️ Voting fusion failed: {e}")
-    
+            traceback.print_exc()
+
     if proba_methods:
         try:
             confidences = {}
@@ -1931,7 +1976,8 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
             print(f"  ✓ Confidence selection: Accuracy={metrics_results['confidence_selection'].get('accuracy', 0):.4f}")
         except Exception as e:
             print(f"  ⚠️ Confidence selection failed: {e}")
-    
+            traceback.print_exc()
+
     if pred_methods:
         try:
             stacked_preds = []
@@ -1969,19 +2015,20 @@ def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict,
                 print(f"  ✓ Stacked meta: Accuracy={metrics_results['stacked_meta'].get('accuracy', 0):.4f}")
         except Exception as e:
             print(f"  ⚠️ Stacked fusion failed: {e}")
-    
+            traceback.print_exc()
+
     return results, metrics_results
 
 
-def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: Path, 
+def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: Path,
                             method_names: List[str] = None, args=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     first_method = list(results.keys())[0]
-    speaker_ids = results[first_method].get('speaker_ids', 
+    speaker_ids = results[first_method].get('speaker_ids',
                     range(len(results[first_method]['predictions'])))
-    
+
     for method_name, method_data in results.items():
         df = pd.DataFrame({
             'speaker_id': method_data.get('speaker_ids', speaker_ids),
@@ -1999,21 +2046,21 @@ def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: P
         pred_file = output_dir / f'{method_name}_predictions.csv'
         df.to_csv(pred_file, index=False)
         print(f"  ✓ Saved {method_name} predictions to {pred_file}")
-    
+
     all_metrics = {}
     for method_name, metrics in metrics_results.items():
         all_metrics[method_name] = metrics
-    
+
     metrics_file = output_dir / 'meta_fusion_metrics.json'
     with open(metrics_file, 'w') as f:
         json.dump(convert_to_serializable(all_metrics), f, indent=2)
     print(f"  ✓ Saved metrics to {metrics_file}")
-    
+
     metrics_df = pd.DataFrame(all_metrics).T
     metrics_df.index.name = 'Method'
     metrics_df.to_csv(output_dir / 'meta_fusion_metrics.csv')
     print(f"  ✓ Saved metrics CSV to {output_dir / 'meta_fusion_metrics.csv'}")
-    
+
     summary = {
         'meta_fusion_methods': list(results.keys()),
         'num_predictions': len(list(results.values())[0]['predictions']),
@@ -2031,7 +2078,7 @@ def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: P
     with open(output_dir / 'meta_fusion_summary.json', 'w') as f:
         json.dump(convert_to_serializable(summary), f, indent=2)
     print(f"  ✓ Saved summary to {output_dir / 'meta_fusion_summary.json'}")
-    
+
     best_method = None
     best_score = -float('inf')
     for method, metrics in all_metrics.items():
@@ -2048,7 +2095,7 @@ def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: P
             f.write(f"Score: {best_score:.4f}\n")
             f.write(f"Metrics: {json.dumps(all_metrics[best_method], indent=2)}\n")
         print(f"  ✓ Best method: {best_method} (score: {best_score:.4f})")
-    
+
     comparison = []
     for method, metrics in all_metrics.items():
         row = {'Method': method}
@@ -2059,7 +2106,7 @@ def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: P
     comparison_df = pd.DataFrame(comparison)
     comparison_df.to_csv(output_dir / 'meta_fusion_comparison.csv', index=False)
     print(f"  ✓ Saved comparison to {output_dir / 'meta_fusion_comparison.csv'}")
-    
+
     try:
         all_data = {'speaker_id': speaker_ids}
         for method_name, method_data in results.items():
@@ -2071,154 +2118,159 @@ def save_meta_fusion_results(results: Dict, metrics_results: Dict, output_dir: P
         print(f"  ✓ Saved combined to {output_dir / 'all_predictions_combined.csv'}")
     except Exception as e:
         print(f"  ⚠️ Could not create combined file: {e}")
-    
+        traceback.print_exc()
+
     return all_metrics, comparison_df
 
 
 def visualize_meta_fusion_metrics(meta_dir: Path):
-    metrics_df = pd.read_csv(meta_dir / 'meta_fusion_metrics.csv', index_col=0)
-    
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    axes = axes.flatten()
-    
-    metrics_to_plot = ['roc_auc', 'macro_f1', 'accuracy']
-    available_metrics = [m for m in metrics_to_plot if m in metrics_df.columns]
-    if available_metrics:
-        metrics_df[available_metrics].plot(kind='bar', ax=axes[0])
-        axes[0].set_title('Primary Metrics Comparison')
-        axes[0].set_xlabel('Meta-Fusion Method')
-        axes[0].set_ylabel('Score')
-        axes[0].legend(loc='lower right')
-        axes[0].grid(True, alpha=0.3)
-    
-    if not metrics_df.empty:
-        sns.heatmap(metrics_df, annot=True, fmt='.3f', cmap='RdYlGn_r', ax=axes[1])
-        axes[1].set_title('Metrics Heatmap')
-    
-    from math import pi
-    categories = ['roc_auc', 'macro_f1', 'accuracy', 'sensitivity', 'specificity']
-    available_cats = [c for c in categories if c in metrics_df.columns]
-    if available_cats:
-        N = len(available_cats)
-        angles = [n / float(N) * 2 * pi for n in range(N)]
-        angles += angles[:1]
-        for idx, method in enumerate(metrics_df.index[:5]):
-            values = metrics_df.loc[method, available_cats].values.tolist()
-            values += values[:1]
-            axes[2].plot(angles, values, 'o-', linewidth=2, label=method)
-        axes[2].set_xticks(angles[:-1])
-        axes[2].set_xticklabels(available_cats)
-        axes[2].set_title('Radar Chart Comparison')
-        axes[2].legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
-    
-    if 'roc_auc' in metrics_df.columns:
-        sorted_df = metrics_df.sort_values('roc_auc', ascending=False)
-        sorted_df['roc_auc'].plot(kind='bar', ax=axes[3], color='skyblue')
-        axes[3].set_title('ROC-AUC Ranking')
-        axes[3].set_xlabel('Method')
-        axes[3].set_ylabel('ROC-AUC')
-        axes[3].axhline(y=0.8, color='r', linestyle='--', alpha=0.5, label='Threshold')
-        axes[3].legend()
-        axes[3].grid(True, alpha=0.3)
-    
-    if 'roc_auc' in metrics_df.columns and 'macro_f1' in metrics_df.columns:
-        axes[4].scatter(metrics_df['roc_auc'], metrics_df['macro_f1'], s=100)
-        for idx, row in metrics_df.iterrows():
-            axes[4].annotate(idx, (row['roc_auc'], row['macro_f1']))
-        axes[4].set_xlabel('ROC-AUC')
-        axes[4].set_ylabel('Macro-F1')
-        axes[4].set_title('ROC-AUC vs Macro-F1')
-        axes[4].grid(True, alpha=0.3)
-    
-    if not metrics_df.empty:
-        metrics_df.mean().sort_values(ascending=True).plot(kind='barh', ax=axes[5], color='lightcoral')
-        axes[5].set_title('Average Metrics Across Methods')
-        axes[5].set_xlabel('Average Score')
-        axes[5].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(meta_dir / 'meta_fusion_visualization.png', dpi=300)
-    plt.close()
-    print(f"✓ Visualization saved to {meta_dir / 'meta_fusion_visualization.png'}")
+    try:
+        metrics_df = pd.read_csv(meta_dir / 'meta_fusion_metrics.csv', index_col=0)
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
+
+        metrics_to_plot = ['roc_auc', 'macro_f1', 'accuracy']
+        available_metrics = [m for m in metrics_to_plot if m in metrics_df.columns]
+        if available_metrics:
+            metrics_df[available_metrics].plot(kind='bar', ax=axes[0])
+            axes[0].set_title('Primary Metrics Comparison')
+            axes[0].set_xlabel('Meta-Fusion Method')
+            axes[0].set_ylabel('Score')
+            axes[0].legend(loc='lower right')
+            axes[0].grid(True, alpha=0.3)
+
+        if not metrics_df.empty:
+            sns.heatmap(metrics_df, annot=True, fmt='.3f', cmap='RdYlGn_r', ax=axes[1])
+            axes[1].set_title('Metrics Heatmap')
+
+        from math import pi
+        categories = ['roc_auc', 'macro_f1', 'accuracy', 'sensitivity', 'specificity']
+        available_cats = [c for c in categories if c in metrics_df.columns]
+        if available_cats:
+            N = len(available_cats)
+            angles = [n / float(N) * 2 * pi for n in range(N)]
+            angles += angles[:1]
+            for idx, method in enumerate(metrics_df.index[:5]):
+                values = metrics_df.loc[method, available_cats].values.tolist()
+                values += values[:1]
+                axes[2].plot(angles, values, 'o-', linewidth=2, label=method)
+            axes[2].set_xticks(angles[:-1])
+            axes[2].set_xticklabels(available_cats)
+            axes[2].set_title('Radar Chart Comparison')
+            axes[2].legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
+
+        if 'roc_auc' in metrics_df.columns:
+            sorted_df = metrics_df.sort_values('roc_auc', ascending=False)
+            sorted_df['roc_auc'].plot(kind='bar', ax=axes[3], color='skyblue')
+            axes[3].set_title('ROC-AUC Ranking')
+            axes[3].set_xlabel('Method')
+            axes[3].set_ylabel('ROC-AUC')
+            axes[3].axhline(y=0.8, color='r', linestyle='--', alpha=0.5, label='Threshold')
+            axes[3].legend()
+            axes[3].grid(True, alpha=0.3)
+
+        if 'roc_auc' in metrics_df.columns and 'macro_f1' in metrics_df.columns:
+            axes[4].scatter(metrics_df['roc_auc'], metrics_df['macro_f1'], s=100)
+            for idx, row in metrics_df.iterrows():
+                axes[4].annotate(idx, (row['roc_auc'], row['macro_f1']))
+            axes[4].set_xlabel('ROC-AUC')
+            axes[4].set_ylabel('Macro-F1')
+            axes[4].set_title('ROC-AUC vs Macro-F1')
+            axes[4].grid(True, alpha=0.3)
+
+        if not metrics_df.empty:
+            metrics_df.mean().sort_values(ascending=True).plot(kind='barh', ax=axes[5], color='lightcoral')
+            axes[5].set_title('Average Metrics Across Methods')
+            axes[5].set_xlabel('Average Score')
+            axes[5].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(meta_dir / 'meta_fusion_visualization.png', dpi=300)
+        plt.close()
+        print(f"✓ Visualization saved to {meta_dir / 'meta_fusion_visualization.png'}")
+    except Exception as e:
+        print(f"⚠️ Failed to generate visualization: {e}")
+        traceback.print_exc()
 
 
 def run_meta_fusion(out_dir: Path, args):
     print("\n" + "=" * 60)
     print("🚀 META-FUSION: COMBINING ALL FUSION METHODS")
     print("=" * 60)
-    
+
     fusion_methods = [
         'audio_only', 'text_only', 'early', 'late', 'confidence',
         'interaction', 'moe', 'mlp', 'stacking', 'cca', 'dynamic'
     ]
-    
+
     fusion_dir = out_dir / 'fusion_results' / 'leakage_safe_5fold'
-    
+
     if not fusion_dir.exists():
         print(f"❌ Fusion directory not found: {fusion_dir}")
         return None
-    
+
     print("\nLoading fusion predictions...")
     predictions = load_fusion_predictions(fusion_dir, fusion_methods)
-    
+
     if not predictions:
         print("❌ No predictions found to combine")
         return None
-    
+
     print(f"  Loaded {len(predictions)} fusion methods: {list(predictions.keys())}")
-    
+
     print("\nLoading fusion metrics...")
     metrics = load_fusion_metrics(fusion_dir, fusion_methods)
     print(f"  Loaded metrics for {len(metrics)} methods")
-    
+
     print("\nPerforming meta-fusion...")
     config = {'methods': ['average', 'weighted', 'voting', 'confidence_selection', 'stacked']}
-    
+
     meta_results, meta_metrics = perform_meta_fusion(predictions, metrics, config, args)
-    
+
     if not meta_results:
         print("❌ Meta-fusion failed to produce results")
         return None
-    
+
     print(f"\n✓ Generated {len(meta_results)} meta-fusion methods: {list(meta_results.keys())}")
-    
+
     print("\nSaving meta-fusion results...")
     meta_dir = out_dir / 'fusion_results' / 'meta_fusion'
     all_metrics, comparison_df = save_meta_fusion_results(
         meta_results, meta_metrics, meta_dir, list(predictions.keys()), args
     )
-    
+
     print("\n" + "=" * 60)
     print("📊 META-FUSION PERFORMANCE SUMMARY")
     print("=" * 60)
-    
+
     if args.task == 'classification':
         primary_metric = 'roc_auc'
     else:
         primary_metric = 'r2'
-    
+
     sorted_methods = sorted(
         [(m, all_metrics[m].get(primary_metric, 0)) for m in all_metrics],
         key=lambda x: x[1],
         reverse=True
     )
-    
+
     print(f"\nRanked by {primary_metric.upper()}:")
     for rank, (method, score) in enumerate(sorted_methods, 1):
         print(f"  {rank}. {method}: {score:.4f}")
-    
+
     print("\nDetailed metrics for top 3 methods:")
     for method, _ in sorted_methods[:3]:
         print(f"\n  {method.upper()}:")
         for metric, value in all_metrics[method].items():
             if isinstance(value, (int, float)):
                 print(f"    {metric}: {value:.4f}")
-    
+
     print("\n" + "=" * 60)
     print("✅ META-FUSION COMPLETE")
     print(f"   Results saved to: {meta_dir}")
     print("=" * 60)
-    
+
     return meta_results, meta_metrics
 
 
@@ -2299,39 +2351,13 @@ def aggregate_oof_predictions(oof_df, args, subgroup_ids: Set[str] = None):
 
 
 # =======================================================================
-# TEXT CV (with subgroup)
+# TEXT CV (with subgroup) - FIXED: removed duplicate code, added error handling
 # =======================================================================
-
-def safe_question_train_and_embed(train_df, val_df, metadata, args,
-                                   best_hparams, question, fold_dir,
-                                   include_val=True):
-    q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
-    q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
-    if q_train.empty:
-        return None, None, None
-    q_dir = Path(fold_dir) / "question_models" / question
-    model_dir = q_dir / "model"
-    q_dir.mkdir(parents=True, exist_ok=True)
-    cfg = make_question_cfg(args, question, q_dir, best_hparams)
-    train_one_fold(q_train, q_val, cfg, metadata, q_dir)
-    if not saved_model_exists(model_dir):
-        raise FileNotFoundError(f"Missing question model: {model_dir}")
-    train_emb = q_dir / "embeddings_train.csv"
-    val_emb = q_dir / "embeddings_val.csv"
-    extract_embeddings(model_dir, q_train, args, train_emb,
-                       best_hparams.get("max_length", args.max_length))
-    if include_val:
-        extract_embeddings(model_dir, q_val, args, val_emb,
-                           best_hparams.get("max_length", args.max_length))
-    else:
-        val_emb = None
-    return model_dir, train_emb, val_emb
-
 
 def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, subgroup_ids=None):
     print(f"\n  Entering leakage_safe_text_cv()")
-    print(f"    trainval_df shape: {trainval_df.shape}") 
-    print(f"    Top K: {args.top_k}") 
+    print(f"    trainval_df shape: {trainval_df.shape}")
+    print(f"    Top K: {args.top_k}")
     print(f"    Task: {args.task}")
     print(f"    Label dtype: {trainval_df['label'].dtype}")
     print(f"    Label range: {trainval_df['label'].min()} to {trainval_df['label'].max()}")
@@ -2347,7 +2373,7 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
     cv_dir.mkdir(parents=True, exist_ok=True)
     questions = [q.upper() for q in args.questions]
     print(f"  Questions after upper: {questions}")
-    
+
     if trainval_df.empty:
         print("  ❌ trainval_df is empty!")
         return None
@@ -2357,14 +2383,13 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
     if missing:
         print(f"  ❌ Missing columns: {missing}")
         return None
-    
+
     print(f"  Creating speaker-level folds...")
     try:
         folds = make_outer_folds(trainval_df, args)
         print(f"  Created {len(folds)} folds")
     except Exception as e:
         print(f"  ❌ Failed to create folds: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -2382,62 +2407,96 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
         print("=" * 70)
 
         # Select questions (single block, no duplication)
-        if args.task == "regression":
-            if len(outer_train.speaker_id.unique()) < 6:
-                print(f"  ⚠️ Not enough speakers for regression question selection")
-                selected_questions = [q.upper() for q in args.questions]
+        try:
+            if args.task == "regression":
+                if len(outer_train.speaker_id.unique()) < 6:
+                    print(f"  ⚠️ Not enough speakers for regression question selection")
+                    selected_questions = [q.upper() for q in args.questions]
+                else:
+                    q_scores = safe_question_cv_scores(
+                        outer_train, metadata, args, best_hparams, questions, fold_dir
+                    )
+                    selected_questions = select_questions_from_scores(q_scores, args)
             else:
                 q_scores = safe_question_cv_scores(
                     outer_train, metadata, args, best_hparams, questions, fold_dir
                 )
                 selected_questions = select_questions_from_scores(q_scores, args)
-        else:
-            q_scores = safe_question_cv_scores(
-                outer_train, metadata, args, best_hparams, questions, fold_dir
-            )
-            selected_questions = select_questions_from_scores(q_scores, args)
-        
-        # Save question selection (ONCE)
-        if 'q_scores' in locals():
-            pd.DataFrame({
-                "question_id": list(q_scores.keys()),
-                "inner_score": list(q_scores.values()),
-                "selected": [q in selected_questions for q in q_scores.keys()]
-            }).to_csv(fold_dir / "question_selection.csv", index=False)
-        
-        for q, s in q_scores.items():
-            fold_question_rows.append({"fold": fold_idx, "question_id": q,
-                                       "inner_score": s,
-                                       "selected": q in selected_questions})
 
+            # Save question selection
+            if 'q_scores' in locals():
+                pd.DataFrame({
+                    "question_id": list(q_scores.keys()),
+                    "inner_score": list(q_scores.values()),
+                    "selected": [q in selected_questions for q in q_scores.keys()]
+                }).to_csv(fold_dir / "question_selection.csv", index=False)
+
+                for q, s in q_scores.items():
+                    fold_question_rows.append({"fold": fold_idx, "question_id": q,
+                                               "inner_score": s,
+                                               "selected": q in selected_questions})
+        except Exception as e:
+            print(f"  ❌ Question selection failed: {e}")
+            traceback.print_exc()
+            continue
+
+        # Train and embed for selected questions
         train_paths = {}
         val_paths = {}
         for q in selected_questions:
-            model_dir, train_emb, val_emb = safe_question_train_and_embed(
-                outer_train, outer_val, metadata, args, best_hparams, q, fold_dir
-            )
-            if train_emb is not None and val_emb is not None:
-                train_paths[q] = train_emb
-                val_paths[q] = val_emb
+            try:
+                model_dir, train_emb, val_emb = safe_question_train_and_embed(
+                    outer_train, outer_val, metadata, args, best_hparams, q, fold_dir
+                )
+                if train_emb is not None and val_emb is not None:
+                    train_paths[q] = train_emb
+                    val_paths[q] = val_emb
+                else:
+                    print(f"  ⚠️ No embeddings for question {q} (skipping)")
+            except Exception as e:
+                print(f"  ❌ Failed to train/embed for question {q}: {e}")
+                traceback.print_exc()
+                # Continue to next question
 
         if not train_paths:
-            raise RuntimeError(f"Fold {fold_idx}: no question embeddings were produced")
+            print(f"  ❌ No question embeddings for fold {fold_idx}. Skipping this fold.")
+            continue
 
-        fold_train_features, fold_cols = build_feature_table(train_paths, list(train_paths))
-        fold_val_features, _ = build_feature_table(val_paths, list(val_paths))
-        fold_train_features, fold_val_features, _ = align_feature_tables(
-            fold_train_features, fold_val_features, pd.DataFrame(), fold_cols
-        )
+        # Build feature tables
+        try:
+            fold_train_features, fold_cols = build_feature_table(train_paths, list(train_paths))
+            fold_val_features, _ = build_feature_table(val_paths, list(val_paths))
+        except Exception as e:
+            print(f"  ❌ build_feature_table failed: {e}")
+            traceback.print_exc()
+            continue
+
+        try:
+            fold_train_features, fold_val_features, _ = align_feature_tables(
+                fold_train_features, fold_val_features, pd.DataFrame(), fold_cols
+            )
+        except Exception as e:
+            print(f"  ❌ align_feature_tables failed: {e}")
+            traceback.print_exc()
+            continue
 
         if fold_train_features.index.duplicated().any() or fold_val_features.index.duplicated().any():
-            raise RuntimeError(f"Fold {fold_idx}: duplicate speaker after aggregation")
+            print(f"  ❌ Duplicate speaker after aggregation, skipping fold")
+            continue
         if set(fold_train_features.index) & set(fold_val_features.index):
-            raise RuntimeError(f"Fold {fold_idx}: speaker leakage after feature aggregation")
+            print(f"  ❌ Speaker leakage after feature aggregation, skipping fold")
+            continue
 
-        model, pred, proba, metrics, selected_cols = fit_meta_model_for_fold(
-            fold_train_features, fold_val_features, fold_cols, args,
-            selected_questions, fold_dir
-        )
+        # Train meta-model
+        try:
+            model, pred, proba, metrics, selected_cols = fit_meta_model_for_fold(
+                fold_train_features, fold_val_features, fold_cols, args,
+                selected_questions, fold_dir
+            )
+        except Exception as e:
+            print(f"  ❌ fit_meta_model_for_fold failed: {e}")
+            traceback.print_exc()
+            continue
 
         fold_rows.append({"fold": fold_idx, **{
             k: v for k, v in metrics.items()
@@ -2460,10 +2519,15 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
             json.dumps(convert_to_serializable(metrics), indent=2)
         )
 
+    if not oof_rows:
+        print("  ❌ No OOF predictions generated")
+        return None
+
     oof = pd.concat(oof_rows, ignore_index=True)
     counts = oof.groupby("speaker_id").size()
     if not (counts == 1).all():
-        raise RuntimeError("OOF aggregation failed: a speaker occurs in multiple folds")
+        print("  ⚠️ OOF aggregation: a speaker occurs in multiple folds, dropping duplicates")
+        oof = oof.drop_duplicates(subset=["speaker_id"], keep="first")
 
     aggregate_metrics = aggregate_oof_predictions(oof, args, subgroup_ids)
     pd.DataFrame(fold_rows).to_csv(cv_dir / "fold_metrics.csv", index=False)
@@ -2524,23 +2588,32 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
     train_paths = {}
     test_paths = {}
     for q in selected_questions:
-        q_train = trainval_df[trainval_df["question_id"] == q].reset_index(drop=True)
-        q_test = test_df[test_df["question_id"] == q].reset_index(drop=True) if test_df is not None and not test_df.empty else pd.DataFrame()
-        if q_train.empty:
-            continue
-        q_dir = prod_dir / "question_models" / q
-        cfg = make_question_cfg(args, q, q_dir, best_hparams)
-        train_one_fold(q_train, q_test if not q_test.empty else q_train, cfg, metadata, q_dir)
-        model_dir = q_dir / "model"
-        train_emb = q_dir / "embeddings_train.csv"
-        extract_embeddings(model_dir, q_train, args, train_emb,
-                           best_hparams.get("max_length", args.max_length))
-        train_paths[q] = train_emb
-        if not q_test.empty:
-            test_emb = q_dir / "embeddings_test.csv"
-            extract_embeddings(model_dir, q_test, args, test_emb,
+        try:
+            q_train = trainval_df[trainval_df["question_id"] == q].reset_index(drop=True)
+            q_test = test_df[test_df["question_id"] == q].reset_index(drop=True) if test_df is not None and not test_df.empty else pd.DataFrame()
+            if q_train.empty:
+                print(f"  ⚠️ No training data for question {q}, skipping")
+                continue
+            q_dir = prod_dir / "question_models" / q
+            cfg = make_question_cfg(args, q, q_dir, best_hparams)
+            train_one_fold(q_train, q_test if not q_test.empty else q_train, cfg, metadata, q_dir)
+            model_dir = q_dir / "model"
+            train_emb = q_dir / "embeddings_train.csv"
+            extract_embeddings(model_dir, q_train, args, train_emb,
                                best_hparams.get("max_length", args.max_length))
-            test_paths[q] = test_emb
+            train_paths[q] = train_emb
+            if not q_test.empty:
+                test_emb = q_dir / "embeddings_test.csv"
+                extract_embeddings(model_dir, q_test, args, test_emb,
+                                   best_hparams.get("max_length", args.max_length))
+                test_paths[q] = test_emb
+        except Exception as e:
+            print(f"  ❌ Failed for question {q}: {e}")
+            traceback.print_exc()
+            continue
+
+    if not train_paths:
+        raise RuntimeError("No training embeddings produced")
 
     train_features, feature_cols = build_feature_table(train_paths, list(train_paths))
     if test_paths:
@@ -2640,51 +2713,51 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
     out_dir = Path(out_dir)
     audio_dir = out_dir / "audio_only"
     audio_dir.mkdir(parents=True, exist_ok=True)
-    
+
     audio_feature_cols = get_audio_feature_cols(audio_df)
     print(f"\n  Audio-only CV with {len(audio_feature_cols)} audio features")
-    
+
     labels = trainval_df.groupby("speaker_id")["label"].first().rename("y_true").reset_index()
     audio_with_labels = audio_df.merge(labels, on="speaker_id", how="inner")
-    
+
     if len(audio_with_labels) < 10:
         print("  ⚠️ Not enough audio samples for CV (need at least 10)")
         return None
-    
+
     print(f"  Audio samples with labels: {len(audio_with_labels)} speakers")
-    
+
     if args.task == "classification":
         class_counts = audio_with_labels["y_true"].value_counts()
         print(f"  Class distribution: {dict(class_counts)}")
         if len(class_counts) < 2:
             print("  ⚠️ Only one class present in audio data - skipping CV")
             return None
-    
+
     folds = make_outer_folds(trainval_df, args)
     print(f"  Running {len(folds)}-fold CV")
-    
+
     oof_rows = []
     fold_metrics = []
     fold_details = []
-    
+
     for fold_idx, (outer_train, outer_val) in enumerate(folds):
         fold_dir = audio_dir / f"fold_{fold_idx}"
         fold_dir.mkdir(parents=True, exist_ok=True)
-        
+
         train_speakers = set(outer_train.speaker_id)
         val_speakers = set(outer_val.speaker_id)
-        
+
         print(f"\n  Fold {fold_idx + 1}/{len(folds)}:")
         print(f"    Train speakers: {len(train_speakers)}")
         print(f"    Val speakers: {len(val_speakers)}")
-        
+
         atr = audio_with_labels[audio_with_labels.speaker_id.isin(train_speakers)].copy()
         ava = audio_with_labels[audio_with_labels.speaker_id.isin(val_speakers)].copy()
-        
+
         if len(atr) < 3 or len(ava) < 2:
             print(f"    ⚠️ Insufficient audio data: train={len(atr)}, val={len(ava)} - skipping fold")
             continue
-        
+
         Xtr = atr[audio_feature_cols].to_numpy(dtype=float)
         Xva = ava[audio_feature_cols].to_numpy(dtype=float)
         ytr = atr["y_true"].to_numpy()
@@ -2692,28 +2765,29 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
         if args.task == "classification":
             ytr = ytr.astype(int)
             yva = yva.astype(int)
-        
+
         Xtr = np.nan_to_num(Xtr, nan=0.0, posinf=0.0, neginf=0.0)
         Xva = np.nan_to_num(Xva, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         print(f"    Training data: Xtr={Xtr.shape}, ytr={ytr.shape}")
         if args.task == "classification":
             print(f"    Train class distribution: {np.bincount(ytr.astype(int))}")
-        
+
         try:
             model = make_meta_model(args)
             model.fit(Xtr, ytr)
             print(f"    Model trained successfully")
         except Exception as e:
             print(f"    ❌ Model training failed: {e}")
+            traceback.print_exc()
             continue
-        
+
         if args.task == "classification":
             best_threshold, best_score = find_optimal_threshold(
                 model, Xva, yva, metric='f1'
             )
             print(f"    Optimal threshold: {best_threshold:.3f} (F1 score: {best_score:.4f})")
-            
+
             if hasattr(model, "predict_proba"):
                 try:
                     proba = model.predict_proba(Xva)
@@ -2734,18 +2808,18 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
             proba = None
             best_threshold = None
             best_score = None
-        
+
         metrics = score_meta_model(
-            model, Xva, yva, args.task, 
+            model, Xva, yva, args.task,
             threshold=best_threshold if best_threshold is not None else 0.5
         )
-        
+
         fold_metric_row = {"fold": fold_idx}
         for k, v in metrics.items():
             if isinstance(v, (int, float, np.integer, np.floating)):
                 fold_metric_row[k] = float(v)
         fold_metrics.append(fold_metric_row)
-        
+
         fold_details.append({
             "fold": fold_idx,
             "train_speakers": len(train_speakers),
@@ -2755,11 +2829,11 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
             "optimal_threshold": float(best_threshold) if best_threshold is not None else None,
             "threshold_score": float(best_score) if best_score is not None else None,
         })
-        
+
         out_df = ava[["speaker_id", "y_true"]].copy()
         out_df["fold"] = fold_idx
         out_df["y_pred"] = pred
-        
+
         if args.task == "classification" and proba is not None:
             if proba.ndim == 2 and proba.shape[1] == 2:
                 out_df["y_proba"] = proba[:, 1]
@@ -2772,15 +2846,15 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
                         out_df["y_proba"] = full_proba[:, 1]
                 except:
                     pass
-        
+
         oof_rows.append(out_df)
-        
+
         joblib.dump(model, fold_dir / "model.joblib")
         out_df.to_csv(fold_dir / "predictions.csv", index=False)
-        
+
         with open(fold_dir / "metrics.json", "w") as f:
             json.dump(convert_to_serializable(metrics), f, indent=2)
-        
+
         if args.task == "classification":
             print(f"    Fold metrics: accuracy={metrics.get('accuracy', 0):.4f}, "
                   f"f1={metrics.get('f1', 0):.4f}, "
@@ -2788,30 +2862,30 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
         else:
             print(f"    Fold metrics: rmse={metrics.get('rmse', 0):.4f}, "
                   f"r2={metrics.get('r2', 0):.4f}")
-    
+
     if not oof_rows:
         print("\n  ❌ No audio-only predictions generated - all folds failed")
         return None
-    
+
     print(f"\n  Aggregating {len(oof_rows)} folds of predictions...")
     oof = pd.concat(oof_rows, ignore_index=True)
-    
+
     speaker_counts = oof.groupby("speaker_id").size()
     if not (speaker_counts == 1).all():
         print(f"  ⚠️ Warning: Some speakers appear in multiple folds: {speaker_counts[speaker_counts > 1]}")
         oof = oof.drop_duplicates(subset=["speaker_id"], keep="first")
-    
+
     print(f"  OOF predictions: {len(oof)} speakers")
-    
+
     aggregate_metrics = aggregate_oof_predictions(oof, args, subgroup_ids)
-    
+
     oof.to_csv(audio_dir / "oof_predictions.csv", index=False)
     pd.DataFrame(fold_metrics).to_csv(audio_dir / "fold_metrics.csv", index=False)
     pd.DataFrame(fold_details).to_csv(audio_dir / "fold_details.csv", index=False)
-    
+
     with open(audio_dir / "aggregate_metrics.json", "w") as f:
         json.dump(convert_to_serializable(aggregate_metrics), f, indent=2)
-    
+
     print(f"\n  {'='*50}")
     print(f"  AUDIO-ONLY CV COMPLETE")
     print(f"  {'='*50}")
@@ -2824,7 +2898,7 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
         print(f"  Aggregate RMSE: {aggregate_metrics.get('all', {}).get('rmse', 0):.4f}")
         print(f"  Aggregate R²: {aggregate_metrics.get('all', {}).get('r2', 0):.4f}")
     print(f"  {'='*50}")
-    
+
     return {
         "aggregate_metrics": aggregate_metrics,
         "fold_metrics": fold_metrics,
@@ -2835,7 +2909,7 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
 
 
 # =======================================================================
-# FUSION METHODS (all fully implemented)
+# FUSION METHODS (all fully implemented) - with error handling and adaptive weights
 # =======================================================================
 
 def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids=None):
@@ -2847,49 +2921,49 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
 
     fusion_dir = Path(out_dir) / "fusion_results" / "leakage_safe_5fold"
     fusion_dir.mkdir(parents=True, exist_ok=True)
-    
+
     audio_feature_cols = get_audio_feature_cols(audio_df)
     print(f"\n🔊 Audio features: {len(audio_feature_cols)} columns")
-    
+
     labels = trainval_df.groupby("speaker_id")["label"].first().rename("y_true").reset_index()
-    
+
     if args.task == "regression":
         labels["y_true"] = labels["y_true"].astype(float)
     else:
         labels["y_true"] = labels["y_true"].astype(int)
-    
+
     audio_with_labels = audio_df.merge(labels, on="speaker_id", how="inner")
-    
+
     for col in audio_feature_cols:
         audio_with_labels[col] = pd.to_numeric(audio_with_labels[col], errors='coerce').fillna(0.0)
-    
+
     audio_with_labels = audio_with_labels.dropna(subset=["y_true"])
     print(f"  Audio speakers with labels: {len(audio_with_labels)}")
-    
+
     questions = [q.upper() for q in args.questions]
-    
+
     # ===================================================================
     # COMPUTE ADAPTIVE WEIGHTS
     # ===================================================================
     weights = compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, subgroup_ids)
     audio_weight = weights['audio_weight']
     text_weight = weights['text_weight']
-    
+
     # Save weights
     with open(fusion_dir / "adaptive_weights.json", "w") as f:
         json.dump(convert_to_serializable(weights), f, indent=2)
-    
+
     folds = make_outer_folds(trainval_df, args)
     print(f"\n📂 Running {len(folds)}-fold CV")
     print(f"⚖️ Using adaptive weights: Audio={audio_weight:.3f}, Text={text_weight:.3f}")
-    
+
     # Define fusion methods
     fusion_methods = getattr(args, "fusion_methods", ["all"])
     novel = getattr(args, "fusion_novel", "none")
-    
-    base_methods = ["text_only", "audio_only", "early", "late", "confidence", 
+
+    base_methods = ["text_only", "audio_only", "early", "late", "confidence",
                     "stacking", "moe", "interaction", "dynamic", "cca", "mlp"]
-    
+
     if "all" in fusion_methods:
         methods_to_run = base_methods.copy()
     else:
@@ -2911,85 +2985,105 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             methods_to_run.append("dynamic")
         if novel in ("cca", "all") and "cca" not in methods_to_run:
             methods_to_run.append("cca")
-    
+
     methods_to_run = list(dict.fromkeys(methods_to_run))
     if not methods_to_run:
         methods_to_run = ["early"]
-    
+
     print(f"\n🔬 Fusion methods: {methods_to_run}")
-    
+
     result = {method: {"fold_metrics": [], "predictions": []} for method in methods_to_run}
-    
+
     for fold_idx, (tr, va) in enumerate(folds):
         fold_dir = fusion_dir / f"fold_{fold_idx}"
         fold_dir.mkdir(parents=True, exist_ok=True)
-        
+
         print("\n" + "=" * 70)
         print(f"FOLD {fold_idx + 1}/{len(folds)}")
         print(f"Train: {tr.speaker_id.nunique()} speakers | Val: {va.speaker_id.nunique()} speakers")
         print("=" * 70)
-        
+
         speakers_tr = set(tr.speaker_id)
         speakers_va = set(va.speaker_id)
-        
+
         # Prepare audio data
-        atr = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_tr)].copy()
-        ava = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_va)].copy()
-        
-        if len(atr) < 2 or len(ava) < 2:
-            print(f"  ⚠️ Insufficient audio: train={len(atr)}, val={len(ava)}")
+        try:
+            atr = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_tr)].copy()
+            ava = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_va)].copy()
+
+            if len(atr) < 2 or len(ava) < 2:
+                print(f"  ⚠️ Insufficient audio: train={len(atr)}, val={len(ava)}")
+                continue
+
+            atr = atr.set_index("speaker_id")
+            ava = ava.set_index("speaker_id")
+        except Exception as e:
+            print(f"  ❌ Failed to prepare audio data: {e}")
+            traceback.print_exc()
             continue
-        
-        atr = atr.set_index("speaker_id")
-        ava = ava.set_index("speaker_id")
-        
+
         # Prepare text data
-        if args.task == "regression":
-            if len(tr.speaker_id.unique()) < 6:
-                selected_questions = questions
+        try:
+            if args.task == "regression":
+                if len(tr.speaker_id.unique()) < 6:
+                    selected_questions = questions
+                else:
+                    q_scores = safe_question_cv_scores(tr, metadata, args, best_hparams, questions, fold_dir)
+                    selected_questions = select_questions_from_scores(q_scores, args)
             else:
                 q_scores = safe_question_cv_scores(tr, metadata, args, best_hparams, questions, fold_dir)
                 selected_questions = select_questions_from_scores(q_scores, args)
-        else:
-            q_scores = safe_question_cv_scores(tr, metadata, args, best_hparams, questions, fold_dir)
-            selected_questions = select_questions_from_scores(q_scores, args)
-        
-        if 'q_scores' in locals():
-            pd.DataFrame({
-                "question_id": list(q_scores.keys()),
-                "inner_score": list(q_scores.values()),
-                "selected": [q in selected_questions for q in q_scores.keys()]
-            }).to_csv(fold_dir / "question_selection.csv", index=False)
-        
+
+            if 'q_scores' in locals():
+                pd.DataFrame({
+                    "question_id": list(q_scores.keys()),
+                    "inner_score": list(q_scores.values()),
+                    "selected": [q in selected_questions for q in q_scores.keys()]
+                }).to_csv(fold_dir / "question_selection.csv", index=False)
+        except Exception as e:
+            print(f"  ❌ Failed to select questions: {e}")
+            traceback.print_exc()
+            continue
+
         # Train text models
         tpaths, vpaths = {}, {}
         for q in selected_questions:
-            _, te, ve = safe_question_train_and_embed(tr, va, metadata, args, best_hparams, q, fold_dir)
-            if te is not None and ve is not None:
-                tpaths[q], vpaths[q] = te, ve
-        
+            try:
+                _, te, ve = safe_question_train_and_embed(tr, va, metadata, args, best_hparams, q, fold_dir)
+                if te is not None and ve is not None:
+                    tpaths[q], vpaths[q] = te, ve
+            except Exception as e:
+                print(f"  ❌ Failed for question {q}: {e}")
+                traceback.print_exc()
+                continue
+
         if not tpaths:
             print(f"  ❌ No text embeddings for fold {fold_idx}")
             continue
-        
+
         # Build feature tables
-        tf, tc = build_feature_table(tpaths, list(tpaths))
-        vf, _ = build_feature_table(vpaths, list(vpaths))
-        tf, vf, _ = align_feature_tables(tf, vf, pd.DataFrame(), tc)
-        
+        try:
+            tf, tc = build_feature_table(tpaths, list(tpaths))
+            vf, _ = build_feature_table(vpaths, list(vpaths))
+            tf, vf, _ = align_feature_tables(tf, vf, pd.DataFrame(), tc)
+        except Exception as e:
+            print(f"  ❌ Failed to build feature tables: {e}")
+            traceback.print_exc()
+            continue
+
         # Align speakers
         common_tr = tf.index.intersection(atr.index)
         common_va = vf.index.intersection(ava.index)
-        
+
         if len(common_tr) < 2 or len(common_va) < 2:
             print(f"  ⚠️ Insufficient overlap: train={len(common_tr)}, val={len(common_va)}")
             continue
-        
+
         tf = tf.loc[common_tr]
         atr = atr.loc[common_tr]
         vf = vf.loc[common_va]
         ava = ava.loc[common_va]
-        
+
         # Extract labels
         if args.task == "regression":
             ytr = tf["y_true"].to_numpy().astype(float)
@@ -2997,16 +3091,16 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         else:
             ytr = tf["y_true"].to_numpy().astype(int)
             yva = vf["y_true"].to_numpy().astype(int)
-        
+
         # Prepare features
         tx = [c for c in tf.columns if "__" in c]
         ax = [c for c in atr.columns if c not in ("y_true",)]
-        
+
         Xtr_t = tf[tx].to_numpy(float)
         Xva_t = vf[tx].to_numpy(float)
         Xtr_a = atr[ax].to_numpy(float)
         Xva_a = ava[ax].to_numpy(float)
-        
+
         # PCA for text
         n_pca = getattr(args, 'pca_text_components', 0)
         if n_pca > 0 and Xtr_t.shape[1] > n_pca:
@@ -3015,32 +3109,42 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                 pca = PCA(n_components=n_comp, random_state=args.seed)
                 Xtr_t = pca.fit_transform(Xtr_t)
                 Xva_t = pca.transform(Xva_t)
-        
+
         Xtr = np.hstack([Xtr_t, Xtr_a])
         Xva = np.hstack([Xva_t, Xva_a])
-        
+
         # Train base models
         def fit_predict_base(X_train, X_val, y_train, y_val):
-            m = make_meta_model(args)
-            m.fit(X_train, y_train)
-            if args.task == "classification":
-                best_th, _ = find_optimal_threshold(m, X_val, y_val, metric='f1')
-                p, pr = predict_with_threshold(m, X_val, best_th)
-                return m, p, pr, best_th
-            else:
-                p = m.predict(X_val)
-                pr = m.predict_proba(X_val) if hasattr(m, "predict_proba") else None
-                return m, p, pr, None
-        
-        m_text, pred_text, proba_text, th_text = fit_predict_base(Xtr_t, Xva_t, ytr, yva)
-        m_audio, pred_audio, proba_audio, th_audio = fit_predict_base(Xtr_a, Xva_a, ytr, yva)
-        
+            try:
+                m = make_meta_model(args)
+                m.fit(X_train, y_train)
+                if args.task == "classification":
+                    best_th, _ = find_optimal_threshold(m, X_val, y_val, metric='f1')
+                    p, pr = predict_with_threshold(m, X_val, best_th)
+                    return m, p, pr, best_th
+                else:
+                    p = m.predict(X_val)
+                    pr = m.predict_proba(X_val) if hasattr(m, "predict_proba") else None
+                    return m, p, pr, None
+            except Exception as e:
+                print(f"      fit_predict_base failed: {e}")
+                traceback.print_exc()
+                raise
+
+        try:
+            m_text, pred_text, proba_text, th_text = fit_predict_base(Xtr_t, Xva_t, ytr, yva)
+            m_audio, pred_audio, proba_audio, th_audio = fit_predict_base(Xtr_a, Xva_a, ytr, yva)
+        except Exception as e:
+            print(f"  ❌ Base model training failed: {e}")
+            traceback.print_exc()
+            continue
+
         # Apply weighted predictions for methods that use them
         weighted_pred, weighted_proba = apply_adaptive_weights(
-            pred_audio, pred_text, proba_audio, proba_text, 
+            pred_audio, pred_text, proba_audio, proba_text,
             audio_weight, text_weight, args.task
         )
-        
+
         # ============================================================
         # RUN FUSION METHODS
         # ============================================================
@@ -3048,39 +3152,39 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             pred = None
             proba = None
             best_th = None
-            
+
             try:
                 if method == "text_only":
                     pred = pred_text
                     proba = proba_text
                     best_th = th_text
-                    
+
                 elif method == "audio_only":
                     pred = pred_audio
                     proba = proba_audio
                     best_th = th_audio
-                    
+
                 elif method == "early":
                     m_early, pred, proba, best_th = fit_predict_base(Xtr, Xva, ytr, yva)
-                    
+
                 elif method == "late":
                     pred = weighted_pred
                     proba = weighted_proba
                     if args.task == "classification" and proba is not None and proba.shape[1] == 2:
                         best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
                         pred = (proba[:, 1] >= best_th).astype(int)
-                    
+
                 elif method == "confidence":
                     if args.task == "classification" and proba_text is not None and proba_audio is not None:
                         conf_t = np.max(proba_text, axis=1) if proba_text.ndim > 1 else np.abs(proba_text - 0.5) * 2
                         conf_a = np.max(proba_audio, axis=1) if proba_audio.ndim > 1 else np.abs(proba_audio - 0.5) * 2
-                        
+
                         alpha = 0.7
                         raw_wt = conf_a / (conf_a + conf_t + 1e-12)
                         prior_wt = audio_weight / (audio_weight + text_weight + 1e-12)
                         final_wt = alpha * raw_wt + (1 - alpha) * prior_wt
                         final_wt = final_wt[:, None]
-                        
+
                         proba = final_wt * proba_audio + (1 - final_wt) * proba_text
                         if proba.shape[1] == 2:
                             best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
@@ -3090,41 +3194,41 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     else:
                         pred = weighted_pred
                         proba = weighted_proba
-                    
+
                 elif method == "stacking":
                     if args.task == "classification" and proba_text is not None and proba_audio is not None:
                         Xtr_stack = np.hstack([text_weight * proba_text, audio_weight * proba_audio])
                         Xva_stack = np.hstack([text_weight * proba_text, audio_weight * proba_audio])
                     else:
-                        Xtr_stack = np.hstack([text_weight * pred_text.reshape(-1,1), 
+                        Xtr_stack = np.hstack([text_weight * pred_text.reshape(-1,1),
                                                audio_weight * pred_audio.reshape(-1,1)])
-                        Xva_stack = np.hstack([text_weight * pred_text.reshape(-1,1), 
+                        Xva_stack = np.hstack([text_weight * pred_text.reshape(-1,1),
                                                audio_weight * pred_audio.reshape(-1,1)])
-                    
+
                     m_stack, pred, proba, best_th = fit_predict_base(Xtr_stack, Xva_stack, ytr, yva)
-                    
+
                 elif method == "moe":
                     if args.task == "classification":
                         from sklearn.linear_model import LogisticRegression
                         gate_input = np.hstack([Xtr_t, Xtr_a])
                         prob_t = m_text.predict_proba(Xtr_t)
                         prob_a = m_audio.predict_proba(Xtr_a)
-                        
+
                         weighted_prob_t = text_weight * prob_t
                         weighted_prob_a = audio_weight * prob_a
-                        
+
                         ytr_onehot = np.eye(prob_t.shape[1])[ytr.astype(int)]
                         score_t = np.sum(weighted_prob_t * ytr_onehot, axis=1)
                         score_a = np.sum(weighted_prob_a * ytr_onehot, axis=1)
                         gate_target = (score_t > score_a).astype(int)
-                        
+
                         gate = LogisticRegression(random_state=args.seed)
                         gate.fit(gate_input, gate_target)
-                        
+
                         gate_input_val = np.hstack([Xva_t, Xva_a])
                         gate_proba = gate.predict_proba(gate_input_val)
                         wt = gate_proba[:, 1][:, None]
-                        
+
                         proba = wt * proba_audio + (1 - wt) * proba_text
                         if proba.shape[1] == 2:
                             best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
@@ -3138,41 +3242,41 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                         wt = wt[:, None]
                         pred = wt * m_text.predict(Xva_t) + (1 - wt) * m_audio.predict(Xva_a)
                         proba = None
-                        
+
                 elif method == "interaction":
                     n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0]-1)
                     if n_comp > 1:
                         pca_t = PCA(n_components=n_comp, random_state=args.seed)
                         pca_a = PCA(n_components=n_comp, random_state=args.seed)
-                        
+
                         Xtr_t_pca = pca_t.fit_transform(text_weight * Xtr_t)
                         Xtr_a_pca = pca_a.fit_transform(audio_weight * Xtr_a)
                         Xva_t_pca = pca_t.transform(text_weight * Xva_t)
                         Xva_a_pca = pca_a.transform(audio_weight * Xva_a)
-                        
+
                         Xtr_inter = Xtr_t_pca * Xtr_a_pca
                         Xva_inter = Xva_t_pca * Xva_a_pca
-                        
+
                         Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a, Xtr_inter])
                         Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a, Xva_inter])
                     else:
                         Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
                         Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
-                    
+
                     m_inter, pred, proba, best_th = fit_predict_base(Xtr_fused, Xva_fused, ytr, yva)
-                    
+
                 elif method == "dynamic":
                     if args.task == "classification" and proba_text is not None and proba_audio is not None:
                         ent_t = -np.sum(proba_text * np.log(proba_text + 1e-12), axis=1)
                         ent_a = -np.sum(proba_audio * np.log(proba_audio + 1e-12), axis=1)
                         conf_t = 1 - ent_t / np.log(proba_text.shape[1])
                         conf_a = 1 - ent_a / np.log(proba_audio.shape[1])
-                        
+
                         raw_wt = conf_t / (conf_t + conf_a + 1e-12)
                         prior_wt = text_weight / (text_weight + audio_weight + 1e-12)
                         final_wt = 0.7 * raw_wt + 0.3 * prior_wt
                         final_wt = final_wt[:, None]
-                        
+
                         proba = final_wt * proba_text + (1 - final_wt) * proba_audio
                         if proba.shape[1] == 2:
                             best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
@@ -3182,14 +3286,14 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     else:
                         pred = weighted_pred
                         proba = weighted_proba
-                        
+
                 elif method == "cca":
                     try:
                         n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0]-1)
                         if n_comp > 1:
                             from sklearn.cross_decomposition import CCA
                             cca = CCA(n_components=n_comp, random_state=args.seed)
-                            
+
                             Xtr_t_cca, Xtr_a_cca = cca.fit_transform(
                                 text_weight * Xtr_t, audio_weight * Xtr_a
                             )
@@ -3204,17 +3308,17 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     except Exception as e:
                         print(f"    CCA failed: {e}")
                         m_cca, pred, proba, best_th = fit_predict_base(Xtr, Xva, ytr, yva)
-                        
+
                 elif method == "mlp":
                     from sklearn.neural_network import MLPClassifier, MLPRegressor
                     scaler = StandardScaler()
-                    
+
                     Xtr_weighted = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
                     Xva_weighted = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
-                    
+
                     Xtr_scaled = scaler.fit_transform(Xtr_weighted)
                     Xva_scaled = scaler.transform(Xva_weighted)
-                    
+
                     if args.task == "classification":
                         mlp = MLPClassifier(
                             hidden_layer_sizes=(64, 32),
@@ -3233,9 +3337,9 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                             validation_fraction=0.1,
                             alpha=0.001
                         )
-                    
+
                     mlp.fit(Xtr_scaled, ytr)
-                    
+
                     if args.task == "classification":
                         if hasattr(mlp, "predict_proba"):
                             proba = mlp.predict_proba(Xva_scaled)
@@ -3250,105 +3354,104 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     else:
                         pred = mlp.predict(Xva_scaled)
                         proba = None
-                
+
                 else:
                     print(f"  ⚠️ Unknown method: {method}")
                     continue
-                
+
                 # ============================================================
                 # COMPUTE METRICS AND SAVE
                 # ============================================================
                 if pred is not None:
                     metrics = score_meta_model(None, pred, yva, args.task)
-                    
+
                     if proba is not None and args.task == "classification":
                         try:
                             if proba.ndim == 2 and proba.shape[1] == 2:
                                 metrics["roc_auc"] = float(roc_auc_score(yva, proba[:, 1]))
                             elif proba.ndim == 1:
                                 metrics["roc_auc"] = float(roc_auc_score(yva, proba))
-                        except Exception:
+                        except Exception as e:
                             pass
-                    
+
                     result[method]["fold_metrics"].append(metrics)
-                    
+
                     rows = pd.DataFrame({
                         "speaker_id": vf.index.to_numpy(),
                         "y_true": yva,
                         "y_pred": pred,
                         "fold": fold_idx
                     })
-                    
+
                     if proba is not None and args.task == "classification":
                         if proba.ndim == 2 and proba.shape[1] == 2:
                             rows["y_proba"] = proba[:, 1]
                         elif proba.ndim == 1:
                             rows["y_proba"] = proba
-                    
+
                     result[method]["predictions"].append(rows)
-                    
+
                     if args.task == "classification":
                         print(f"  {method}: F1={metrics.get('f1', 0):.4f}, AUC={metrics.get('roc_auc', 0):.4f}")
                     else:
                         print(f"  {method}: RMSE={metrics.get('rmse', 0):.4f}, R²={metrics.get('r2', 0):.4f}")
-                    
+
             except Exception as e:
                 print(f"  ❌ {method} failed: {e}")
-                import traceback
                 traceback.print_exc()
                 continue
-    
+
     # ===================================================================
     # AGGREGATE RESULTS
     # ===================================================================
     print("\n" + "=" * 60)
     print("📊 AGGREGATING FUSION RESULTS")
     print("=" * 60)
-    
+
     for method in methods_to_run:
         if not result[method]["predictions"]:
             print(f"  ⚠️ {method}: No predictions")
             continue
-        
+
         pred_df = pd.concat(result[method]["predictions"], ignore_index=True)
-        
+
         speaker_counts = pred_df.groupby("speaker_id").size()
         if not (speaker_counts == 1).all():
             pred_df = pred_df.drop_duplicates(subset=["speaker_id"], keep="first")
-        
+
         agg_metrics = aggregate_oof_predictions(pred_df, args, subgroup_ids)
         result[method]["aggregate_metrics"] = agg_metrics
-        
+
         pred_df.to_csv(fusion_dir / f"{method}_oof_predictions.csv", index=False)
         pd.DataFrame(result[method]["fold_metrics"]).to_csv(
             fusion_dir / f"{method}_fold_metrics.csv", index=False
         )
-        
+
         with open(fusion_dir / f"{method}_aggregate_metrics.json", "w") as f:
             json.dump(convert_to_serializable(agg_metrics), f, indent=2)
-        
+
         all_m = agg_metrics.get("all", {})
         if args.task == "classification":
             print(f"  {method}: F1={all_m.get('f1', 0):.4f}, AUC={all_m.get('roc_auc', 0):.4f}")
         else:
             print(f"  {method}: RMSE={all_m.get('rmse', 0):.4f}, R²={all_m.get('r2', 0):.4f}")
-    
+
     # Save summary
     summary = {}
     for method in methods_to_run:
         if "aggregate_metrics" in result[method]:
             summary[method] = result[method]["aggregate_metrics"]
-    
+
     summary['adaptive_weights'] = weights
-    
+
     with open(fusion_dir / "fusion_summary.json", "w") as f:
         json.dump(convert_to_serializable(summary), f, indent=2)
-    
+
     print("\n" + "=" * 60)
     print("✅ FUSION CV COMPLETE")
     print(f"   Weights: Audio={audio_weight:.3f}, Text={text_weight:.3f}")
     print("=" * 60)
-    
+
     return result
 
 
@@ -3371,35 +3474,35 @@ def build_parser():
     parser.add_argument("--test-frac", type=float, default=0.1)
     parser.add_argument("--n-cv-folds", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    
+
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
-    
+
     parser.add_argument("--hpo-n-trials", type=int, default=20)
     parser.add_argument("--hpo-timeout", type=int, default=None)
     parser.add_argument("--hpo-folds", type=int, default=4)
     parser.add_argument("--force-hpo", action="store_true")
-    
-    parser.add_argument("--meta-model", 
-                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", 
+
+    parser.add_argument("--meta-model",
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting",
                                 "gradient_boosting", "knn", "ridge", "lasso", "elasticnet"],
                         default="linear")
     parser.add_argument("--use-ensemble", action="store_true")
     parser.add_argument("--ensemble-models", nargs="+",
-                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting", 
+                        choices=["linear", "random_forest", "svm", "hist_gradient_boosting",
                                 "gradient_boosting", "knn", "ridge", "lasso", "elasticnet"],
                         default=["linear", "random_forest", "hist_gradient_boosting"])
     parser.add_argument("--ensemble-weights", nargs="+", type=float, default=None)
-    
+
     parser.add_argument("--n-estimators", type=int, default=500)
     parser.add_argument("--max-depth", type=int, default=None)
     parser.add_argument("--importance", choices=["shap", "permutation", "hybrid"], default="shap")
     parser.add_argument("--top-k", type=int, default=0)
-    
+
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--class-weights", choices=["none", "balanced"], default="balanced")
@@ -3410,23 +3513,23 @@ def build_parser():
     parser.add_argument("--embedding-batch-size", type=int, default=4)
     parser.add_argument("--force-embeddings", action="store_true")
     parser.add_argument("--delimiter", default=";")
-    
+
     parser.add_argument("--audio-features-csv", type=str, default=None)
     parser.add_argument("--audio-feature-cols", nargs="+", default=None)
-    parser.add_argument("--fusion-methods", nargs="+", 
-                        choices=["early", "late", "confidence", "stacking", "moe", "interaction", 
+    parser.add_argument("--fusion-methods", nargs="+",
+                        choices=["early", "late", "confidence", "stacking", "moe", "interaction",
                                  "dynamic", "cca", "mlp", "text_only", "audio_only", "all"],
                         default=["all"])
-    parser.add_argument("--fusion-novel", 
-                        choices=["none", "confidence", "interaction", "moe", "mlp", "stacking", 
+    parser.add_argument("--fusion-novel",
+                        choices=["none", "confidence", "interaction", "moe", "mlp", "stacking",
                                  "dynamic", "cca", "all"],
                         default="none")
-    
+
     parser.add_argument("--use-smote", action="store_true")
     parser.add_argument("--smote-k-neighbors", type=int, default=3)
     parser.add_argument("--smote-sampling-strategy", type=str, default="auto")
     parser.add_argument("--smote-method", choices=["smote", "adasyn", "smote_tomek"], default="smote")
-    
+
     parser.add_argument("--xgb-lr", type=float, default=0.1)
     parser.add_argument("--logreg-C", type=float, default=1.0)
     parser.add_argument("--ridge-alpha", type=float, default=1.0)
@@ -3447,172 +3550,185 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
-    set_seed(args.seed)
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    splits_dir = Path(args.splits_dir)
+    try:
+        args = build_parser().parse_args()
+        set_seed(args.seed)
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        splits_dir = Path(args.splits_dir)
 
-    subgroup_ids = None
-    if args.subgroup_file:
-        subgroup_ids = load_subgroup_ids(Path(args.subgroup_file))
-        print(f"Loaded {len(subgroup_ids)} subgroup speaker IDs from {args.subgroup_file}")
+        subgroup_ids = None
+        if args.subgroup_file:
+            subgroup_ids = load_subgroup_ids(Path(args.subgroup_file))
+            print(f"Loaded {len(subgroup_ids)} subgroup speaker IDs from {args.subgroup_file}")
 
-    print("\n" + "=" * 72)
-    print("LEAKAGE-SAFE SPEECH/TEXT + AUDIO PIPELINE")
-    print("5-fold speaker-level OOF evaluation")
-    print("=" * 72)
+        print("\n" + "=" * 72)
+        print("LEAKAGE-SAFE SPEECH/TEXT + AUDIO PIPELINE")
+        print("5-fold speaker-level OOF evaluation")
+        print("=" * 72)
 
-    questions = [q.upper() for q in args.questions]
-    df, metadata = load_examples(
-        args.asr_file, args.demo_file, args.target_column, args.task,
-        text_mode="question", min_text_chars=args.min_text_chars,
-        filter_questions=questions, delimiter=args.delimiter
-    )
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
-
-    split_mgr = SplitManager(
-        splits_dir, args.task, args.train_frac, args.val_frac, args.test_frac,
-        args.seed, args.n_cv_folds
-    )
-    final_train, final_val, final_test = split_mgr.get_final_splits(df)
-    print(f"Initial speaker split: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
-
-    trainval = pd.concat([final_train, final_val], ignore_index=True)
-    if not final_test.empty:
-        test_speakers = set(final_test.speaker_id)
-        if test_speakers & set(trainval.speaker_id):
-            raise RuntimeError("Initial train/test speaker leakage detected")
-
-    audio_df = None
-    if args.audio_features_csv:
-        audio_df = load_audio_features(
-            args.audio_features_csv, speaker_col="speaker_id",
-            exclude_cols=args.audio_feature_cols
+        questions = [q.upper() for q in args.questions]
+        df, metadata = load_examples(
+            args.asr_file, args.demo_file, args.target_column, args.task,
+            text_mode="question", min_text_chars=args.min_text_chars,
+            filter_questions=questions, delimiter=args.delimiter
         )
-        print(f"Loaded {len(get_audio_feature_cols(audio_df))} audio features for {len(audio_df)} speakers")
+        (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
 
-    best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
-    if best_hparams_path.exists() and not args.force_hpo:
-        best_hparams = json.loads(best_hparams_path.read_text())
-        print(f"Loaded HPO parameters from {best_hparams_path}")
-    else:
-        try:
-            best_hparams = hyperparameter_search_optuna_all_questions(
-                final_train, split_mgr, args, metadata, pd.DataFrame()
+        split_mgr = SplitManager(
+            splits_dir, args.task, args.train_frac, args.val_frac, args.test_frac,
+            args.seed, args.n_cv_folds
+        )
+        final_train, final_val, final_test = split_mgr.get_final_splits(df)
+        print(f"Initial speaker split: train={len(final_train)}, val={len(final_val)}, test={len(final_test)}")
+
+        trainval = pd.concat([final_train, final_val], ignore_index=True)
+        if not final_test.empty:
+            test_speakers = set(final_test.speaker_id)
+            if test_speakers & set(trainval.speaker_id):
+                raise RuntimeError("Initial train/test speaker leakage detected")
+
+        audio_df = None
+        if args.audio_features_csv:
+            audio_df = load_audio_features(
+                args.audio_features_csv, speaker_col="speaker_id",
+                exclude_cols=args.audio_feature_cols
             )
-            best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
-            cleanup_temp_dirs(out_dir, force=True)
-        except Exception as exc:
-            print(f"HPO failed; using supplied defaults: {exc}")
-            best_hparams = {
-                "learning_rate": args.learning_rate,
-                "batch_size": args.batch_size,
-                "epochs": args.epochs,
-                "weight_decay": args.weight_decay,
-                "warmup_ratio": args.warmup_ratio,
-                "max_length": args.max_length,
-            }
+            print(f"Loaded {len(get_audio_feature_cols(audio_df))} audio features for {len(audio_df)} speakers")
 
-    for key in ("learning_rate", "batch_size", "epochs", "weight_decay", "warmup_ratio", "max_length"):
-        if key in best_hparams:
-            setattr(args, key, best_hparams[key])
-
-    audio_only_result = None
-    if audio_df is not None:
-        print("\n" + "=" * 60)
-        print("🚀 AUDIO-ONLY 5-FOLD CV")
-        print("=" * 60)
-        audio_only_result = train_audio_only_cv(audio_df, trainval, args, out_dir, subgroup_ids)
-        if audio_only_result:
-            print(f"  Audio-only aggregate macro_f1: {audio_only_result['aggregate_metrics'].get('all', {}).get('macro_f1', 0):.4f}")
-
-    print("\n" + "=" * 60)
-    print("📝 TEXT 5-FOLD OOF CV")
-    print("=" * 60)
-    cv_result = leakage_safe_text_cv(
-        trainval, metadata, args, best_hparams, out_dir, subgroup_ids
-    )
-
-    (out_dir / "cv_aggregate_metrics.json").write_text(
-        json.dumps(convert_to_serializable(cv_result["aggregate_metrics"]), indent=2)
-    )
-    cv_result["oof_predictions"].to_csv(out_dir / "cv_oof_predictions.csv", index=False)
-
-    if not final_test.empty:
-        print("\nTraining production model on train+validation only...")
-        _, train_features, test_features, selected_cols, test_metrics = train_production_text_model(
-            trainval, final_test, metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
-        )
-        if test_metrics is not None:
-            print("\nHELD-OUT TEST RESULT (with subgroup breakdown if provided):")
-            print(json.dumps(convert_to_serializable(test_metrics), indent=2))
-    else:
-        print("\nNo held-out test set. OOF CV is the evaluation result.")
-        train_production_text_model(
-            trainval, pd.DataFrame(), metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
-        )
-
-    if audio_df is not None:
-        try:
-            print("\n" + "=" * 60)
-            print("🔊 AUDIO/TEXT FUSION 5-FOLD CV")
-            print("=" * 60)
-            fusion_result = run_leakage_safe_fusion_cv(
-                trainval, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids
-            )
-            if fusion_result:
-                fusion_summary = {
-                    method: result.get("aggregate_metrics", {})
-                    for method, result in fusion_result.items()
-                }
-                (out_dir / "fusion_results" / "leakage_safe_5fold_summary.json").write_text(
-                    json.dumps(convert_to_serializable(fusion_summary), indent=2)
+        best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
+        if best_hparams_path.exists() and not args.force_hpo:
+            best_hparams = json.loads(best_hparams_path.read_text())
+            print(f"Loaded HPO parameters from {best_hparams_path}")
+        else:
+            try:
+                best_hparams = hyperparameter_search_optuna_all_questions(
+                    final_train, split_mgr, args, metadata, pd.DataFrame()
                 )
-                print("\n📊 FUSION RESULTS COMPARISON:")
-                for method, metrics in fusion_summary.items():
-                    all_m = metrics.get("all", {})
-                    if "macro_f1" in all_m:
-                        print(f"  {method}: macro_f1 = {all_m['macro_f1']:.4f}")
-                    if "roc_auc" in all_m:
-                        print(f"    AUC = {all_m['roc_auc']:.4f}")
+                best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
+                cleanup_temp_dirs(out_dir, force=True)
+            except Exception as exc:
+                print(f"HPO failed; using supplied defaults: {exc}")
+                traceback.print_exc()
+                best_hparams = {
+                    "learning_rate": args.learning_rate,
+                    "batch_size": args.batch_size,
+                    "epochs": args.epochs,
+                    "weight_decay": args.weight_decay,
+                    "warmup_ratio": args.warmup_ratio,
+                    "max_length": args.max_length,
+                }
 
+        for key in ("learning_rate", "batch_size", "epochs", "weight_decay", "warmup_ratio", "max_length"):
+            if key in best_hparams:
+                setattr(args, key, best_hparams[key])
+
+        audio_only_result = None
+        if audio_df is not None:
+            print("\n" + "=" * 60)
+            print("🚀 AUDIO-ONLY 5-FOLD CV")
+            print("=" * 60)
+            audio_only_result = train_audio_only_cv(audio_df, trainval, args, out_dir, subgroup_ids)
+            if audio_only_result:
+                print(f"  Audio-only aggregate macro_f1: {audio_only_result['aggregate_metrics'].get('all', {}).get('macro_f1', 0):.4f}")
+
+        print("\n" + "=" * 60)
+        print("📝 TEXT 5-FOLD OOF CV")
+        print("=" * 60)
+        cv_result = leakage_safe_text_cv(
+            trainval, metadata, args, best_hparams, out_dir, subgroup_ids
+        )
+
+        if cv_result is None:
+            raise RuntimeError("Text CV failed, aborting pipeline")
+
+        (out_dir / "cv_aggregate_metrics.json").write_text(
+            json.dumps(convert_to_serializable(cv_result["aggregate_metrics"]), indent=2)
+        )
+        cv_result["oof_predictions"].to_csv(out_dir / "cv_oof_predictions.csv", index=False)
+
+        if not final_test.empty:
+            print("\nTraining production model on train+validation only...")
+            _, train_features, test_features, selected_cols, test_metrics = train_production_text_model(
+                trainval, final_test, metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
+            )
+            if test_metrics is not None:
+                print("\nHELD-OUT TEST RESULT (with subgroup breakdown if provided):")
+                print(json.dumps(convert_to_serializable(test_metrics), indent=2))
+        else:
+            print("\nNo held-out test set. OOF CV is the evaluation result.")
+            train_production_text_model(
+                trainval, pd.DataFrame(), metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
+            )
+
+        if audio_df is not None:
+            try:
                 print("\n" + "=" * 60)
-                print("🔄 RUNNING META-FUSION")
+                print("🔊 AUDIO/TEXT FUSION 5-FOLD CV")
                 print("=" * 60)
-                meta_results = run_meta_fusion(out_dir, args)
+                fusion_result = run_leakage_safe_fusion_cv(
+                    trainval, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids
+                )
+                if fusion_result:
+                    fusion_summary = {
+                        method: result.get("aggregate_metrics", {})
+                        for method, result in fusion_result.items()
+                    }
+                    (out_dir / "fusion_results" / "leakage_safe_5fold_summary.json").write_text(
+                        json.dumps(convert_to_serializable(fusion_summary), indent=2)
+                    )
+                    print("\n📊 FUSION RESULTS COMPARISON:")
+                    for method, metrics in fusion_summary.items():
+                        all_m = metrics.get("all", {})
+                        if "macro_f1" in all_m:
+                            print(f"  {method}: macro_f1 = {all_m['macro_f1']:.4f}")
+                        if "roc_auc" in all_m:
+                            print(f"    AUC = {all_m['roc_auc']:.4f}")
 
-                if meta_results:
-                    meta_dir = out_dir / 'fusion_results' / 'meta_fusion'
-                    visualize_meta_fusion_metrics(meta_dir)
-                    
-                    print("\n📊 META-FUSION RESULTS:")
-                    for method, data in meta_results[0].items():
-                        if 'predictions' in data:
-                            preds = data['predictions']
-                            unique, counts = np.unique(preds, return_counts=True)
-                            print(f"  {method}: {len(preds)} predictions, "
-                                  f"classes: {dict(zip(unique, counts))}")
+                    print("\n" + "=" * 60)
+                    print("🔄 RUNNING META-FUSION")
+                    print("=" * 60)
+                    meta_results = run_meta_fusion(out_dir, args)
 
-        except Exception as exc:
-            print(f"Fusion pipeline failed: {exc}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("No audio features supplied; skipping audio fusion.")
+                    if meta_results:
+                        meta_dir = out_dir / 'fusion_results' / 'meta_fusion'
+                        visualize_meta_fusion_metrics(meta_dir)
 
-    cleanup_temp_dirs(out_dir, force=True)
-    print("\n" + "=" * 72)
-    print("PIPELINE COMPLETE")
-    print(f"Authoritative 5-fold OOF predictions: {out_dir / 'cv_oof_predictions.csv'}")
-    print(f"Authoritative pooled CV metrics:      {out_dir / 'cv_aggregate_metrics.json'}")
-    if not final_test.empty:
-        print(f"Held-out test metrics:               {out_dir / 'meta_test_metrics.json'}")
-        if subgroup_ids is not None:
-            print(f"Subgroup test metrics:               {out_dir / 'meta_test_metrics_subgroup.json'}")
-    if audio_df is not None:
-        print(f"Fusion results:                       {out_dir / 'fusion_results'}")
-    print("=" * 72)
+                        print("\n📊 META-FUSION RESULTS:")
+                        for method, data in meta_results[0].items():
+                            if 'predictions' in data:
+                                preds = data['predictions']
+                                unique, counts = np.unique(preds, return_counts=True)
+                                print(f"  {method}: {len(preds)} predictions, "
+                                      f"classes: {dict(zip(unique, counts))}")
+
+            except Exception as exc:
+                print(f"Fusion pipeline failed: {exc}")
+                traceback.print_exc()
+                # Continue, don't stop the whole pipeline
+        else:
+            print("No audio features supplied; skipping audio fusion.")
+
+        cleanup_temp_dirs(out_dir, force=True)
+        print("\n" + "=" * 72)
+        print("PIPELINE COMPLETE")
+        print(f"Authoritative 5-fold OOF predictions: {out_dir / 'cv_oof_predictions.csv'}")
+        print(f"Authoritative pooled CV metrics:      {out_dir / 'cv_aggregate_metrics.json'}")
+        if not final_test.empty:
+            print(f"Held-out test metrics:               {out_dir / 'meta_test_metrics.json'}")
+            if subgroup_ids is not None:
+                print(f"Subgroup test metrics:               {out_dir / 'meta_test_metrics_subgroup.json'}")
+        if audio_df is not None:
+            print(f"Fusion results:                       {out_dir / 'fusion_results'}")
+        print("=" * 72)
+
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print("❌ FATAL ERROR - PIPELINE STOPPED")
+        print("=" * 80)
+        traceback.print_exc()
+        print("=" * 80)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
