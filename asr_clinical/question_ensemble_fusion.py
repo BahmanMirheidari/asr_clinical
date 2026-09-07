@@ -642,13 +642,6 @@ def score_meta_model(model, x, y, task, threshold=0.5):
 
 
 def primary_score(metrics: dict, task: str) -> float:
-    """
-    Get the primary metric for optimization.
-    
-    Returns:
-        For classification: F1 score (higher is better)
-        For regression: RMSE (lower is better, used with minimize direction)
-    """
     if task == "classification":
         return metrics.get("macro_f1", metrics.get("f1", 0.0))
     else:
@@ -656,10 +649,6 @@ def primary_score(metrics: dict, task: str) -> float:
 
 
 def compute_subgroup_metrics(df, args, subgroup_ids=None):
-    """
-    Compute metrics for all, subgroup, and non-subgroup.
-    Returns a dict with keys 'all', 'subgroup', 'non_subgroup' (if subgroup_ids provided).
-    """
     if df.empty:
         return {}
     def _metrics(sub):
@@ -1188,12 +1177,17 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args, output_csv: Path
 
 
 # =======================================================================
-# FEATURE TABLE BUILDING
+# FEATURE TABLE BUILDING (FIXED FOR MISSING QUESTIONS)
 # =======================================================================
 
 def build_feature_table(embedding_paths: dict[str, Path | None], questions: list[str]):
+    """
+    Build feature table from embeddings.
+    For speakers missing a question, fill with question mean.
+    """
     tables = []
     question_means = {}
+    
     for q in questions:
         path = embedding_paths.get(q)
         if path is None or not Path(path).exists():
@@ -1208,33 +1202,58 @@ def build_feature_table(embedding_paths: dict[str, Path | None], questions: list
             if not emb_cols:
                 print(f"⚠️ WARNING: No embedding columns for question {q}")
                 continue
+            
+            # Group by speaker and aggregate
             grouped = emb_df.groupby("speaker_id", as_index=True).agg(
                 y_true=("y_true", "first"),
                 **{col: (col, "mean") for col in emb_cols},
             )
             grouped = grouped.rename(columns={col: f"{q}__{col}" for col in emb_cols})
             grouped[f"{q}__present"] = 1.0
+            
+            # Store question means for filling missing values
             question_means[q] = grouped[[f"{q}__{col}" for col in emb_cols]].mean()
+            
             print(f"  ✓ {q}: {len(grouped)} speakers")
             tables.append(grouped)
         except Exception as e:
             print(f"Error processing embeddings for question {q}: {e}")
             continue
+    
     if not tables:
         raise ValueError("No embedding tables available.")
+    
+    # Start with first table
     merged = tables[0]
+    
+    # Outer join remaining tables
     for t in tables[1:]:
         merged = merged.join(t.drop(columns=["y_true"]), how="outer")
         merged["y_true"] = merged["y_true"].combine_first(t["y_true"])
+    
     print(f"  After OUTER join: {len(merged)} speakers")
+    
+    # Fill missing values with question means
     for q in questions:
         if q in question_means:
-            q_cols = [c for c in merged.columns if c.startswith(f"{q}__")]
+            q_cols = [c for c in merged.columns if c.startswith(f"{q}__") and c != f"{q}__present"]
             for col in q_cols:
                 if col in question_means[q]:
+                    # Fill NaN with question mean
                     merged[col] = merged[col].fillna(question_means[q][col])
-    feature_cols = [c for c in merged.columns if "__" in c]
+                    # Check if any NaN remain
+                    if merged[col].isna().any():
+                        print(f"    ⚠️ {col}: {merged[col].isna().sum()} NaN values after mean fill")
+    
+    # Final fill: any remaining NaN with 0
+    feature_cols = [c for c in merged.columns if "__" in c and c != f"{q}__present" for q in questions]
+    # Actually get all feature columns
+    feature_cols = [c for c in merged.columns if "__" in c and "present" not in c]
     merged[feature_cols] = merged[feature_cols].fillna(0.0)
+    
+    print(f"  Final feature columns: {len(feature_cols)}")
+    print(f"  Final speakers: {len(merged)}")
+    
     return merged, feature_cols
 
 
@@ -1285,37 +1304,74 @@ def make_outer_folds(df: pd.DataFrame, args):
     return folds
 
 
-def get_adaptive_fusion_weights(audio_metric: float, text_metric: float, 
-                                method: str = 'performance_ratio') -> Dict:
-    if method == 'performance_ratio':
-        total = audio_metric + text_metric
-        if total == 0:
-            return {'audio': 0.5, 'text': 0.5}
-        return {
-            'audio': audio_metric / total,
-            'text': text_metric / total
-        }
-    elif method == 'softmax':
-        temp = 1.0
-        exp_audio = np.exp(audio_metric / temp)
-        exp_text = np.exp(text_metric / temp)
-        total = exp_audio + exp_text
-        return {
-            'audio': exp_audio / total,
-            'text': exp_text / total
-        }
-    elif method == 'threshold':
-        if audio_metric > 0.85:
-            return {'audio': 0.8, 'text': 0.2}
-        elif audio_metric > 0.80:
-            return {'audio': 0.7, 'text': 0.3}
-        else:
-            return {'audio': 0.6, 'text': 0.4}
-    return {'audio': 0.5, 'text': 0.5}
+# =======================================================================
+# QUESTION MODEL TRAINING
+# =======================================================================
+
+def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dict) -> TrainConfig:
+    if best_hparams is None:
+        best_hparams = {}
+    
+    return TrainConfig(
+        asr_file=args.asr_file,
+        demo_file=args.demo_file,
+        target_column=args.target_column,
+        task=args.task,
+        output_dir=str(question_dir),
+        model_name=args.model_name,
+        text_mode="question",
+        aggregate_level="speaker",
+        num_folds=1,
+        test_size=0.0,
+        final_dev_size=0.0,
+        seed=args.seed,
+        max_length=best_hparams.get("max_length", args.max_length),
+        batch_size=best_hparams.get("batch_size", args.batch_size),
+        eval_batch_size=best_hparams.get("batch_size", args.batch_size),
+        epochs=best_hparams.get("epochs", args.epochs),
+        learning_rate=best_hparams.get("learning_rate", args.learning_rate),
+        weight_decay=best_hparams.get("weight_decay", args.weight_decay),
+        warmup_ratio=best_hparams.get("warmup_ratio", args.warmup_ratio),
+        patience=best_hparams.get("patience", args.patience),
+        class_weights=args.class_weights,
+        loss=args.loss,
+        focal_gamma=args.focal_gamma,
+        filter_questions=[question],
+        min_text_chars=args.min_text_chars,
+    )
+
+
+def safe_question_train_and_embed(train_df, val_df, metadata, args,
+                                   best_hparams, question, fold_dir,
+                                   include_val=True):
+    q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
+    q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
+    if q_train.empty:
+        return None, None, None
+    q_dir = Path(fold_dir) / "question_models" / question
+    model_dir = q_dir / "model"
+    q_dir.mkdir(parents=True, exist_ok=True)
+    cfg = make_question_cfg(args, question, q_dir, best_hparams)
+    train_one_fold(q_train, q_val, cfg, metadata, q_dir)
+    if not saved_model_exists(model_dir):
+        raise FileNotFoundError(f"Missing question model: {model_dir}")
+    train_emb = q_dir / "embeddings_train.csv"
+    val_emb = q_dir / "embeddings_val.csv"
+    extract_embeddings(model_dir, q_train, args, train_emb,
+                       best_hparams.get("max_length", args.max_length))
+    if include_val:
+        extract_embeddings(model_dir, q_val, args, val_emb,
+                           best_hparams.get("max_length", args.max_length))
+    else:
+        val_emb = None
+    return model_dir, train_emb, val_emb
 
 
 def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                              questions, fold_dir):
+    if best_hparams is None:
+        best_hparams = {}
+    
     speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
     
     if args.task == "regression":
@@ -1464,9 +1520,8 @@ def select_questions_from_scores(scores, args):
 # =======================================================================
 # ADAPTIVE WEIGHTING FOR FUSION
 # =======================================================================
- 
 
-def compute_adaptive_weights(trainval_df, audio_df, args, out_dir, subgroup_ids=None):
+def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, subgroup_ids=None):
     """
     Compute adaptive weights for text and audio modalities based on CV performance.
     Returns weights that can be used by all fusion methods.
@@ -1478,9 +1533,25 @@ def compute_adaptive_weights(trainval_df, audio_df, args, out_dir, subgroup_ids=
     # Get audio-only performance
     audio_only_result = train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids)
     
-    # Get text-only performance
+    # Load best_hparams
+    best_hparams_path = Path(out_dir) / "best_hyperparams_all_questions.json"
+    if best_hparams_path.exists():
+        with open(best_hparams_path, 'r') as f:
+            best_hparams = json.load(f)
+    else:
+        best_hparams = {
+            "learning_rate": args.learning_rate,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "weight_decay": args.weight_decay,
+            "warmup_ratio": args.warmup_ratio,
+            "max_length": args.max_length,
+            "patience": args.patience,
+        }
+    
+    # Get text-only performance - pass metadata
     text_only_result = leakage_safe_text_cv(
-        trainval_df, None, args, None, out_dir, subgroup_ids
+        trainval_df, metadata, args, best_hparams, out_dir, subgroup_ids
     )
     
     audio_perf = 0.0
@@ -1500,7 +1571,6 @@ def compute_adaptive_weights(trainval_df, audio_df, args, out_dir, subgroup_ids=
         else:
             text_perf = text_metrics.get('r2', -text_metrics.get('rmse', float('inf')))
     
-    # Compute weights
     total = audio_perf + text_perf
     if total > 0:
         audio_weight = audio_perf / total
@@ -1509,7 +1579,6 @@ def compute_adaptive_weights(trainval_df, audio_df, args, out_dir, subgroup_ids=
         audio_weight = 0.5
         text_weight = 0.5
     
-    # Slight boost to the better modality
     if audio_perf > text_perf:
         audio_weight = min(0.85, audio_weight * 1.1)
         text_weight = 1.0 - audio_weight
@@ -1534,13 +1603,8 @@ def compute_adaptive_weights(trainval_df, audio_df, args, out_dir, subgroup_ids=
 
 def apply_adaptive_weights(pred_audio, pred_text, proba_audio, proba_text, 
                            audio_weight, text_weight, task='classification'):
-    """
-    Apply adaptive weights to predictions/probabilities.
-    Returns weighted predictions and probabilities.
-    """
     if task == 'classification':
         if proba_audio is not None and proba_text is not None:
-            # Weighted probabilities
             weighted_proba = audio_weight * proba_audio + text_weight * proba_text
             if weighted_proba.shape[1] == 2:
                 pred = np.argmax(weighted_proba, axis=1)
@@ -1548,53 +1612,34 @@ def apply_adaptive_weights(pred_audio, pred_text, proba_audio, proba_text,
                 pred = np.argmax(weighted_proba, axis=1)
             return pred, weighted_proba
         else:
-            # Weighted predictions
             if pred_audio.ndim == 1 and pred_text.ndim == 1:
                 pred = np.round(audio_weight * pred_audio + text_weight * pred_text).astype(int)
             else:
                 pred = (pred_audio + pred_text) // 2
             return pred, None
     else:
-        # Regression
         if pred_audio.ndim == 1 and pred_text.ndim == 1:
             pred = audio_weight * pred_audio + text_weight * pred_text
         else:
             pred = (pred_audio + pred_text) / 2.0
         return pred, None
 
+
 def get_fusion_weights(audio_weight, text_weight, method='adaptive', 
                        confidence_audio=None, confidence_text=None):
-    """
-    Get fusion weights based on different strategies.
-    
-    Args:
-        audio_weight: Base audio weight
-        text_weight: Base text weight
-        method: 'adaptive', 'confidence', 'hybrid', 'dynamic'
-        confidence_audio: Per-sample confidence for audio
-        confidence_text: Per-sample confidence for text
-    
-    Returns:
-        Tuple of (audio_weight, text_weight)
-    """
     if method == 'adaptive':
-        # Use fixed adaptive weights
         return audio_weight, text_weight
     
     elif method == 'confidence' and confidence_audio is not None and confidence_text is not None:
-        # Per-sample confidence-based weighting
         conf_audio = np.array(confidence_audio)
         conf_text = np.array(confidence_text)
         
-        # Normalize confidences
         total_conf = conf_audio + conf_text
-        total_conf = np.maximum(total_conf, 1e-12)  # Avoid division by zero
+        total_conf = np.maximum(total_conf, 1e-12)
         
-        # Per-sample weights
         sample_audio_weight = conf_audio / total_conf
         sample_text_weight = conf_text / total_conf
         
-        # Blend with base weights (70% confidence, 30% base)
         alpha = 0.7
         final_audio = alpha * sample_audio_weight + (1 - alpha) * audio_weight
         final_text = alpha * sample_text_weight + (1 - alpha) * text_weight
@@ -1602,18 +1647,15 @@ def get_fusion_weights(audio_weight, text_weight, method='adaptive',
         return final_audio, final_text
     
     elif method == 'hybrid':
-        # Hybrid: use adaptive base but boost confident samples
         if confidence_audio is not None and confidence_text is not None:
             conf_audio = np.array(confidence_audio)
             conf_text = np.array(confidence_text)
             
-            # Only adjust when confidence is high
             high_conf_mask = (conf_audio > 0.8) | (conf_text > 0.8)
             
             sample_audio_weight = np.ones_like(conf_audio) * audio_weight
             sample_text_weight = np.ones_like(conf_text) * text_weight
             
-            # For high confidence samples, boost the confident modality
             if np.any(high_conf_mask):
                 boost = 0.9
                 sample_audio_weight[high_conf_mask] = np.where(
@@ -1628,11 +1670,9 @@ def get_fusion_weights(audio_weight, text_weight, method='adaptive',
         return audio_weight, text_weight
     
     elif method == 'dynamic':
-        # Dynamic weighting based on relative performance
         if audio_weight > text_weight:
-            # Audio is better, but adjust based on sample
             range_weight = audio_weight - text_weight
-            dynamic_audio = audio_weight - range_weight * 0.3  # Slight adjustment
+            dynamic_audio = audio_weight - range_weight * 0.3
             dynamic_text = 1 - dynamic_audio
             return dynamic_audio, dynamic_text
         else:
@@ -1642,8 +1682,8 @@ def get_fusion_weights(audio_weight, text_weight, method='adaptive',
             return dynamic_audio, dynamic_text
     
     else:
-        # Default: equal weights
         return 0.5, 0.5
+
 
 # =======================================================================
 # META-FUSION FUNCTIONS
@@ -2262,6 +2302,32 @@ def aggregate_oof_predictions(oof_df, args, subgroup_ids: Set[str] = None):
 # TEXT CV (with subgroup)
 # =======================================================================
 
+def safe_question_train_and_embed(train_df, val_df, metadata, args,
+                                   best_hparams, question, fold_dir,
+                                   include_val=True):
+    q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
+    q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
+    if q_train.empty:
+        return None, None, None
+    q_dir = Path(fold_dir) / "question_models" / question
+    model_dir = q_dir / "model"
+    q_dir.mkdir(parents=True, exist_ok=True)
+    cfg = make_question_cfg(args, question, q_dir, best_hparams)
+    train_one_fold(q_train, q_val, cfg, metadata, q_dir)
+    if not saved_model_exists(model_dir):
+        raise FileNotFoundError(f"Missing question model: {model_dir}")
+    train_emb = q_dir / "embeddings_train.csv"
+    val_emb = q_dir / "embeddings_val.csv"
+    extract_embeddings(model_dir, q_train, args, train_emb,
+                       best_hparams.get("max_length", args.max_length))
+    if include_val:
+        extract_embeddings(model_dir, q_val, args, val_emb,
+                           best_hparams.get("max_length", args.max_length))
+    else:
+        val_emb = None
+    return model_dir, train_emb, val_emb
+
+
 def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, subgroup_ids=None):
     print(f"\n  Entering leakage_safe_text_cv()")
     print(f"    trainval_df shape: {trainval_df.shape}") 
@@ -2769,7 +2835,7 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None)
 
 
 # =======================================================================
-# FUSION METHODS (all fully implemented, with subgroup, fixed indexing)
+# FUSION METHODS (all fully implemented)
 # =======================================================================
 
 def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids=None):
@@ -2805,7 +2871,7 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
     # ===================================================================
     # COMPUTE ADAPTIVE WEIGHTS
     # ===================================================================
-    weights = compute_adaptive_weights(trainval_df, audio_df, args, out_dir, subgroup_ids)
+    weights = compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, subgroup_ids)
     audio_weight = weights['audio_weight']
     text_weight = weights['text_weight']
     
@@ -2976,7 +3042,7 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         )
         
         # ============================================================
-        # RUN FUSION METHODS (INCLUDING ADAPTIVE WEIGHTED VERSIONS)
+        # RUN FUSION METHODS
         # ============================================================
         for method in methods_to_run:
             pred = None
@@ -2998,7 +3064,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     m_early, pred, proba, best_th = fit_predict_base(Xtr, Xva, ytr, yva)
                     
                 elif method == "late":
-                    # Use adaptive weighted predictions
                     pred = weighted_pred
                     proba = weighted_proba
                     if args.task == "classification" and proba is not None and proba.shape[1] == 2:
@@ -3007,11 +3072,9 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     
                 elif method == "confidence":
                     if args.task == "classification" and proba_text is not None and proba_audio is not None:
-                        # Confidence-based weighting with adaptive priors
                         conf_t = np.max(proba_text, axis=1) if proba_text.ndim > 1 else np.abs(proba_text - 0.5) * 2
                         conf_a = np.max(proba_audio, axis=1) if proba_audio.ndim > 1 else np.abs(proba_audio - 0.5) * 2
                         
-                        # Blend confidence with adaptive weights
                         alpha = 0.7
                         raw_wt = conf_a / (conf_a + conf_t + 1e-12)
                         prior_wt = audio_weight / (audio_weight + text_weight + 1e-12)
@@ -3030,7 +3093,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     
                 elif method == "stacking":
                     if args.task == "classification" and proba_text is not None and proba_audio is not None:
-                        # Stack using weighted probabilities
                         Xtr_stack = np.hstack([text_weight * proba_text, audio_weight * proba_audio])
                         Xva_stack = np.hstack([text_weight * proba_text, audio_weight * proba_audio])
                     else:
@@ -3048,7 +3110,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                         prob_t = m_text.predict_proba(Xtr_t)
                         prob_a = m_audio.predict_proba(Xtr_a)
                         
-                        # Use weighted probabilities for gate
                         weighted_prob_t = text_weight * prob_t
                         weighted_prob_a = audio_weight * prob_a
                         
@@ -3084,7 +3145,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                         pca_t = PCA(n_components=n_comp, random_state=args.seed)
                         pca_a = PCA(n_components=n_comp, random_state=args.seed)
                         
-                        # Weight features before PCA
                         Xtr_t_pca = pca_t.fit_transform(text_weight * Xtr_t)
                         Xtr_a_pca = pca_a.fit_transform(audio_weight * Xtr_a)
                         Xva_t_pca = pca_t.transform(text_weight * Xva_t)
@@ -3103,13 +3163,11 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     
                 elif method == "dynamic":
                     if args.task == "classification" and proba_text is not None and proba_audio is not None:
-                        # Entropy-based with adaptive priors
                         ent_t = -np.sum(proba_text * np.log(proba_text + 1e-12), axis=1)
                         ent_a = -np.sum(proba_audio * np.log(proba_audio + 1e-12), axis=1)
                         conf_t = 1 - ent_t / np.log(proba_text.shape[1])
                         conf_a = 1 - ent_a / np.log(proba_audio.shape[1])
                         
-                        # Blend with adaptive weights
                         raw_wt = conf_t / (conf_t + conf_a + 1e-12)
                         prior_wt = text_weight / (text_weight + audio_weight + 1e-12)
                         final_wt = 0.7 * raw_wt + 0.3 * prior_wt
@@ -3132,7 +3190,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                             from sklearn.cross_decomposition import CCA
                             cca = CCA(n_components=n_comp, random_state=args.seed)
                             
-                            # Weight features before CCA
                             Xtr_t_cca, Xtr_a_cca = cca.fit_transform(
                                 text_weight * Xtr_t, audio_weight * Xtr_a
                             )
@@ -3152,7 +3209,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                     from sklearn.neural_network import MLPClassifier, MLPRegressor
                     scaler = StandardScaler()
                     
-                    # Weight features before MLP
                     Xtr_weighted = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
                     Xva_weighted = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
                     
@@ -3294,6 +3350,8 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
     print("=" * 60)
     
     return result
+
+
 # =======================================================================
 # MAIN
 # =======================================================================
