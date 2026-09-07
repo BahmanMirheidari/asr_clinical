@@ -976,7 +976,7 @@ def objective_function_all_questions(
     # Log effective batch size for monitoring
     print(f"  Effective batch size: {effective_batch_size} "
           f"(batch_size={batch_size}, grad_accum={gradient_accumulation_steps})")
-    
+
     all_question_scores = []
     for fold_idx, (fold_train, fold_val) in enumerate(folds):
         fold_question_scores = []
@@ -1354,6 +1354,457 @@ def select_questions_from_scores(scores, args):
     max_k = min(len(valid), args.top_k if args.top_k and args.top_k > 0 else len(valid))
     ranked = [q for q, _ in valid]
     return ranked[:max_k]
+
+
+
+# =======================================================================
+# META-FUSION: COMBINE ALL FUSION METHODS
+# =======================================================================
+
+def load_fusion_predictions(fusion_dir: Path, method_names: List[str]) -> Dict:
+    """
+    Load predictions from all fusion methods.
+    
+    Args:
+        fusion_dir: Directory containing fusion results (leakage_safe_5fold)
+        method_names: List of method names to load
+    
+    Returns:
+        Dict with predictions and probabilities for each method
+    """
+    results = {}
+    
+    for method in method_names:
+        # Try different naming patterns
+        pred_files = [
+            fusion_dir / f'{method}_oof_predictions.csv',
+            fusion_dir / f'{method}_predictions.csv',
+            fusion_dir / f'{method}_aggregate_predictions.csv',
+        ]
+        
+        pred_file = None
+        for f in pred_files:
+            if f.exists():
+                pred_file = f
+                break
+        
+        if pred_file is None:
+            continue
+        
+        try:
+            df = pd.read_csv(pred_file)
+            results[method] = {
+                'predictions': df['y_pred'].values,
+                'speaker_ids': df['speaker_id'].values if 'speaker_id' in df.columns else None,
+                'dataframe': df
+            }
+            
+            if 'y_proba' in df.columns:
+                results[method]['probabilities'] = df['y_proba'].values
+        except Exception as e:
+            print(f"  ⚠️ Failed to load {method}: {e}")
+            continue
+    
+    return results
+
+
+def load_fusion_metrics(fusion_dir: Path, method_names: List[str]) -> Dict:
+    """
+    Load validation metrics for each fusion method.
+    
+    Args:
+        fusion_dir: Directory containing fusion results
+        method_names: List of method names
+    
+    Returns:
+        Dict with metrics for each method
+    """
+    metrics = {}
+    
+    for method in method_names:
+        # Try different metric file patterns
+        metric_files = [
+            fusion_dir / f'{method}_fold_metrics.csv',
+            fusion_dir / f'{method}_aggregate_metrics.json',
+            fusion_dir / f'{method}_metrics.json',
+        ]
+        
+        for metric_file in metric_files:
+            if metric_file.exists():
+                try:
+                    if metric_file.suffix == '.csv':
+                        df = pd.read_csv(metric_file)
+                        # Use mean of numeric columns
+                        numeric_cols = df.select_dtypes(include=[np.number]).columns
+                        if not numeric_cols.empty:
+                            metrics[method] = df[numeric_cols].mean().to_dict()
+                    else:  # JSON
+                        with open(metric_file, 'r') as f:
+                            data = json.load(f)
+                            if isinstance(data, dict):
+                                # Extract relevant metrics
+                                if 'all' in data and isinstance(data['all'], dict):
+                                    metrics[method] = data['all']
+                                else:
+                                    metrics[method] = data
+                    break
+                except Exception as e:
+                    continue
+    
+    return metrics
+
+
+def perform_meta_fusion(fusion_predictions: Dict, fusion_metrics: Dict, 
+                        config: Dict) -> Dict:
+    """
+    Perform meta-fusion combining all fusion methods.
+    
+    Args:
+        fusion_predictions: Dict with predictions from each method
+        fusion_metrics: Dict with metrics for each method
+        config: Configuration for meta-fusion
+    
+    Returns:
+        Dict with combined predictions
+    """
+    results = {}
+    
+    # Get common speaker IDs
+    speaker_ids = None
+    for method_data in fusion_predictions.values():
+        if 'speaker_ids' in method_data and method_data['speaker_ids'] is not None:
+            speaker_ids = method_data['speaker_ids']
+            break
+    
+    if speaker_ids is None:
+        # Use first method's data
+        first_method = list(fusion_predictions.keys())[0]
+        speaker_ids = fusion_predictions[first_method]['dataframe'].index
+    
+    # 1. Simple Averaging (if probabilities available)
+    proba_methods = [m for m, data in fusion_predictions.items() if 'probabilities' in data]
+    if proba_methods:
+        try:
+            avg_proba = np.mean([fusion_predictions[m]['probabilities'] for m in proba_methods], axis=0)
+            avg_pred = (avg_proba >= 0.5).astype(int)
+            
+            results['average'] = {
+                'predictions': avg_pred,
+                'probabilities': avg_proba,
+                'speaker_ids': speaker_ids
+            }
+            print(f"  ✓ Average fusion: {len(avg_pred)} predictions")
+        except Exception as e:
+            print(f"  ⚠️ Average fusion failed: {e}")
+    
+    # 2. Weighted Averaging (by validation AUC/accuracy)
+    if proba_methods and fusion_metrics:
+        try:
+            # Compute weights based on validation performance
+            weights = {}
+            total_weight = 0
+            
+            for method in proba_methods:
+                if method in fusion_metrics:
+                    metrics = fusion_metrics[method]
+                    # Use ROC-AUC if available, else accuracy, else F1
+                    if 'roc_auc' in metrics:
+                        weight = metrics['roc_auc']
+                    elif 'accuracy' in metrics:
+                        weight = metrics['accuracy']
+                    elif 'f1' in metrics:
+                        weight = metrics['f1']
+                    elif 'r2' in metrics:
+                        weight = metrics['r2']
+                    else:
+                        weight = 1.0
+                    weights[method] = max(0, weight)  # Ensure non-negative
+                    total_weight += weights[method]
+            
+            # Normalize weights
+            if total_weight > 0:
+                for method in weights:
+                    weights[method] /= total_weight
+                
+                # Weighted average
+                weighted_proba = np.zeros_like(fusion_predictions[proba_methods[0]]['probabilities'], dtype=float)
+                for method, proba in [(m, fusion_predictions[m]['probabilities']) for m in proba_methods]:
+                    if method in weights:
+                        weighted_proba += weights[method] * proba
+                
+                weighted_pred = (weighted_proba >= 0.5).astype(int)
+                
+                results['weighted'] = {
+                    'predictions': weighted_pred,
+                    'probabilities': weighted_proba,
+                    'weights': weights,
+                    'speaker_ids': speaker_ids
+                }
+                print(f"  ✓ Weighted fusion: {len(weighted_pred)} predictions")
+        except Exception as e:
+            print(f"  ⚠️ Weighted fusion failed: {e}")
+    
+    # 3. Majority Voting (if predictions available)
+    pred_methods = [m for m, data in fusion_predictions.items() if 'predictions' in data]
+    if len(pred_methods) >= 3:
+        try:
+            # Stack all predictions
+            all_preds = np.column_stack([fusion_predictions[m]['predictions'] for m in pred_methods])
+            
+            # Majority vote
+            majority_pred = np.apply_along_axis(
+                lambda x: np.bincount(x.astype(int)).argmax(),
+                axis=1,
+                arr=all_preds
+            )
+            
+            # Compute agreement (optional)
+            agreement = np.apply_along_axis(
+                lambda x: np.max(np.bincount(x.astype(int))) / len(x),
+                axis=1,
+                arr=all_preds
+            )
+            
+            results['voting'] = {
+                'predictions': majority_pred,
+                'agreement': agreement,
+                'speaker_ids': speaker_ids
+            }
+            print(f"  ✓ Voting fusion: {len(majority_pred)} predictions")
+        except Exception as e:
+            print(f"  ⚠️ Voting fusion failed: {e}")
+    
+    # 4. Confidence-Weighted Selection
+    if proba_methods:
+        try:
+            # Compute confidence as max probability or 1 - entropy
+            confidences = {}
+            for method in proba_methods:
+                proba = fusion_predictions[method]['probabilities']
+                if proba.ndim == 1:
+                    # Binary classification: confidence = |proba - 0.5| * 2
+                    conf = np.abs(proba - 0.5) * 2
+                else:
+                    # Multi-class: confidence = max probability
+                    conf = np.max(proba, axis=1)
+                confidences[method] = conf
+            
+            # For each sample, select the method with highest confidence
+            selected_preds = []
+            selected_confidences = []
+            selected_methods = []
+            
+            num_samples = len(list(confidences.values())[0])
+            for i in range(num_samples):
+                # Get confidences for this sample
+                sample_conf = {m: conf[i] for m, conf in confidences.items()}
+                
+                # Select method with highest confidence
+                best_method = max(sample_conf, key=sample_conf.get)
+                max_conf = sample_conf[best_method]
+                
+                # Use that method's prediction
+                pred = fusion_predictions[best_method]['predictions'][i]
+                
+                selected_preds.append(pred)
+                selected_confidences.append(max_conf)
+                selected_methods.append(best_method)
+            
+            results['confidence_selection'] = {
+                'predictions': np.array(selected_preds),
+                'confidences': np.array(selected_confidences),
+                'selected_methods': selected_methods,
+                'speaker_ids': speaker_ids
+            }
+            print(f"  ✓ Confidence selection: {len(selected_preds)} predictions")
+        except Exception as e:
+            print(f"  ⚠️ Confidence selection failed: {e}")
+    
+    # 5. Stacking (meta-model)
+    # This requires validation data, so we'll use the validation predictions
+    # We'll implement this if we have multiple folds
+    try:
+        # Use validation predictions from all methods
+        stacked_preds = []
+        stacked_probas = []
+        
+        for method in pred_methods:
+            # Get predictions from each fold
+            fold_files = fusion_predictions[method].get('dataframe', pd.DataFrame())
+            if 'fold' in fold_files.columns:
+                # We have fold information
+                for fold in fold_files['fold'].unique():
+                    fold_preds = fold_files[fold_files['fold'] == fold]['y_pred'].values
+                    if len(fold_preds) > 0:
+                        stacked_preds.append(fold_preds)
+                        if 'y_proba' in fold_files.columns:
+                            stacked_probas.append(fold_files[fold_files['fold'] == fold]['y_proba'].values)
+        
+        if stacked_preds:
+            # Train a meta-model (simplified - would need proper cross-validation)
+            # For now, we'll just use average of stacked predictions
+            avg_stacked = np.mean(stacked_preds, axis=0)
+            avg_stacked_pred = np.round(avg_stacked).astype(int)
+            
+            results['stacked'] = {
+                'predictions': avg_stacked_pred,
+                'speaker_ids': speaker_ids
+            }
+            print(f"  ✓ Stacked fusion: {len(avg_stacked_pred)} predictions")
+    except Exception as e:
+        print(f"  ⚠️ Stacked fusion skipped: {e}")
+    
+    return results
+
+
+def save_meta_fusion_results(results: Dict, output_dir: Path, 
+                            method_names: List[str] = None):
+    """
+    Save meta-fusion results to files.
+    
+    Args:
+        results: Dict with meta-fusion results
+        output_dir: Output directory
+        method_names: List of method names for reference
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save each meta-fusion method
+    for method_name, method_data in results.items():
+        # Create DataFrame
+        df = pd.DataFrame({
+            'speaker_id': method_data.get('speaker_ids', range(len(method_data['predictions']))),
+            'y_pred': method_data['predictions']
+        })
+        
+        if 'probabilities' in method_data:
+            df['y_proba'] = method_data['probabilities']
+        
+        if 'weights' in method_data:
+            # Save weights separately
+            weights_file = output_dir / f'{method_name}_weights.json'
+            with open(weights_file, 'w') as f:
+                json.dump(method_data['weights'], f, indent=2)
+        
+        if 'agreement' in method_data:
+            df['agreement'] = method_data['agreement']
+        
+        if 'confidences' in method_data:
+            df['confidence'] = method_data['confidences']
+        
+        if 'selected_methods' in method_data:
+            df['selected_method'] = method_data['selected_methods']
+        
+        # Save predictions
+        pred_file = output_dir / f'{method_name}_predictions.csv'
+        df.to_csv(pred_file, index=False)
+        print(f"  ✓ Saved {method_name} predictions to {pred_file}")
+    
+    # Save summary
+    summary = {
+        'meta_fusion_methods': list(results.keys()),
+        'num_predictions': len(list(results.values())[0]['predictions']),
+        'timestamp': str(pd.Timestamp.now())
+    }
+    
+    if method_names:
+        summary['base_methods'] = method_names
+    
+    with open(output_dir / 'meta_fusion_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def run_meta_fusion(out_dir: Path, args):
+    """
+    Main function to run meta-fusion after all fusion methods are computed.
+    """
+    print("\n" + "=" * 60)
+    print("🚀 META-FUSION: COMBINING ALL FUSION METHODS")
+    print("=" * 60)
+    
+    # Fusion methods to combine
+    fusion_methods = [
+        'audio_only', 'text_only', 'early', 'late', 'confidence',
+        'interaction', 'moe', 'mlp', 'stacking', 'cca', 'dynamic'
+    ]
+    
+    # Directory containing fusion results
+    fusion_dir = out_dir / 'fusion_results' / 'leakage_safe_5fold'
+    
+    if not fusion_dir.exists():
+        print(f"❌ Fusion directory not found: {fusion_dir}")
+        return None
+    
+    # Load predictions from all methods
+    print("\nLoading fusion predictions...")
+    predictions = load_fusion_predictions(fusion_dir, fusion_methods)
+    
+    if not predictions:
+        print("❌ No predictions found to combine")
+        return None
+    
+    print(f"  Loaded {len(predictions)} fusion methods: {list(predictions.keys())}")
+    
+    # Load validation metrics
+    print("\nLoading fusion metrics...")
+    metrics = load_fusion_metrics(fusion_dir, fusion_methods)
+    print(f"  Loaded metrics for {len(metrics)} methods")
+    
+    # Perform meta-fusion
+    print("\nPerforming meta-fusion...")
+    config = {
+        'methods': ['average', 'weighted', 'voting', 'confidence_selection', 'stacked']
+    }
+    
+    meta_results = perform_meta_fusion(predictions, metrics, config)
+    
+    if not meta_results:
+        print("❌ Meta-fusion failed to produce results")
+        return None
+    
+    print(f"\n✓ Generated {len(meta_results)} meta-fusion methods: {list(meta_results.keys())}")
+    
+    # Save results
+    print("\nSaving meta-fusion results...")
+    meta_dir = out_dir / 'fusion_results' / 'meta_fusion'
+    save_meta_fusion_results(meta_results, meta_dir, list(predictions.keys()))
+    
+    # Also save a combined version with all methods
+    try:
+        # Combine all predictions into one file
+        all_data = {}
+        for method_name, method_data in predictions.items():
+            all_data[f'{method_name}_pred'] = method_data['predictions']
+            if 'probabilities' in method_data:
+                all_data[f'{method_name}_proba'] = method_data['probabilities']
+        
+        # Add meta-fusion results
+        for method_name, method_data in meta_results.items():
+            all_data[f'meta_{method_name}_pred'] = method_data['predictions']
+            if 'probabilities' in method_data:
+                all_data[f'meta_{method_name}_proba'] = method_data['probabilities']
+        
+        # Create DataFrame
+        speaker_ids = list(predictions.values())[0].get('speaker_ids', 
+                         range(len(list(predictions.values())[0]['predictions'])))
+        combined_df = pd.DataFrame({
+            'speaker_id': speaker_ids,
+            **all_data
+        })
+        
+        combined_df.to_csv(meta_dir / 'all_predictions_combined.csv', index=False)
+        print(f"  ✓ Combined all predictions to {meta_dir / 'all_predictions_combined.csv'}")
+    except Exception as e:
+        print(f"  ⚠️ Could not create combined file: {e}")
+    
+    print("\n" + "=" * 60)
+    print("✅ META-FUSION COMPLETE")
+    print(f"   Results saved to: {meta_dir}")
+    print("=" * 60)
+    
+    return meta_results
+
 
 
 # =======================================================================
@@ -2479,6 +2930,24 @@ def main():
                         print(f"  {method}: macro_f1 = {all_m['macro_f1']:.4f}")
                     if "roc_auc" in all_m:
                         print(f"    AUC = {all_m['roc_auc']:.4f}")
+
+                print("\n" + "=" * 60)
+                print("🔄 RUNNING META-FUSION")
+                print("=" * 60)
+                meta_results = run_meta_fusion(out_dir, args)
+                
+                # Print meta-fusion results
+                if meta_results:
+                    print("\n📊 META-FUSION RESULTS:")
+                    for method, data in meta_results.items():
+                        if 'predictions' in data:
+                            preds = data['predictions']
+                            # Compute some basic stats
+                            unique, counts = np.unique(preds, return_counts=True)
+                            print(f"  {method}: {len(preds)} predictions, "
+                                  f"classes: {dict(zip(unique, counts))}")
+
+
         except Exception as exc:
             print(f"Fusion pipeline failed: {exc}")
             import traceback
