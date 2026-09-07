@@ -897,19 +897,86 @@ def objective_function_all_questions(
     args,
     metadata: dict,
 ) -> float:
+    # Determine if using large model
+    is_large_model = "large" in args.model_name.lower()
+    
+    # Target effective batch size based on model size
+    # Large models: 16, Base models: 32
+    target_effective_batch_size = 16 if is_large_model else 32
+    
+    # Suggest actual batch size (limited by GPU memory)
+    if is_large_model:
+        batch_size = trial.suggest_categorical("batch_size", [2, 4])
+    else:
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+    
+    # Calculate gradient accumulation to reach target effective batch size
+    gradient_accumulation_steps = target_effective_batch_size // batch_size
+    gradient_accumulation_steps = max(1, min(gradient_accumulation_steps, 8))  # Cap at 8
+    
+    # Calculate actual effective batch size for logging
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    
     params = {
-        "learning_rate": trial.suggest_float("learning_rate", 5e-6, 1e-5, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [2, 4, 8, 16]),
-        "epochs": trial.suggest_int("epochs", 5, 15),
+        # Learning rate: wider range for both base and large
+        "learning_rate": trial.suggest_float(
+            "learning_rate", 
+            1e-6 if is_large_model else 5e-6,  # Lower for large
+            5e-4 if not is_large_model else 2e-4,  # Higher for base
+            log=True
+        ),
+        
+        # Batch size with gradient accumulation info
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        
+        # Epochs: reasonable range
+        "epochs": trial.suggest_int("epochs", 3, 10),
         "patience": 3,
-        "weight_decay": trial.suggest_float("weight_decay", 0.01, 0.1),
-        "dropout_rate": trial.suggest_float("dropout_rate", 0.05, 0.25),
-        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.05),
-        "max_length": trial.suggest_categorical("max_length", [64,128,256,512]),
-        "focal_gamma": trial.suggest_float("focal_gamma", 1.0, 2.0, log=True),
-        "label_smoothing": trial.suggest_float("label_smoothing", 0.05, 0.2),
-        "gradient_clip_val": trial.suggest_float("gradient_clip_val", 0.1, 1.0, log=True),
+        
+        # Weight decay: model-size aware
+        "weight_decay": trial.suggest_float(
+            "weight_decay", 
+            0.001 if is_large_model else 0.005,
+            0.03 if is_large_model else 0.05,
+            log=True
+        ),
+        
+        # Dropout: adapt to model capacity
+        "dropout_rate": trial.suggest_float(
+            "dropout_rate", 
+            0.0 if is_large_model else 0.05,
+            0.15 if is_large_model else 0.25
+        ),
+        
+        # Warmup ratio: standard range
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
+        
+        # Max length: include appropriate options
+        "max_length": trial.suggest_categorical(
+            "max_length", 
+            [128, 256] if is_large_model else [128, 256, 512]
+        ),
+        
+        # Focal gamma: include CE (gamma=0)
+        "focal_gamma": trial.suggest_float("focal_gamma", 0.0, 2.5),
+        
+        # Label smoothing: conservative range
+        "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.15),
+        
+        # Gradient clipping: proper range
+        "gradient_clip_val": trial.suggest_float(
+            "gradient_clip_val", 
+            0.5, 
+            5.0,
+            log=True
+        ),
     }
+    
+    # Log effective batch size for monitoring
+    print(f"  Effective batch size: {effective_batch_size} "
+          f"(batch_size={batch_size}, grad_accum={gradient_accumulation_steps})")
+    
     all_question_scores = []
     for fold_idx, (fold_train, fold_val) in enumerate(folds):
         fold_question_scores = []
@@ -1896,7 +1963,19 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
 
     audio_feature_cols = get_audio_feature_cols(audio_df)
     labels = trainval_df.groupby("speaker_id")["label"].first().rename("y_true").reset_index()
+
+    if args.task == "regression":
+        labels["y_true"] = labels["y_true"].astype(float)
+
     audio_with_labels = audio_df.merge(labels, on="speaker_id", how="inner")
+
+    # Ensure all audio features are numeric
+    audio_cols = [c for c in audio_df.columns if c != 'speaker_id']
+    for col in audio_cols:
+        audio_with_labels[col] = pd.to_numeric(audio_with_labels[col], errors='coerce').fillna(0.0)
+    
+    audio_with_labels = audio_with_labels.dropna(subset=["y_true"])
+
     questions = [q.upper() for q in args.questions]
 
     for fold_idx, (tr, va) in enumerate(folds):
@@ -1907,6 +1986,10 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
 
         atr = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_tr)].copy()
         ava = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_va)].copy()
+        if len(atr) < 2 or len(ava) < 2:
+            print(f"  ⚠️ Fold {fold_idx}: Insufficient audio data: train={len(atr)}, val={len(ava)}")
+            continue
+
         atr = atr.set_index("speaker_id")
         ava = ava.set_index("speaker_id")
 
@@ -1930,10 +2013,22 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         
         common_tr = tf.index.intersection(atr.index)
         common_va = vf.index.intersection(ava.index)
+
+        if len(common_tr) < 2 or len(common_va) < 2:
+            print(f"  ⚠️ Fold {fold_idx}: Insufficient overlap. Train: {len(common_tr)}, Val: {len(common_va)}")
+            continue
+
         tf = tf.loc[common_tr]
         atr = atr.loc[common_tr]
         vf = vf.loc[common_va]
         ava = ava.loc[common_va]
+
+        if args.task == "regression":
+            ytr = tf["y_true"].to_numpy().astype(float)
+            yva = vf["y_true"].to_numpy().astype(float)
+        else:
+            ytr = tf["y_true"].to_numpy().astype(int)
+            yva = vf["y_true"].to_numpy().astype(int)
         
         ytr = tf["y_true"].to_numpy()
         yva = vf["y_true"].to_numpy()
@@ -2187,9 +2282,9 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     
-    parser.add_argument("--hpo-n-trials", type=int, default=10)
+    parser.add_argument("--hpo-n-trials", type=int, default=20)
     parser.add_argument("--hpo-timeout", type=int, default=None)
-    parser.add_argument("--hpo-folds", type=int, default=5)
+    parser.add_argument("--hpo-folds", type=int, default=4)
     parser.add_argument("--force-hpo", action="store_true")
     
     parser.add_argument("--meta-model", 
