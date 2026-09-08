@@ -2904,8 +2904,10 @@ def compute_adaptive_weights(trainval_df, audio_df, args, metadata, out_dir, sub
             "patience": args.patience,
         }
 
+    text_common_dir = Path(out_dir) / "text_cv_common"
     text_only_result = leakage_safe_text_cv(
-        trainval_common, metadata, args, best_hparams, out_dir, subgroup_ids, force_recompute=args.force_recompute
+        trainval_common, metadata, args, best_hparams, text_common_dir, subgroup_ids,
+        force_recompute=args.force_recompute
     )
 
     audio_perf = 0.0
