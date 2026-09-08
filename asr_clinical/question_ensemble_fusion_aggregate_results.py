@@ -71,34 +71,44 @@ plt.rcParams['savefig.bbox'] = 'tight'
 class ExperimentConfig:
     """Configuration for the aggregator."""
     
-    # Standard fusion methods
+    # All 14 fusion methods and their JSON filenames
     fusion_methods: Dict[str, str] = field(default_factory=lambda: {
+        # BASE METHODS (4)
         'audio_only': 'audio_only_aggregate_metrics.json',
         'text_only': 'text_only_aggregate_metrics.json',
         'early': 'early_aggregate_metrics.json',
         'late': 'late_aggregate_metrics.json',
+        # ADVANCED METHODS (10)
         'confidence': 'confidence_aggregate_metrics.json',
         'interaction': 'interaction_aggregate_metrics.json',
         'moe': 'moe_aggregate_metrics.json',
         'mlp': 'mlp_aggregate_metrics.json',
         'stacking': 'stacking_aggregate_metrics.json',
         'cca': 'cca_aggregate_metrics.json',
-        'dynamic': 'dynamic_aggregate_metrics.json'
+        'dynamic': 'dynamic_aggregate_metrics.json',
+        'cross_attention': 'cross_attention_aggregate_metrics.json',
+        'adaptive_weighted': 'adaptive_weighted_aggregate_metrics.json',
+        'bilinear': 'bilinear_aggregate_metrics.json'
     })
     
-    # Display names for standard fusion methods
+    # Display names for all 14 fusion methods
     method_display_names: Dict[str, str] = field(default_factory=lambda: {
+        # BASE METHODS (4)
         'audio_only': 'Audio-Only',
         'text_only': 'Text-Only',
         'early': 'Early Fusion',
         'late': 'Late Fusion',
+        # ADVANCED METHODS (10)
         'confidence': 'Confidence-Weighted',
         'interaction': 'Interaction Stacking',
         'moe': 'Mixture of Experts',
-        'mlp': 'MLP Early Fusion',
+        'mlp': 'MLP Fusion',
         'stacking': 'Model-Based Stacking',
         'cca': 'CCA Fusion',
-        'dynamic': 'Dynamic Fusion'
+        'dynamic': 'Dynamic Fusion',
+        'cross_attention': 'Cross-Attention Fusion',
+        'adaptive_weighted': 'Adaptive Weighted Fusion',
+        'bilinear': 'Bilinear Fusion'
     })
     
     # Display names for fusion combinations (fuse- prefix)
@@ -115,9 +125,13 @@ class ExperimentConfig:
         'fuse-moe_stacking': 'MoE + Stacking',
         'fuse-cca_mlp': 'CCA + MLP',
         'fuse-dynamic_confidence': 'Dynamic + Confidence',
+        # NEW: Advanced fusion combinations
+        'fuse-cross_attention_bilinear': 'Cross-Attention + Bilinear',
+        'fuse-adaptive_weighted_confidence': 'Adaptive + Confidence',
+        'fuse-mlp_cross_attention': 'MLP + Cross-Attention',
     })
     
-    # Meta-fusion display names
+    # Meta-fusion display names (5 strategies)
     meta_fusion_display_names: Dict[str, str] = field(default_factory=lambda: {
         'average': 'Average Ensemble',
         'voting': 'Voting Ensemble',
@@ -202,6 +216,34 @@ class ExperimentConfig:
     # Bootstrap iterations
     bootstrap_iterations: int = 1000
 
+    # Add this to ExperimentConfig:
+    fusion_method_groups: Dict[str, List[str]] = field(default_factory=lambda: {
+        'Base Methods': ['audio_only', 'text_only', 'early', 'late'],
+        'Advanced Methods': ['confidence', 'interaction', 'moe', 'mlp', 'stacking', 'cca', 'dynamic'],
+        'State-of-the-Art': ['cross_attention', 'adaptive_weighted', 'bilinear']
+    })
+
+    # Method colors for consistent visualization
+    method_colors: Dict[str, str] = field(default_factory=lambda: {
+        # Base Methods
+        'audio_only': '#E74C3C',
+        'text_only': '#3498DB',
+        'early': '#2ECC71',
+        'late': '#F1C40F',
+        # Advanced Methods
+        'confidence': '#9B59B6',
+        'interaction': '#1ABC9C',
+        'moe': '#E67E22',
+        'mlp': '#3498DB',
+        'stacking': '#2C3E50',
+        'cca': '#8E44AD',
+        'dynamic': '#16A085',
+        # State-of-the-Art
+        'cross_attention': '#E74C3C',
+        'adaptive_weighted': '#27AE60',
+        'bilinear': '#2980B9'
+    })
+
 
 # =======================================================================
 #  HELPER FUNCTIONS
@@ -232,22 +274,30 @@ def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
 
 
 def get_method_display_name(method_key: str, config: ExperimentConfig) -> str:
-    """Get display name for a method."""
-    if method_key == 'audio_only':
-        return 'Audio-Only'
-    elif method_key == 'text_only':
-        return 'Text-Only'
-    elif method_key.startswith('fuse-'):
+    """Get display name for a method, handling all 14 methods + fuse- combinations."""
+    # Handle standard fusion methods
+    if method_key in config.method_display_names:
+        return config.method_display_names[method_key]
+    
+    # Handle fuse- combinations
+    if method_key.startswith('fuse-'):
         if method_key in config.fusion_combination_display_names:
             return config.fusion_combination_display_names[method_key]
         else:
             parts = method_key.replace('fuse-', '').split('_')
             return ' + '.join([p.replace('_', ' ').title() for p in parts])
-    elif method_key.startswith('ensemble_'):
+    
+    # Handle ensemble/meta-fusion methods
+    if method_key.startswith('ensemble_'):
         ensemble = method_key.replace('ensemble_', '')
         return config.meta_fusion_display_names.get(ensemble, ensemble.title())
-    else:
-        return config.method_display_names.get(method_key, method_key.replace('_', ' ').title())
+    
+    # Handle meta_fusion directly
+    if method_key == 'meta_fusion':
+        return 'Meta-Fusion'
+    
+    # Fallback
+    return method_key.replace('_', ' ').title()
 
 
 def clean_model_name(model_name: str) -> str:
@@ -530,7 +580,7 @@ def load_subgroup_predictions(experiments: Dict, model_name: str, method_key: st
 # =======================================================================
 
 def discover_experiments(base_dir: Path, task_type: str = 'all', config: ExperimentConfig = None) -> Dict:
-    """Discover experiments by scanning folders."""
+    """Discover experiments by scanning folders - supports all 14 fusion methods + meta-fusion."""
     if config is None:
         config = ExperimentConfig()
     
@@ -540,7 +590,9 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
     print(f"DISCOVERING EXPERIMENTS IN: {base_dir}")
     print(f"{'='*60}")
     print(f"Task type filter: {task_type}")
+    print(f"Looking for {len(config.fusion_methods)} fusion methods + meta-fusion")
     
+    # Find all folders
     all_folders = []
     
     if task_type in ['classification', 'all']:
@@ -555,6 +607,9 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
     
     all_folders = list(set(all_folders))
     print(f"\nTotal: {len(all_folders)} experiment folders to process")
+    
+    # Track which methods were found
+    found_methods = set()
     
     for folder_path in all_folders:
         folder_name = folder_path.name
@@ -583,6 +638,7 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
         found_fusion = False
         
         if leakage_dir.exists():
+            # Look for ALL JSON files in the directory
             json_files = list(leakage_dir.glob("*_aggregate_metrics.json"))
             json_files.extend(leakage_dir.glob("*_metrics.json"))
             json_files = list(set(json_files))
@@ -593,11 +649,13 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                 filename = json_file.name
                 method_key = None
                 
+                # Check standard fusion methods
                 for key, fname in config.fusion_methods.items():
                     if filename == fname:
                         method_key = key
                         break
                 
+                # If not standard, check if it's a fuse- combination
                 if method_key is None:
                     base_name = filename
                     for suffix in ['_aggregate_metrics.json', '_metrics.json', '.json']:
@@ -608,13 +666,16 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                     if base_name.startswith('fuse-'):
                         method_key = base_name
                     else:
+                        # Try to match with known methods
                         for key in config.fusion_methods.keys():
                             if key in base_name or base_name in key:
                                 method_key = key
                                 break
+                        
                         if method_key is None:
                             method_key = base_name
                 
+                # Store the result
                 experiments[model_name][method_key] = {
                     'task': task,
                     'model': model_name,
@@ -625,16 +686,23 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                     'source': 'leakage_safe_5fold'
                 }
                 found_fusion = True
+                found_methods.add(method_key)
                 print(f"    ✓ Found: {method_key} -> {json_file.name}")
         else:
             print(f"    ✗ leakage_safe_5fold NOT found")
+            fusion_results_dir = folder_path / 'fusion_results'
+            if fusion_results_dir.exists():
+                subdirs = list(fusion_results_dir.glob("*"))
+                print(f"    Available in fusion_results: {[s.name for s in subdirs]}")
         
+        # Check for meta_fusion results
         if meta_fusion_dir.exists():
             meta_fusion_file = meta_fusion_dir / 'meta_fusion_metrics.json'
             
             if meta_fusion_file.exists():
                 meta_metrics = load_metrics_file(meta_fusion_file)
                 if meta_metrics:
+                    # Extract ensemble methods from meta_fusion
                     ensemble_methods = ['average', 'voting', 'stacking', 'weighted', 'confidence_selection', 'best']
                     for ensemble in ensemble_methods:
                         if ensemble in meta_metrics and isinstance(meta_metrics[ensemble], dict):
@@ -650,6 +718,18 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                                 'ensemble_method': ensemble
                             }
                             print(f"    ✓ Found ensemble: {ensemble}")
+                            
+                    # Also store the full meta_fusion results
+                    experiments[model_name]['meta_fusion'] = {
+                        'task': task,
+                        'model': model_name,
+                        'size': size,
+                        'family': family,
+                        'metrics_file': meta_fusion_file,
+                        'dir': folder_path,
+                        'source': 'meta_fusion'
+                    }
+                    print(f"    ✓ Found meta_fusion_metrics.json")
             
             # Look for prediction files
             pred_files = list(meta_fusion_dir.glob("*_predictions.csv"))
@@ -671,42 +751,107 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
         if not found_fusion:
             print(f"    ⚠ No fusion metrics found in leakage_safe_5fold")
     
+    # Print summary with method counts
     print(f"\n{'='*60}")
     print(f"DISCOVERY SUMMARY")
     print(f"{'='*60}")
     
-    total_methods = 0
-    classification_models = 0
-    regression_models = 0
+    # Count methods found
+    method_counts = defaultdict(int)
+    for model_data in experiments.values():
+        for method_key in model_data.keys():
+            if method_key not in ['meta_fusion', 'meta_fusion_summary'] and not method_key.startswith('predictions_'):
+                method_counts[method_key] += 1
     
-    for model_key, model_data in experiments.items():
-        task = 'unknown'
-        for method_key, method_data in model_data.items():
-            if 'task' in method_data:
-                task = method_data['task']
-                break
-        
-        if task == 'classification':
-            classification_models += 1
-        else:
-            regression_models += 1
-        
-        print(f"\nTask: {task}, Model: {model_key}")
-        method_count = len([m for m in model_data.keys() if not m.startswith('ensemble_') and not m.startswith('predictions_')])
-        ensemble_count = len([m for m in model_data.keys() if m.startswith('ensemble_')])
-        pred_count = len([m for m in model_data.keys() if m.startswith('predictions_')])
-        print(f"  {method_count} fusion methods")
-        if ensemble_count > 0:
-            print(f"  {ensemble_count} ensemble methods")
-        if pred_count > 0:
-            print(f"  {pred_count} prediction files")
-        total_methods += method_count + ensemble_count
+    print(f"\nMethods found across all models:")
+    # Group by category
+    for category, methods in config.fusion_method_groups.items():
+        found_in_category = [m for m in methods if m in method_counts]
+        if found_in_category:
+            print(f"  {category}: {len(found_in_category)}/{len(methods)} methods")
+            for m in found_in_category:
+                print(f"    ✓ {get_method_display_name(m, config)}: {method_counts[m]} models")
     
-    print(f"\nTotal: {len(experiments)} models ({classification_models} classification, {regression_models} regression)")
-    print(f"Total method results: {total_methods}")
+    # Check for meta-fusion
+    meta_fusion_count = sum(1 for model_data in experiments.values() if 'meta_fusion' in model_data)
+    if meta_fusion_count > 0:
+        print(f"\n  Meta-Fusion: found in {meta_fusion_count} models")
+    
+    total_methods = sum(method_counts.values())
+    print(f"\nTotal: {len(experiments)} models, {total_methods} fusion method results")
     
     return dict(experiments)
 
+def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
+                                 task_type: str = 'classification'):
+    """Create visualization comparing meta-fusion methods."""
+    # Filter for meta-fusion methods
+    meta_methods = [m for m in df['Method'].unique() if m.startswith('ensemble_') or m == 'meta_fusion']
+    if not meta_methods:
+        print("No meta-fusion methods found")
+        return
+    
+    meta_df = df[df['Method'].isin(meta_methods)].copy()
+    
+    # Get display names
+    meta_df['Method_Label'] = meta_df['Method'].apply(
+        lambda x: get_method_display_name(x, config)
+    )
+    
+    if meta_df.empty:
+        return
+    
+    # Get metrics based on task
+    if task_type == 'classification':
+        metrics = ['macro_f1', 'roc_auc', 'accuracy', 'balanced_accuracy']
+    else:
+        metrics = ['rmse', 'r2']
+    
+    # Create comparison plots
+    for metric in metrics:
+        if metric not in meta_df.columns:
+            continue
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Pivot table
+        pivot = meta_df.pivot_table(
+            index='Model_Short',
+            columns='Method_Label',
+            values=metric,
+            aggfunc='mean'
+        )
+        
+        if pivot.empty:
+            continue
+        
+        # Sort by best method
+        if metric in ['rmse']:
+            best_vals = pivot.min(axis=1)
+        else:
+            best_vals = pivot.max(axis=1)
+        pivot = pivot.loc[best_vals.sort_values(ascending=metric in ['rmse']).index]
+        
+        # Plot
+        pivot.plot(kind='bar', ax=ax, width=0.8, colormap='viridis')
+        
+        metric_label = config.metric_labels.get(metric, metric.upper())
+        ax.set_title(f'Meta-Fusion Comparison: {metric_label} ({task_type.title()})', 
+                    fontsize=14, fontweight='bold')
+        ax.set_xlabel('Model')
+        ax.set_ylabel(metric_label)
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        
+        if metric not in ['rmse']:
+            ax.set_ylim(0, 1.05)
+        
+        plt.tight_layout()
+        task_suffix = f"_{task_type}"
+        plt.savefig(output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Meta-fusion comparison saved to: {output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png'}")
 
 # =======================================================================
 #  DATA AGGREGATION FUNCTIONS
@@ -1236,8 +1381,8 @@ def print_bootstrap_summary(ci_df: pd.DataFrame, metric: str, config: Experiment
 def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentConfig, 
                                           task_type: str = 'classification', verbose: bool = True) -> Dict:
     """
-    Perform ablation analysis using ALL patients data (not subgroups).
-    Compares each method against the best method using overall metrics.
+    Perform ablation analysis using ONLY base methods (no ensembles).
+    Ensembles are meta-methods and should not be included in ablation.
     """
     if task_type == 'classification':
         metric = config.ranking_metric_classification
@@ -1252,23 +1397,38 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
     if task_df.empty:
         return {}
     
-    # Filter to methods that have the overall metric
-    task_df = task_df[task_df[metric_name].notna()].copy()
+    # EXCLUDE ensemble methods from ablation
+    # Ensemble methods are those from meta_fusion (average, voting, stacking, weighted, confidence_selection, best)
+    ensemble_patterns = ['average', 'voting', 'stacking', 'weighted', 'confidence_selection', 'best', 'ensemble_']
+    is_ensemble = task_df['Method_Label'].str.lower().str.contains('|'.join(ensemble_patterns), na=False)
     
-    if task_df.empty:
+    # Also exclude methods that clearly indicate they're ensembles
+    base_df = task_df[~is_ensemble].copy()
+    
+    # Filter to methods that have the overall metric
+    base_df = base_df[base_df[metric_name].notna()].copy()
+    
+    if base_df.empty:
         if verbose:
-            print(f"  Warning: No methods with {metric_name} for {task_type}")
+            print(f"  Warning: No base methods with {metric_name} for {task_type}")
         return {}
     
-    all_methods = task_df['Method_Label'].unique()
+    all_methods = base_df['Method_Label'].unique()
     
     if verbose:
-        print(f"\n  Methods with {metric_name} for {task_type}: {len(all_methods)}")
+        print(f"\n  Base methods with {metric_name} for {task_type}: {len(all_methods)}")
         for m in sorted(all_methods):
             print(f"    ✓ {m}")
+        
+        # List excluded ensemble methods for clarity
+        ensemble_methods = task_df[is_ensemble]['Method_Label'].unique()
+        if len(ensemble_methods) > 0:
+            print(f"\n  Excluded ensemble methods (not in ablation):")
+            for m in sorted(ensemble_methods):
+                print(f"    ✗ {m} (ensemble method)")
     
     # Find best method using the ranking metric
-    method_performance = task_df.groupby('Method_Label')[metric_name].mean()
+    method_performance = base_df.groupby('Method_Label')[metric_name].mean()
     if lower_is_better:
         best_method = method_performance.idxmin()
         best_score = method_performance.min()
@@ -1277,8 +1437,9 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
         best_score = method_performance.max()
     
     if verbose:
-        print(f"\n  Best method: {best_method} ({best_score:.4f})")
+        print(f"\n  Best base method: {best_method} ({best_score:.4f})")
     
+    # Continue with ablation analysis on base methods only...
     ablation_results = []
     skipped_methods = []
     
@@ -1286,8 +1447,8 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
         if method == best_method:
             continue
         
-        method_df = task_df[task_df['Method_Label'] == method]
-        best_df = task_df[task_df['Method_Label'] == best_method]
+        method_df = base_df[base_df['Method_Label'] == method]
+        best_df = base_df[base_df['Method_Label'] == best_method]
         
         # Get paired data
         method_values = []
@@ -1310,10 +1471,8 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
         method_values = np.array(method_values)
         best_values = np.array(best_values)
         
-        # Calculate difference (positive means best is better)
         diff = best_values - method_values if not lower_is_better else method_values - best_values
         
-        # Statistical tests
         try:
             t_stat, p_value_ttest = ttest_rel(best_values, method_values)
         except:
@@ -1324,7 +1483,6 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
         except:
             w_stat, p_value_wilcoxon = np.nan, np.nan
         
-        # Effect size
         pooled_std = np.sqrt((np.std(best_values, ddof=1)**2 + np.std(method_values, ddof=1)**2) / 2)
         effect_size = np.mean(diff) / pooled_std if pooled_std > 0 else np.nan
         
@@ -2231,6 +2389,13 @@ def main():
                         help='Skip generating plots')
     parser.add_argument('--subgroup', action='store_true',
                         help='Generate subgroup (Dys/Norm) analysis')
+
+    # In argparse, add option to filter by method group
+    parser.add_argument('--method-group', type=str, 
+                        choices=['all', 'base', 'advanced', 'sota', 'meta'],
+                        default='all',
+                        help='Filter methods by group: base (4), advanced (7), sota (3), meta, or all')
+
     
     args = parser.parse_args()
     
@@ -2360,6 +2525,7 @@ def main():
         plot_dys_scatter_audio_text_fusion_single(df, experiments, output_dir, config, 'regression', dys_ids)
     
     # ===== PLOTS =====
+        # ===== PLOTS =====
     if not args.no_plots:
         print(f"\n{'='*60}")
         print(f"GENERATING FIGURES")
@@ -2389,12 +2555,24 @@ def main():
             
             if args.subgroup:
                 plot_subgroup_comparison(df, output_dir, config, task_type=task)
+
+        # ===== META-FUSION ANALYSIS =====
+        # Check if we have meta-fusion results
+        has_meta = any(df['Method'].str.startswith('ensemble_') | (df['Method'] == 'meta_fusion'))
+        if has_meta:
+            print(f"\n{'='*60}")
+            print(f"GENERATING META-FUSION FIGURES")
+            print(f"{'='*60}")
+            
+            for task in tasks_to_process:
+                plot_meta_fusion_comparison(df, output_dir, config, task_type=task)
     
+    # ===== SUMMARY STATISTICS =====
     print(f"\n{'='*60}")
     print(f"SUMMARY STATISTICS")
     print(f"{'='*60}")
     
-    for task in df['Task'].unique():
+    for task in df['Task'].unique(): 
         task_df = df[df['Task'] == task]
         print(f"\n{task.upper()}:")
         
