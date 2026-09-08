@@ -3,9 +3,12 @@ Experiment Results Aggregator - Enhanced Version
 Supports BOTH classification and regression experiments with subgroup analysis (Dys/Norm).
 
 Key Metrics:
-- Classification: F1-Macro, Sensitivity, Specificity (coupled with harmonic mean), Balanced Accuracy, AUC-ROC
+- Classification: F1-Macro, Sensitivity, Specificity, Balanced Accuracy, AUC-ROC
 - Regression: RMSE, R²
-- Subgroup analysis: Dys vs Norm for all metrics with Sen/Spec pairs and harmonic mean
+- Subgroup analysis: Dys vs Norm for all metrics with Sen/Spec pairs
+- Robustness: Confidence Intervals (95%), Bootstrap resampling
+- Ablation: Component removal analysis with statistical significance
+- Statistical tests: t-test, Wilcoxon signed-rank test
 
 Folder Structure:
 <main_dir>/
@@ -14,11 +17,10 @@ Folder Structure:
 │   │   ├── leakage_safe_5fold/
 │   │   │   ├── audio_only_aggregate_metrics.json
 │   │   │   ├── text_only_aggregate_metrics.json
-│   │   │   ├── early_aggregate_metrics.json
+│   │   │   ├── fuse-audio_text_aggregate_metrics.json
 │   │   │   └── ...
 │   │   └── meta_fusion/
 │   │       ├── meta_fusion_metrics.json
-│   │       ├── meta_fusion_summary.json
 │   │       └── ...
 ├── regression-fusion-<model_name>/               
 │   └── ...
@@ -35,6 +37,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+from scipy.stats import ttest_rel, wilcoxon, ttest_ind
 import argparse
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -67,7 +70,7 @@ plt.rcParams['savefig.bbox'] = 'tight'
 class ExperimentConfig:
     """Configuration for the aggregator."""
     
-    # Fusion methods and their JSON filenames
+    # Standard fusion methods
     fusion_methods: Dict[str, str] = field(default_factory=lambda: {
         'audio_only': 'audio_only_aggregate_metrics.json',
         'text_only': 'text_only_aggregate_metrics.json',
@@ -82,7 +85,7 @@ class ExperimentConfig:
         'dynamic': 'dynamic_aggregate_metrics.json'
     })
     
-    # Display names for fusion methods
+    # Display names for standard fusion methods
     method_display_names: Dict[str, str] = field(default_factory=lambda: {
         'audio_only': 'Audio-Only',
         'text_only': 'Text-Only',
@@ -97,15 +100,30 @@ class ExperimentConfig:
         'dynamic': 'Dynamic Fusion'
     })
     
-    # Meta-fusion method display names
+    # Display names for fusion combinations (fuse- prefix)
+    fusion_combination_display_names: Dict[str, str] = field(default_factory=lambda: {
+        'fuse-audio_text': 'Audio + Text',
+        'fuse-audio_early': 'Audio + Early',
+        'fuse-text_early': 'Text + Early',
+        'fuse-audio_text_early': 'Audio + Text + Early',
+        'fuse-early_late': 'Early + Late',
+        'fuse-audio_text_late': 'Audio + Text + Late',
+        'fuse-confidence_audio': 'Confidence + Audio',
+        'fuse-confidence_text': 'Confidence + Text',
+        'fuse-confidence_early': 'Confidence + Early',
+        'fuse-moe_stacking': 'MoE + Stacking',
+        'fuse-cca_mlp': 'CCA + MLP',
+        'fuse-dynamic_confidence': 'Dynamic + Confidence',
+    })
+    
+    # Meta-fusion display names
     meta_fusion_display_names: Dict[str, str] = field(default_factory=lambda: {
         'average': 'Average Ensemble',
         'voting': 'Voting Ensemble',
         'stacking': 'Stacking Ensemble',
         'weighted': 'Weighted Ensemble',
         'confidence_selection': 'Confidence Selection',
-        'best': 'Best Method',
-        'meta_fusion': 'Meta-Fusion'
+        'best': 'Best Method'
     })
     
     # Classification metrics
@@ -134,16 +152,13 @@ class ExperimentConfig:
     
     # Metric labels
     metric_labels: Dict[str, str] = field(default_factory=lambda: {
-        # Classification
         'macro_f1': 'F1-Macro',
         'sensitivity': 'Sensitivity',
         'specificity': 'Specificity',
         'balanced_accuracy': 'Balanced Accuracy',
         'roc_auc': 'AUC-ROC',
-        # Regression
         'rmse': 'RMSE',
         'r2': 'R²',
-        # Subgroup classification
         'subgroup_macro_f1': 'Dys - F1-Macro',
         'subgroup_sensitivity': 'Dys - Sensitivity',
         'subgroup_specificity': 'Dys - Specificity',
@@ -154,7 +169,6 @@ class ExperimentConfig:
         'non_subgroup_specificity': 'Norm - Specificity',
         'non_subgroup_balanced_accuracy': 'Norm - Balanced Accuracy',
         'non_subgroup_roc_auc': 'Norm - AUC-ROC',
-        # Subgroup regression
         'subgroup_rmse': 'Dys - RMSE',
         'subgroup_r2': 'Dys - R²',
         'non_subgroup_rmse': 'Norm - RMSE',
@@ -164,29 +178,40 @@ class ExperimentConfig:
     # Ranking metrics
     ranking_metric_classification: str = 'macro_f1'
     ranking_metric_regression: str = 'r2'
+    
+    # Bootstrap iterations
+    bootstrap_iterations: int = 1000
 
 
 # =======================================================================
-#  FOLDER PARSING FUNCTIONS
+#  HELPER FUNCTIONS
 # =======================================================================
+
+def get_method_display_name(method_key: str, config: ExperimentConfig) -> str:
+    """Get display name for a method."""
+    if method_key.startswith('fuse-'):
+        if method_key in config.fusion_combination_display_names:
+            return config.fusion_combination_display_names[method_key]
+        else:
+            parts = method_key.replace('fuse-', '').split('_')
+            return ' + '.join([p.replace('_', ' ').title() for p in parts])
+    else:
+        return config.method_display_names.get(method_key, method_key.replace('_', ' ').title())
+
 
 def clean_model_name(model_name: str) -> str:
-    """Clean model name by removing common prefixes like ecas_105-."""
+    """Clean model name by removing common prefixes."""
     cleaned = model_name
-    
     prefixes_to_remove = [
         'ecas_105-', 'ecas105-', 'ecas_105_', 'ecas105_',
         'ecas-105-', 'ecas-105_',
     ]
-    
     for prefix in prefixes_to_remove:
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):]
             break
-    
     if re.match(r'^\d+-', cleaned):
         cleaned = re.sub(r'^\d+-', '', cleaned)
-    
     cleaned = cleaned.lstrip('-_')
     return cleaned
 
@@ -230,7 +255,7 @@ def detect_model_family(model_name: str) -> str:
 
 
 def parse_folder_name(folder_name: str) -> Dict[str, str]:
-    """Parse folder name for classification-fusion-* or regression-fusion-* pattern."""
+    """Parse folder name."""
     result = {
         'task': 'unknown',
         'model': folder_name,
@@ -403,13 +428,15 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                             base_name = base_name[:-len(suffix)]
                             break
                     
-                    for key in config.fusion_methods.keys():
-                        if key in base_name or base_name in key:
-                            method_key = key
-                            break
-                    
-                    if method_key is None:
+                    if base_name.startswith('fuse-'):
                         method_key = base_name
+                    else:
+                        for key in config.fusion_methods.keys():
+                            if key in base_name or base_name in key:
+                                method_key = key
+                                break
+                        if method_key is None:
+                            method_key = base_name
                 
                 experiments[model_name][method_key] = {
                     'task': task,
@@ -424,38 +451,28 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                 print(f"    ✓ Found: {method_key} -> {json_file.name}")
         else:
             print(f"    ✗ leakage_safe_5fold NOT found")
-            fusion_results_dir = folder_path / 'fusion_results'
-            if fusion_results_dir.exists():
-                subdirs = list(fusion_results_dir.glob("*"))
-                print(f"    Available in fusion_results: {[s.name for s in subdirs]}")
         
         if meta_fusion_dir.exists():
             meta_fusion_file = meta_fusion_dir / 'meta_fusion_metrics.json'
-            meta_fusion_summary = meta_fusion_dir / 'meta_fusion_summary.json'
             
             if meta_fusion_file.exists():
-                experiments[model_name]['meta_fusion'] = {
-                    'task': task,
-                    'model': model_name,
-                    'size': size,
-                    'family': family,
-                    'metrics_file': meta_fusion_file,
-                    'dir': folder_path,
-                    'source': 'meta_fusion'
-                }
-                print(f"    ✓ Found meta_fusion_metrics.json")
-            
-            if meta_fusion_summary.exists():
-                experiments[model_name]['meta_fusion_summary'] = {
-                    'task': task,
-                    'model': model_name,
-                    'size': size,
-                    'family': family,
-                    'metrics_file': meta_fusion_summary,
-                    'dir': folder_path,
-                    'source': 'meta_fusion_summary'
-                }
-                print(f"    ✓ Found meta_fusion_summary.json")
+                meta_metrics = load_metrics_file(meta_fusion_file)
+                if meta_metrics:
+                    ensemble_methods = ['average', 'voting', 'stacking', 'weighted', 'confidence_selection', 'best']
+                    for ensemble in ensemble_methods:
+                        if ensemble in meta_metrics and isinstance(meta_metrics[ensemble], dict):
+                            ensemble_key = f'ensemble_{ensemble}'
+                            experiments[model_name][ensemble_key] = {
+                                'task': task,
+                                'model': model_name,
+                                'size': size,
+                                'family': family,
+                                'metrics_file': meta_fusion_file,
+                                'dir': folder_path,
+                                'source': 'meta_fusion',
+                                'ensemble_method': ensemble
+                            }
+                            print(f"    ✓ Found ensemble: {ensemble}")
         else:
             print(f"    ✗ meta_fusion NOT found")
         
@@ -483,19 +500,15 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
             regression_models += 1
         
         print(f"\nTask: {task}, Model: {model_key}")
-        method_count = 0
-        for method_key in model_data.keys():
-            if method_key not in ['meta_fusion', 'meta_fusion_summary']:
-                method_count += 1
+        method_count = len([m for m in model_data.keys() if not m.startswith('ensemble_')])
+        ensemble_count = len([m for m in model_data.keys() if m.startswith('ensemble_')])
         print(f"  {method_count} fusion methods")
-        if 'meta_fusion' in model_data:
-            print(f"  meta_fusion results")
-        if 'meta_fusion_summary' in model_data:
-            print(f"  meta_fusion summary")
-        total_methods += method_count
+        if ensemble_count > 0:
+            print(f"  {ensemble_count} ensemble methods")
+        total_methods += method_count + ensemble_count
     
     print(f"\nTotal: {len(experiments)} models ({classification_models} classification, {regression_models} regression)")
-    print(f"Total fusion method results: {total_methods}")
+    print(f"Total method results: {total_methods}")
     
     return dict(experiments)
 
@@ -514,24 +527,38 @@ def aggregate_experiment_results(experiments: Dict, config: ExperimentConfig) ->
         family = 'Other'
         
         for method_key, method_data in model_data.items():
-            if method_key not in ['meta_fusion', 'meta_fusion_summary']:
+            if 'task' in method_data:
                 task = method_data.get('task', 'unknown')
                 size = method_data.get('size', 'Unknown')
                 family = method_data.get('family', 'Other')
                 break
         
         for method_key, method_data in model_data.items():
-            if method_key in ['meta_fusion', 'meta_fusion_summary']:
+            metrics_file = method_data.get('metrics_file')
+            if metrics_file is None:
                 continue
             
-            metrics = load_metrics_file(method_data.get('metrics_file'))
-            if metrics is None:
-                print(f"  Warning: Could not load metrics for {model_name} - {method_key}")
-                continue
-            
-            extracted = extract_metrics_from_result(metrics, task)
-            
-            method_display = config.method_display_names.get(method_key, method_key.replace('_', ' ').title())
+            if method_key.startswith('ensemble_'):
+                metrics = load_metrics_file(metrics_file)
+                if metrics is None:
+                    continue
+                
+                ensemble_method = method_data.get('ensemble_method')
+                if ensemble_method and ensemble_method in metrics:
+                    extracted = extract_metrics_from_result(metrics[ensemble_method], task)
+                    display_name = config.meta_fusion_display_names.get(ensemble_method, ensemble_method.title())
+                    method_display = display_name
+                    source = 'meta_fusion'
+                else:
+                    continue
+            else:
+                metrics = load_metrics_file(metrics_file)
+                if metrics is None:
+                    continue
+                
+                extracted = extract_metrics_from_result(metrics, task)
+                method_display = get_method_display_name(method_key, config)
+                source = method_data.get('source', 'leakage_safe_5fold')
             
             row = {
                 'Task': task,
@@ -540,7 +567,7 @@ def aggregate_experiment_results(experiments: Dict, config: ExperimentConfig) ->
                 'Family': family,
                 'Method': method_key,
                 'Method_Label': method_display,
-                'Source': method_data.get('source', 'leakage_safe_5fold')
+                'Source': source
             }
             
             if task == 'classification':
@@ -566,130 +593,15 @@ def aggregate_experiment_results(experiments: Dict, config: ExperimentConfig) ->
     return df
 
 
-def aggregate_meta_fusion_results(experiments: Dict, config: ExperimentConfig) -> pd.DataFrame:
-    """Aggregate meta_fusion results - handles multiple ensemble methods."""
-    rows = []
-    
-    for model_name, model_data in experiments.items():
-        for method_key, method_data in model_data.items():
-            if method_key not in ['meta_fusion', 'meta_fusion_summary']:
-                continue
-            
-            metrics = load_metrics_file(method_data.get('metrics_file'))
-            if metrics is None:
-                continue
-            
-            task = method_data.get('task', 'unknown')
-            size = method_data.get('size', 'Unknown')
-            family = method_data.get('family', 'Other')
-            source = method_data.get('source', 'meta_fusion')
-            
-            ensemble_methods = ['average', 'voting', 'stacking', 'weighted', 'confidence_selection', 'best']
-            found_ensembles = False
-            
-            for ensemble in ensemble_methods:
-                if ensemble in metrics and isinstance(metrics[ensemble], dict):
-                    extracted = extract_metrics_from_result(metrics[ensemble], task)
-                    
-                    display_name = config.meta_fusion_display_names.get(ensemble, ensemble.title())
-                    
-                    row = {
-                        'Task': task,
-                        'Model': model_name,
-                        'Size': size,
-                        'Family': family,
-                        'Method': ensemble,
-                        'Method_Label': display_name,
-                        'Source': source,
-                        'Source_Label': 'Meta-Fusion'
-                    }
-                    
-                    if task == 'classification':
-                        all_metrics = config.classification_metrics + config.classification_subgroup_metrics
-                    else:
-                        all_metrics = config.regression_metrics + config.regression_subgroup_metrics
-                    
-                    for metric in all_metrics:
-                        row[metric] = extracted.get(metric, None)
-                        if row[metric] is None and metric in metrics[ensemble]:
-                            row[metric] = metrics[ensemble].get(metric, None)
-                    
-                    rows.append(row)
-                    found_ensembles = True
-            
-            if not found_ensembles:
-                extracted = extract_metrics_from_result(metrics, task)
-                
-                best_method = None
-                if 'best_method' in metrics:
-                    best_method = metrics['best_method']
-                elif 'best_ensemble' in metrics:
-                    best_method = metrics['best_ensemble']
-                
-                row = {
-                    'Task': task,
-                    'Model': model_name,
-                    'Size': size,
-                    'Family': family,
-                    'Method': 'meta_fusion',
-                    'Method_Label': 'Meta-Fusion',
-                    'Source': source,
-                    'Source_Label': 'Meta-Fusion',
-                    'Best_Method': best_method
-                }
-                
-                if task == 'classification':
-                    all_metrics = config.classification_metrics + config.classification_subgroup_metrics
-                else:
-                    all_metrics = config.regression_metrics + config.regression_subgroup_metrics
-                
-                for metric in all_metrics:
-                    row[metric] = extracted.get(metric, None)
-                    if row[metric] is None and metric in metrics:
-                        row[metric] = metrics.get(metric, None)
-                
-                rows.append(row)
-    
-    df = pd.DataFrame(rows)
-    
-    all_metrics = (config.classification_metrics + config.classification_subgroup_metrics + 
-                   config.regression_metrics + config.regression_subgroup_metrics)
-    for metric in all_metrics:
-        if metric in df.columns:
-            df[metric] = pd.to_numeric(df[metric], errors='coerce')
-    
-    return df
-
-
-# =======================================================================
-#  TOP-K MODEL SELECTION FUNCTION
-# =======================================================================
-
 def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config: ExperimentConfig = None) -> pd.DataFrame:
-    """
-    Select top K models based on the ranking metric for each task.
-    
-    Args:
-        df: DataFrame with results
-        k: Number of top models to select
-        task_type: 'classification' or 'regression' or None (all)
-        config: ExperimentConfig instance
-    
-    Returns:
-        DataFrame with only top K models
-    """
+    """Select top K models based on the ranking metric for each task."""
     if config is None:
         config = ExperimentConfig()
     
     if k <= 0:
         return df
     
-    # Determine tasks to process
-    if task_type:
-        tasks = [task_type]
-    else:
-        tasks = df['Task'].unique()
-    
+    tasks = [task_type] if task_type else df['Task'].unique()
     selected_models = []
     
     for task in tasks:
@@ -697,7 +609,6 @@ def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config:
         if task_df.empty:
             continue
         
-        # Get ranking metric for this task
         if task == 'classification':
             ranking_metric = config.ranking_metric_classification
             lower_is_better = False
@@ -709,20 +620,17 @@ def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config:
             print(f"  Warning: Ranking metric {ranking_metric} not found for {task}")
             continue
         
-        # Calculate average performance per model
         model_performance = task_df.groupby('Model')[ranking_metric].mean().reset_index()
         model_performance = model_performance.dropna()
         
         if model_performance.empty:
             continue
         
-        # Sort by ranking metric
         if lower_is_better:
             model_performance = model_performance.sort_values(ranking_metric, ascending=True)
         else:
             model_performance = model_performance.sort_values(ranking_metric, ascending=False)
         
-        # Select top K models
         top_models = model_performance.head(k)['Model'].tolist()
         selected_models.extend(top_models)
         
@@ -730,7 +638,6 @@ def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config:
         for idx, row in model_performance.head(k).iterrows():
             print(f"    {row['Model']}: {row[ranking_metric]:.4f}")
     
-    # Filter original DataFrame to only include selected models
     if selected_models:
         filtered_df = df[df['Model'].isin(selected_models)]
         return filtered_df
@@ -739,7 +646,400 @@ def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config:
 
 
 # =======================================================================
-#  VISUALIZATION FUNCTIONS
+#  BOOTSTRAP CONFIDENCE INTERVALS
+# =======================================================================
+
+def bootstrap_ci(data: np.ndarray, n_iterations: int = 1000, ci: float = 0.95) -> Tuple[float, float, float]:
+    """
+    Compute bootstrap confidence intervals for a metric.
+    
+    Args:
+        data: Array of values
+        n_iterations: Number of bootstrap iterations
+        ci: Confidence interval level (default 0.95)
+    
+    Returns:
+        Tuple of (mean, lower_ci, upper_ci)
+    """
+    if len(data) == 0 or np.all(np.isnan(data)):
+        return np.nan, np.nan, np.nan
+    
+    data = data[~np.isnan(data)]
+    if len(data) < 2:
+        return np.nan, np.nan, np.nan
+    
+    n = len(data)
+    bootstrap_means = []
+    
+    for _ in range(n_iterations):
+        indices = np.random.choice(n, n, replace=True)
+        bootstrap_means.append(np.mean(data[indices]))
+    
+    bootstrap_means = np.array(bootstrap_means)
+    
+    # Handle case where all bootstrap means are the same
+    if np.all(bootstrap_means == bootstrap_means[0]):
+        mean = bootstrap_means[0]
+        lower = mean
+        upper = mean
+    else:
+        mean = np.mean(bootstrap_means)
+        lower = np.percentile(bootstrap_means, (1 - ci) / 2 * 100)
+        upper = np.percentile(bootstrap_means, (1 + ci) / 2 * 100)
+    
+    # Ensure lower and upper are finite
+    if not np.isfinite(lower):
+        lower = mean - 0.01
+    if not np.isfinite(upper):
+        upper = mean + 0.01
+    
+    return mean, lower, upper
+
+
+def compute_confidence_intervals(df: pd.DataFrame, metric: str, group_cols: List[str], 
+                                  n_iterations: int = 1000, ci: float = 0.95) -> pd.DataFrame:
+    """
+    Compute bootstrap confidence intervals for grouped data.
+    
+    Args:
+        df: DataFrame with results
+        metric: Metric to compute CI for
+        group_cols: Columns to group by
+        n_iterations: Number of bootstrap iterations
+        ci: Confidence interval level
+    
+    Returns:
+        DataFrame with mean, lower_ci, upper_ci for each group
+    """
+    results = []
+    
+    for name, group in df.groupby(group_cols):
+        values = group[metric].values
+        mean, lower, upper = bootstrap_ci(values, n_iterations, ci)
+        
+        if isinstance(name, tuple):
+            row = {col: val for col, val in zip(group_cols, name)}
+        else:
+            row = {group_cols[0]: name}
+        
+        row[f'{metric}_mean'] = mean
+        row[f'{metric}_lower_ci'] = lower
+        row[f'{metric}_upper_ci'] = upper
+        row[f'{metric}_std'] = np.nanstd(values) if len(values) > 0 else np.nan
+        row['n_samples'] = len(values)
+        
+        # Only add valid rows
+        if not np.isnan(mean) and not np.isnan(lower) and not np.isnan(upper):
+            results.append(row)
+    
+    return pd.DataFrame(results)
+
+
+# =======================================================================
+#  ABLATION ANALYSIS
+# =======================================================================
+
+def perform_ablation_analysis(df: pd.DataFrame, config: ExperimentConfig, 
+                             task_type: str = 'classification') -> Dict:
+    """
+    Perform ablation analysis: compare full model vs removing each component.
+    
+    Returns:
+        Dictionary with ablation results for each component
+    """
+    if task_type == 'classification':
+        metric = config.ranking_metric_classification
+        lower_is_better = False
+    else:
+        metric = config.ranking_metric_regression
+        lower_is_better = True
+    
+    task_df = df[df['Task'] == task_type]
+    if task_df.empty:
+        return {}
+    
+    all_methods = task_df['Method_Label'].unique()
+    
+    method_performance = task_df.groupby('Method_Label')[metric].mean()
+    if lower_is_better:
+        best_method = method_performance.idxmin()
+        best_score = method_performance.min()
+    else:
+        best_method = method_performance.idxmax()
+        best_score = method_performance.max()
+    
+    ablation_results = []
+    
+    for method in all_methods:
+        if method == best_method:
+            continue
+        
+        method_df = task_df[task_df['Method_Label'] == method]
+        best_df = task_df[task_df['Method_Label'] == best_method]
+        
+        method_values = []
+        best_values = []
+        
+        for model in method_df['Model'].unique():
+            m_val = method_df[method_df['Model'] == model][metric].values
+            b_val = best_df[best_df['Model'] == model][metric].values
+            
+            if len(m_val) > 0 and len(b_val) > 0 and not np.isnan(m_val[0]) and not np.isnan(b_val[0]):
+                method_values.append(m_val[0])
+                best_values.append(b_val[0])
+        
+        if len(method_values) < 2:
+            continue
+        
+        method_values = np.array(method_values)
+        best_values = np.array(best_values)
+        
+        diff = best_values - method_values if not lower_is_better else method_values - best_values
+        
+        t_stat, p_value_ttest = ttest_rel(best_values, method_values)
+        
+        try:
+            w_stat, p_value_wilcoxon = wilcoxon(best_values, method_values)
+        except:
+            w_stat, p_value_wilcoxon = np.nan, np.nan
+        
+        pooled_std = np.sqrt((np.std(best_values, ddof=1)**2 + np.std(method_values, ddof=1)**2) / 2)
+        effect_size = np.mean(diff) / pooled_std if pooled_std > 0 else np.nan
+        
+        ablation_results.append({
+            'Removed_Component': method,
+            'Best_Method': best_method,
+            'Best_Score': np.mean(best_values),
+            'Removed_Score': np.mean(method_values),
+            'Difference': np.mean(diff),
+            'Difference_Std': np.std(diff),
+            't_statistic': t_stat,
+            'p_value_ttest': p_value_ttest,
+            'p_value_wilcoxon': p_value_wilcoxon,
+            'effect_size': effect_size,
+            'n_pairs': len(method_values),
+            'significant': p_value_ttest < 0.05
+        })
+    
+    ablation_df = pd.DataFrame(ablation_results)
+    if not ablation_df.empty:
+        ablation_df = ablation_df.sort_values('Difference', ascending=False)
+    
+    return {
+        'best_method': best_method,
+        'best_score': best_score,
+        'ablation_results': ablation_df,
+        'metric': metric,
+        'lower_is_better': lower_is_better
+    }
+
+
+# =======================================================================
+#  ROBUSTNESS VISUALIZATIONS
+# =======================================================================
+
+def plot_confidence_intervals(ci_df: pd.DataFrame, metric: str, output_dir: Path, 
+                              config: ExperimentConfig, task_type: str = 'classification',
+                              title: str = None):
+    """Plot confidence intervals for each model-method combination."""
+    if ci_df.empty:
+        print(f"Warning: No CI data for {metric}")
+        return
+    
+    base_metric = metric.replace('_mean', '')
+    
+    # Clean data - remove rows with NaN or invalid values
+    ci_df = ci_df.dropna(subset=[f'{base_metric}_mean', f'{base_metric}_lower_ci', f'{base_metric}_upper_ci'])
+    
+    if ci_df.empty:
+        print(f"Warning: No valid CI data after cleaning for {metric}")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, max(6, len(ci_df) * 0.3)))
+    
+    ci_df = ci_df.sort_values(f'{base_metric}_mean', ascending=False)
+    
+    labels = [f"{row['Model']} - {row['Method_Label']}" for _, row in ci_df.iterrows()]
+    
+    y_pos = np.arange(len(ci_df))
+    means = ci_df[f'{base_metric}_mean'].values
+    lower = ci_df[f'{base_metric}_lower_ci'].values
+    upper = ci_df[f'{base_metric}_upper_ci'].values
+    
+    # Ensure lower <= upper and values are finite
+    lower = np.maximum(lower, means - 10)  # Prevent extreme negative values
+    upper = np.minimum(upper, means + 10)
+    
+    # Calculate xerr safely
+    xerr_lower = means - lower
+    xerr_upper = upper - means
+    
+    # Replace any negative or NaN values with small positive values
+    xerr_lower = np.maximum(xerr_lower, 0.001)
+    xerr_upper = np.maximum(xerr_upper, 0.001)
+    
+    methods = ci_df['Method_Label'].unique()
+    color_map = {m: plt.cm.tab10(i % 10) for i, m in enumerate(methods)}
+    colors = [color_map[row['Method_Label']] for _, row in ci_df.iterrows()]
+    
+    ax.errorbar(means, y_pos, xerr=[xerr_lower, xerr_upper], 
+                fmt='o', color='black', capsize=3, elinewidth=1, alpha=0.3)
+    ax.scatter(means, y_pos, c=colors, s=80, alpha=0.8, zorder=3)
+    
+    metric_label = config.metric_labels.get(base_metric, base_metric.upper())
+    ax.set_xlabel(f'{metric_label} (95% CI)', fontsize=12)
+    ax.set_ylabel('Model - Method', fontsize=12)
+    
+    title_text = title or f'{metric_label} with 95% Confidence Intervals ({task_type.title()})'
+    ax.set_title(title_text, fontsize=14, fontweight='bold')
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=color, label=method) for method, color in color_map.items()]
+    ax.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(right=0.7)
+    task_suffix = f"_{task_type}"
+    plt.savefig(output_dir / f'confidence_intervals_{base_metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Confidence intervals saved to: {output_dir / f'confidence_intervals_{base_metric}{task_suffix}.png'}")
+
+def plot_ablation_results(ablation_data: Dict, output_dir: Path, config: ExperimentConfig,
+                         task_type: str = 'classification'):
+    """Plot ablation study results."""
+    ablation_df = ablation_data['ablation_results']
+    if ablation_df.empty:
+        print("Warning: No ablation data to plot")
+        return
+    
+    metric = ablation_data['metric']
+    metric_label = config.metric_labels.get(metric, metric.upper())
+    best_method = ablation_data['best_method']
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, max(6, len(ablation_df) * 0.4)))
+    
+    ablation_df = ablation_df.sort_values('Difference', ascending=False)
+    
+    ax1 = axes[0]
+    colors = ['#2ECC71' if row['significant'] else '#E74C3C' for _, row in ablation_df.iterrows()]
+    
+    bars = ax1.barh(ablation_df['Removed_Component'], ablation_df['Difference'], color=colors, alpha=0.7)
+    
+    for bar, val in zip(bars, ablation_df['Difference']):
+        ax1.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2, 
+                f'{val:.4f}', va='center', fontsize=9)
+    
+    ax1.axvline(x=0, color='black', linestyle='-', alpha=0.5)
+    ax1.set_xlabel(f'Performance Drop (Δ{metric_label})', fontsize=12)
+    ax1.set_ylabel('Removed Component', fontsize=12)
+    ax1.set_title(f'Ablation: Performance Drop When Removing Component\n(Compared to {best_method})', 
+                  fontsize=13, fontweight='bold')
+    ax1.grid(True, alpha=0.3, axis='x')
+    
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#2ECC71', alpha=0.7, label='Significant (p < 0.05)'),
+        Patch(facecolor='#E74C3C', alpha=0.7, label='Not Significant')
+    ]
+    ax1.legend(handles=legend_elements, loc='best', fontsize=9)
+    
+    ax2 = axes[1]
+    
+    p_values = ablation_df['p_value_ttest'].values
+    significant = ablation_df['significant'].values
+    
+    log_p = -np.log10(p_values + 1e-10)
+    
+    colors2 = ['#2ECC71' if sig else '#E74C3C' for sig in significant]
+    bars2 = ax2.barh(ablation_df['Removed_Component'], log_p, color=colors2, alpha=0.7)
+    
+    for bar, p_val in zip(bars2, p_values):
+        label = f'{p_val:.4f}' if p_val >= 0.001 else f'{p_val:.2e}'
+        ax2.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height()/2, 
+                label, va='center', fontsize=8)
+    
+    threshold = -np.log10(0.05)
+    ax2.axvline(x=threshold, color='red', linestyle='--', alpha=0.7, label='p = 0.05')
+    
+    ax2.set_xlabel('-log10(p-value)', fontsize=12)
+    ax2.set_ylabel('Removed Component', fontsize=12)
+    ax2.set_title('Statistical Significance of Ablation', fontsize=13, fontweight='bold')
+    ax2.legend(loc='best', fontsize=9)
+    ax2.grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    task_suffix = f"_{task_type}"
+    plt.savefig(output_dir / f'ablation_analysis_{task_type}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Ablation analysis saved to: {output_dir / f'ablation_analysis_{task_type}.png'}")
+    
+    summary_cols = ['Removed_Component', 'Removed_Score', 'Difference', 
+                    'p_value_ttest', 'significant', 'effect_size', 'n_pairs']
+    summary_df = ablation_df[summary_cols].round(4)
+    summary_df.to_csv(output_dir / f'ablation_summary_{task_type}.csv', index=False)
+    print(f"✓ Ablation summary saved to: {output_dir / f'ablation_summary_{task_type}.csv'}")
+
+
+def plot_robustness_summary(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
+                           task_type: str = 'classification', n_iterations: int = 1000):
+    """Create comprehensive robustness summary with CIs and statistics."""
+    if df.empty:
+        print(f"Warning: Empty dataframe for task {task_type}")
+        return
+    
+    task_df = df[df['Task'] == task_type]
+    if task_df.empty:
+        print(f"Warning: No data for task {task_type}")
+        return
+    
+    if task_type == 'classification':
+        metric = config.ranking_metric_classification
+    else:
+        metric = config.ranking_metric_regression
+    
+    try:
+        ci_df = compute_confidence_intervals(
+            task_df, metric, ['Model', 'Method_Label'], 
+            n_iterations=n_iterations, ci=0.95
+        )
+        
+        if not ci_df.empty:
+            plot_confidence_intervals(ci_df, metric, output_dir, config, task_type)
+            ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv', index=False)
+            print(f"✓ Confidence intervals data saved to: {output_dir / f'confidence_intervals_{task_type}.csv'}")
+        else:
+            print(f"⚠ No confidence intervals could be computed for {task_type}")
+    except Exception as e:
+        print(f"⚠ Error computing confidence intervals for {task_type}: {e}")
+    
+    try:
+        ablation_data = perform_ablation_analysis(task_df, config, task_type)
+        
+        if ablation_data and not ablation_data['ablation_results'].empty:
+            ablation_df = ablation_data['ablation_results']
+            ablation_df.to_csv(output_dir / f'ablation_detailed_{task_type}.csv', index=False)
+            print(f"✓ Detailed ablation results saved to: {output_dir / f'ablation_detailed_{task_type}.csv'}")
+            
+            plot_ablation_results(ablation_data, output_dir, config, task_type)
+            
+            print(f"\n  Ablation Summary for {task_type.upper()}:")
+            print(f"    Best Method: {ablation_data['best_method']} ({ablation_data['best_score']:.4f})")
+            if not ablation_df.empty:
+                print(f"    Most impactful removal: {ablation_df.iloc[0]['Removed_Component']} "
+                      f"(Δ = {ablation_df.iloc[0]['Difference']:.4f}, p = {ablation_df.iloc[0]['p_value_ttest']:.4f})")
+        else:
+            print(f"⚠ No ablation results could be computed for {task_type}")
+    except Exception as e:
+        print(f"⚠ Error computing ablation analysis for {task_type}: {e}")
+    
+    return ci_df if 'ci_df' in locals() else None, ablation_data if 'ablation_data' in locals() else None
+
+
+# =======================================================================
+#  VISUALIZATION FUNCTIONS (ORIGINAL)
 # =======================================================================
 
 def plot_method_comparison(df: pd.DataFrame, metric: str, output_dir: Path, 
@@ -777,7 +1077,11 @@ def plot_method_comparison(df: pd.DataFrame, metric: str, output_dir: Path,
     pivot = pivot.loc[best_vals.sort_values(ascending=lower_is_better).index]
     
     fig, ax = plt.subplots(figsize=(14, max(8, len(pivot.index) * 0.4)))
+    
     pivot.plot(kind='barh', ax=ax, width=0.8, colormap='viridis')
+    
+    for container in ax.containers:
+        ax.bar_label(container, fmt='%.3f', fontsize=7, padding=2)
     
     metric_label = config.metric_labels.get(metric, metric.upper())
     title_text = title or f'{metric_label} by Model and Fusion Method ({task_type.title()})'
@@ -788,13 +1092,14 @@ def plot_method_comparison(df: pd.DataFrame, metric: str, output_dir: Path,
     ax.set_title(title_text, fontsize=14, fontweight='bold')
     ax.set_xlabel(metric_label)
     ax.set_ylabel('Model')
-    ax.legend(loc='best', ncol=2)
+    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9, ncol=1)
     ax.grid(True, alpha=0.3, axis='x')
     
     plt.tight_layout()
+    plt.subplots_adjust(right=0.75)
     suffix = f"_{subgroup_prefix}" if subgroup_prefix else ""
     task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'method_comparison_{metric}{suffix}{task_suffix}.png', dpi=300)
+    plt.savefig(output_dir / f'method_comparison_{metric}{suffix}{task_suffix}.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✓ Method comparison saved to: {output_dir / f'method_comparison_{metric}{suffix}{task_suffix}.png'}")
 
@@ -854,17 +1159,14 @@ def plot_heatmap(df: pd.DataFrame, metric: str, output_dir: Path, config: Experi
     plt.tight_layout()
     suffix = f"_{subgroup_prefix}" if subgroup_prefix else ""
     task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'heatmap_{metric}{suffix}{task_suffix}.png', dpi=300)
+    plt.savefig(output_dir / f'heatmap_{metric}{suffix}{task_suffix}.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✓ Heatmap saved to: {output_dir / f'heatmap_{metric}{suffix}{task_suffix}.png'}")
 
 
 def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
                            subgroup_prefix: str = None, task_type: str = 'classification'):
-    """
-    Create a combined heatmap showing Sensitivity and Specificity together.
-    Also computes and displays the harmonic mean of Sen/Spec.
-    """
+    """Create combined Sen/Spec plots with harmonic mean."""
     plot_df = df[df['Task'] == task_type].copy()
     if plot_df.empty:
         print(f"Warning: No data for task {task_type}")
@@ -897,7 +1199,6 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
         spec_col: 'mean'
     }).reset_index()
     
-    # Drop rows with NaN values
     avg_data = avg_data.dropna(subset=[sen_col, spec_col])
     
     if avg_data.empty:
@@ -905,9 +1206,6 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
         return
     
     avg_data['sen_spec_harmonic'] = 2 * (avg_data[sen_col] * avg_data[spec_col]) / (avg_data[sen_col] + avg_data[spec_col] + 1e-10)
-    avg_data['sen_spec_geometric'] = np.sqrt(avg_data[sen_col] * avg_data[spec_col])
-    
-    # Sort by harmonic mean, handling NaN values
     avg_data = avg_data.sort_values('sen_spec_harmonic', ascending=False)
     
     fig, axes = plt.subplots(1, 3, figsize=(18, max(6, len(avg_data) * 0.3)))
@@ -995,7 +1293,7 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
     
     suffix = f"_{subgroup_prefix}" if subgroup_prefix else ""
     task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'sen_spec_combined{suffix}{task_suffix}.png', dpi=300)
+    plt.savefig(output_dir / f'sen_spec_combined{suffix}{task_suffix}.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✓ Combined Sen/Spec plot saved to: {output_dir / f'sen_spec_combined{suffix}{task_suffix}.png'}")
     
@@ -1007,10 +1305,7 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
 
 def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
                                           task_type: str = 'classification'):
-    """
-    Create comprehensive Sen/Spec plots comparing Dys vs Norm for each model.
-    Includes harmonic mean and difference plots.
-    """
+    """Create comprehensive Sen/Spec plots comparing Dys vs Norm."""
     plot_df = df[df['Task'] == task_type].copy()
     if plot_df.empty:
         print(f"Warning: No data for task {task_type}")
@@ -1032,7 +1327,6 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         non_subgroup_spec: 'mean'
     }).reset_index()
     
-    # Drop rows with NaN values
     avg_data = avg_data.dropna(subset=[subgroup_sen, subgroup_spec, non_subgroup_sen, non_subgroup_spec])
     
     if avg_data.empty:
@@ -1151,11 +1445,8 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
     
     ax4 = axes[1, 1]
     
-    # Check if we have valid differences
     diff_data = avg_data['harmonic_diff'].dropna()
     if diff_data.empty:
-        print(f"Warning: No valid difference data for {task_type}")
-        # Create empty plot with message
         ax4.text(0.5, 0.5, 'No valid difference data', 
                 horizontalalignment='center', verticalalignment='center',
                 transform=ax4.transAxes, fontsize=14)
@@ -1181,7 +1472,6 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         ax4.set_xticklabels(models, rotation=45, ha='right')
         ax4.grid(True, alpha=0.3, axis='y')
         
-        # Calculate y-axis limits with safe handling
         max_abs_diff = max(abs(avg_data['harmonic_diff'].min() or 0), abs(avg_data['harmonic_diff'].max() or 0))
         if np.isnan(max_abs_diff) or max_abs_diff == 0:
             max_abs_diff = 0.1
@@ -1189,7 +1479,7 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
     
     plt.tight_layout()
     task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png', dpi=300)
+    plt.savefig(output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✓ Comprehensive subgroup Sen/Spec plot saved to: {output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png'}")
     
@@ -1277,151 +1567,18 @@ def plot_subgroup_comparison(df: pd.DataFrame, output_dir: Path, config: Experim
         ax.set_ylabel(metric_label)
         ax.set_xticks(x)
         ax.set_xticklabels(plot_data['Model'], rotation=45, ha='right')
-        ax.legend(title='Group')
+        ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
         
         if metric not in ['rmse']:
             ax.set_ylim(0, 1.05)
         
         plt.tight_layout()
+        plt.subplots_adjust(right=0.85)
         task_suffix = f"_{task_type}"
-        plt.savefig(output_dir / f'subgroup_comparison_{metric}{task_suffix}.png', dpi=300)
+        plt.savefig(output_dir / f'subgroup_comparison_{metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
         plt.close()
         print(f"✓ Subgroup comparison saved to: {output_dir / f'subgroup_comparison_{metric}{task_suffix}.png'}")
-
-
-def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig):
-    """Create plots comparing meta_fusion results across models and methods."""
-    if df.empty:
-        print("Warning: No meta_fusion data")
-        return
-    
-    tasks = df['Task'].unique()
-    
-    for task in tasks:
-        task_df = df[df['Task'] == task]
-        if task_df.empty:
-            continue
-        
-        if 'Method_Label' in task_df.columns:
-            methods = task_df['Method_Label'].unique()
-            print(f"  Found {len(methods)} meta-fusion methods: {methods}")
-            
-            if task == 'classification':
-                metrics = ['macro_f1', 'balanced_accuracy', 'roc_auc']
-                
-                if 'sensitivity' in task_df.columns and 'specificity' in task_df.columns:
-                    fig, ax = plt.subplots(figsize=(14, 7))
-                    pivot_sen = task_df.pivot_table(index='Model', columns='Method_Label', values='sensitivity', aggfunc='mean')
-                    
-                    x = np.arange(len(pivot_sen.index))
-                    width = 0.35
-                    
-                    for i, method in enumerate(pivot_sen.columns):
-                        offset = (i - len(pivot_sen.columns)/2 + 0.5) * width
-                        ax.bar(x + offset, pivot_sen[method], width, label=f'{method} (Sen)', alpha=0.7)
-                    
-                    ax.set_xlabel('Model')
-                    ax.set_ylabel('Sensitivity')
-                    ax.set_title(f'Meta-Fusion: Sensitivity by Method ({task.title()})', fontsize=14, fontweight='bold')
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(pivot_sen.index, rotation=45, ha='right')
-                    ax.legend(loc='best', ncol=2)
-                    ax.grid(True, alpha=0.3, axis='y')
-                    ax.set_ylim(0, 1.05)
-                    
-                    plt.tight_layout()
-                    plt.savefig(output_dir / f'meta_fusion_sensitivity_{task}.png', dpi=300)
-                    plt.close()
-                    print(f"✓ Meta-fusion sensitivity plot saved to: {output_dir / f'meta_fusion_sensitivity_{task}.png'}")
-                    
-                    fig, ax = plt.subplots(figsize=(14, 7))
-                    pivot_spec = task_df.pivot_table(index='Model', columns='Method_Label', values='specificity', aggfunc='mean')
-                    
-                    for i, method in enumerate(pivot_spec.columns):
-                        offset = (i - len(pivot_spec.columns)/2 + 0.5) * width
-                        ax.bar(x + offset, pivot_spec[method], width, label=f'{method} (Spec)', alpha=0.7)
-                    
-                    ax.set_xlabel('Model')
-                    ax.set_ylabel('Specificity')
-                    ax.set_title(f'Meta-Fusion: Specificity by Method ({task.title()})', fontsize=14, fontweight='bold')
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(pivot_spec.index, rotation=45, ha='right')
-                    ax.legend(loc='best', ncol=2)
-                    ax.grid(True, alpha=0.3, axis='y')
-                    ax.set_ylim(0, 1.05)
-                    
-                    plt.tight_layout()
-                    plt.savefig(output_dir / f'meta_fusion_specificity_{task}.png', dpi=300)
-                    plt.close()
-                    print(f"✓ Meta-fusion specificity plot saved to: {output_dir / f'meta_fusion_specificity_{task}.png'}")
-            
-            else:
-                metrics = ['rmse', 'r2']
-            
-            for metric in metrics:
-                if metric not in task_df.columns:
-                    continue
-                
-                fig, ax = plt.subplots(figsize=(14, 7))
-                pivot = task_df.pivot_table(index='Model', columns='Method_Label', values=metric, aggfunc='mean')
-                pivot.plot(kind='bar', ax=ax, width=0.8, colormap='viridis')
-                
-                metric_label = config.metric_labels.get(metric, metric.upper())
-                ax.set_title(f'Meta-Fusion {metric_label} Comparison by Method ({task.title()})', fontsize=14, fontweight='bold')
-                ax.set_xlabel('Model')
-                ax.set_ylabel(metric_label)
-                ax.legend(loc='best', ncol=2)
-                ax.grid(True, alpha=0.3, axis='y')
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-                
-                if metric not in ['rmse']:
-                    ax.set_ylim(0, 1.05)
-                
-                plt.tight_layout()
-                task_suffix = f"_{task}"
-                plt.savefig(output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png', dpi=300)
-                plt.close()
-                print(f"✓ Meta-fusion comparison saved to: {output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png'}")
-        else:
-            if task == 'classification':
-                metrics = ['macro_f1', 'balanced_accuracy', 'roc_auc']
-            else:
-                metrics = ['rmse', 'r2']
-            
-            for metric in metrics:
-                if metric not in task_df.columns:
-                    continue
-                
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                if metric in ['rmse']:
-                    sorted_df = task_df.sort_values(metric, ascending=True)
-                else:
-                    sorted_df = task_df.sort_values(metric, ascending=False)
-                
-                bars = ax.bar(sorted_df['Model'], sorted_df[metric], color='steelblue', alpha=0.7)
-                
-                for bar, val in zip(bars, sorted_df[metric]):
-                    if pd.notna(val):
-                        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                               f'{val:.3f}', ha='center', va='bottom', fontsize=9)
-                
-                metric_label = config.metric_labels.get(metric, metric.upper())
-                ax.set_title(f'Meta-Fusion {metric_label} Comparison ({task.title()})', fontsize=14, fontweight='bold')
-                ax.set_xlabel('Model')
-                ax.set_ylabel(metric_label)
-                ax.grid(True, alpha=0.3, axis='y')
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-                
-                if metric not in ['rmse']:
-                    ax.set_ylim(0, 1.05)
-                
-                plt.tight_layout()
-                task_suffix = f"_{task}"
-                plt.savefig(output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png', dpi=300)
-                plt.close()
-                print(f"✓ Meta-fusion comparison saved to: {output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png'}")
 
 
 def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig, prefix: str = ''):
@@ -1484,7 +1641,7 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Experiment Results Aggregator - Supports Classification & Regression'
+        description='Experiment Results Aggregator - Supports Classification & Regression with Robustness Analysis'
     )
     parser.add_argument('--input-dir', type=str, required=True,
                         help='Base directory containing experiment folders')
@@ -1496,18 +1653,22 @@ def main():
                         help='Specific models to include')
     parser.add_argument('--methods', nargs='+', default=None,
                         help='Specific fusion methods to include')
+    parser.add_argument('--ignore-methods', nargs='+', default=None,
+                        help='Fusion methods to ignore/exclude (e.g., mlp cca)')
     parser.add_argument('--metrics', nargs='+', default=None,
                         help='Metrics to include in figures')
     parser.add_argument('--top-k', type=int, default=None,
-                        help='Select top K models based on ranking metric (F1-Macro for classification, R² for regression)')
+                        help='Select top K models based on ranking metric')
+    parser.add_argument('--bootstrap-iterations', type=int, default=1000,
+                        help='Number of bootstrap iterations for confidence intervals (default: 1000)')
+    parser.add_argument('--no-robustness', action='store_true',
+                        help='Skip robustness analysis (CI and ablation)')
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed progress information')
     parser.add_argument('--no-plots', action='store_true',
                         help='Skip generating plots')
     parser.add_argument('--subgroup', action='store_true',
                         help='Generate subgroup (Dys/Norm) analysis')
-    parser.add_argument('--meta-fusion', action='store_true',
-                        help='Include meta_fusion results in analysis')
     
     args = parser.parse_args()
     
@@ -1515,6 +1676,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     config = ExperimentConfig()
+    config.bootstrap_iterations = args.bootstrap_iterations
     
     base_dir = Path(args.input_dir)
     experiments = discover_experiments(base_dir, args.task, config)
@@ -1526,7 +1688,6 @@ def main():
         print(f"Base directory: {base_dir}")
         return
     
-    # Filter experiments by model if specified
     if args.models:
         print(f"\n{'='*60}")
         print(f"FILTERING MODELS")
@@ -1562,43 +1723,26 @@ def main():
     print(f"{'='*60}")
     
     df = aggregate_experiment_results(experiments, config)
-    print(f"Aggregated {len(df)} fusion method results")
+    print(f"Aggregated {len(df)} method results")
     
-    # Apply top-k selection BEFORE meta_fusion aggregation
+    if args.ignore_methods:
+        ignore_set = set(args.ignore_methods)
+        df = df[~df['Method'].isin(ignore_set) & ~df['Method_Label'].isin(ignore_set)]
+        print(f"  Removed methods: {args.ignore_methods}")
+    
     if args.top_k and args.top_k > 0:
         print(f"\n{'='*60}")
         print(f"SELECTING TOP {args.top_k} MODELS")
         print(f"{'='*60}")
         
-        # Select top K models for each task
         df = select_top_k_models(df, args.top_k, args.task if args.task != 'all' else None, config)
         print(f"\nFiltered to {len(df['Model'].unique())} models after top-k selection")
-        
-        # Re-filter experiments based on selected models
-        selected_models = df['Model'].unique().tolist()
-        filtered_experiments = {}
-        for model_name, model_data in experiments.items():
-            if model_name in selected_models:
-                filtered_experiments[model_name] = model_data
-        
-        experiments = filtered_experiments
-        print(f"Updated experiments to {len(experiments)} models")
-    
-    # Aggregate meta_fusion results (after top-k selection)
-    meta_df = None
-    if args.meta_fusion:
-        meta_df = aggregate_meta_fusion_results(experiments, config)
-        print(f"Aggregated {len(meta_df)} meta_fusion results")
     
     if args.task != 'all':
         df = df[df['Task'] == args.task]
-        if meta_df is not None:
-            meta_df = meta_df[meta_df['Task'] == args.task]
     
     if args.models:
         df = df[df['Model'].isin(args.models)]
-        if meta_df is not None:
-            meta_df = meta_df[meta_df['Model'].isin(args.models)]
     
     if args.methods:
         df = df[df['Method'].isin(args.methods)]
@@ -1617,18 +1761,26 @@ def main():
     
     df.to_csv(output_dir / 'all_results.csv', index=False)
     
-    if meta_df is not None and not meta_df.empty:
-        meta_df.to_csv(output_dir / 'meta_fusion_results.csv', index=False)
-    
     print(f"\n{'='*60}")
     print(f"GENERATING SUMMARY TABLES")
     print(f"{'='*60}")
     
     create_summary_table(df, output_dir, config)
     
-    if meta_df is not None and not meta_df.empty:
-        create_summary_table(meta_df, output_dir, config, prefix='meta_fusion_')
+    # ===== ROBUSTNESS ANALYSIS =====
+    if not args.no_robustness:
+        print(f"\n{'='*60}")
+        print(f"ROBUSTNESS ANALYSIS (Bootstrap CI & Ablation)")
+        print(f"{'='*60}")
+        print(f"Bootstrap iterations: {args.bootstrap_iterations}")
+        
+        tasks_to_process = df['Task'].unique()
+        
+        for task in tasks_to_process:
+            print(f"\nProcessing {task} task...")
+            plot_robustness_summary(df, output_dir, config, task, args.bootstrap_iterations)
     
+    # ===== PLOTS =====
     if not args.no_plots:
         print(f"\n{'='*60}")
         print(f"GENERATING FIGURES")
@@ -1658,21 +1810,6 @@ def main():
             
             if args.subgroup:
                 plot_subgroup_comparison(df, output_dir, config, task_type=task)
-                
-                if task == 'classification':
-                    subgroup_metrics = ['subgroup_macro_f1', 'subgroup_balanced_accuracy', 'subgroup_roc_auc']
-                else:
-                    subgroup_metrics = ['subgroup_rmse', 'subgroup_r2']
-                
-                for metric in subgroup_metrics:
-                    if metric in df.columns and df[df['Task'] == task][metric].notna().any():
-                        prefix = 'subgroup'
-                        plot_heatmap(df, metric, output_dir, config, subgroup_prefix=prefix, task_type=task)
-                        plot_method_comparison(df, metric, output_dir, config, subgroup_prefix=prefix, task_type=task)
-        
-        if meta_df is not None and not meta_df.empty:
-            print(f"\nGenerating meta_fusion figures...")
-            plot_meta_fusion_comparison(meta_df, output_dir, config)
     
     print(f"\n{'='*60}")
     print(f"SUMMARY STATISTICS")
@@ -1734,7 +1871,15 @@ def main():
     print(f"\n{'='*60}")
     print(f"ALL RESULTS SAVED TO: {output_dir}")
     print(f"{'='*60}")
+    print(f"\nAdditional outputs:")
+    print(f"  - Confidence intervals: confidence_intervals_*.csv and plots")
+    print(f"  - Ablation analysis: ablation_*.csv and plots")
+    print(f"  - Bootstrap iterations: {args.bootstrap_iterations}")
 
 
 if __name__ == "__main__":
     main()
+
+'''
+python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate --subgroup --top-k 5 --bootstrap-iterations 10000 --ignore-methods mlp | tee outputs-ensemble-aggregate/log.txt
+'''
