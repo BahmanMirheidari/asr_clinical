@@ -897,8 +897,17 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
         spec_col: 'mean'
     }).reset_index()
     
+    # Drop rows with NaN values
+    avg_data = avg_data.dropna(subset=[sen_col, spec_col])
+    
+    if avg_data.empty:
+        print(f"Warning: No valid data for {sen_col} and {spec_col}")
+        return
+    
     avg_data['sen_spec_harmonic'] = 2 * (avg_data[sen_col] * avg_data[spec_col]) / (avg_data[sen_col] + avg_data[spec_col] + 1e-10)
     avg_data['sen_spec_geometric'] = np.sqrt(avg_data[sen_col] * avg_data[spec_col])
+    
+    # Sort by harmonic mean, handling NaN values
     avg_data = avg_data.sort_values('sen_spec_harmonic', ascending=False)
     
     fig, axes = plt.subplots(1, 3, figsize=(18, max(6, len(avg_data) * 0.3)))
@@ -1023,6 +1032,13 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         non_subgroup_spec: 'mean'
     }).reset_index()
     
+    # Drop rows with NaN values
+    avg_data = avg_data.dropna(subset=[subgroup_sen, subgroup_spec, non_subgroup_sen, non_subgroup_spec])
+    
+    if avg_data.empty:
+        print(f"Warning: No valid data for subgroup Sen/Spec after dropping NaN")
+        return
+    
     avg_data['dys_harmonic'] = 2 * (avg_data[subgroup_sen] * avg_data[subgroup_spec]) / (avg_data[subgroup_sen] + avg_data[subgroup_spec] + 1e-10)
     avg_data['norm_harmonic'] = 2 * (avg_data[non_subgroup_sen] * avg_data[non_subgroup_spec]) / (avg_data[non_subgroup_sen] + avg_data[non_subgroup_spec] + 1e-10)
     avg_data['harmonic_diff'] = avg_data['dys_harmonic'] - avg_data['norm_harmonic']
@@ -1134,28 +1150,42 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
     ax3.set_ylim(0, 1.05)
     
     ax4 = axes[1, 1]
-    colors = ['#2ECC71' if val >= 0 else '#E74C3C' for val in avg_data['harmonic_diff']]
-    bars7 = ax4.bar(x, avg_data['harmonic_diff'], color=colors, alpha=0.8)
     
-    for bar, val in zip(bars7, avg_data['harmonic_diff']):
-        if not np.isnan(val):
-            ax4.annotate(f'{val:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, val),
-                       xytext=(0, 3 if val >= 0 else -15),
-                       textcoords="offset points",
-                       ha='center', va='bottom' if val >= 0 else 'top',
-                       fontsize=9)
-    
-    ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-    ax4.set_xlabel('Model')
-    ax4.set_ylabel('Difference (Dys - Norm)')
-    ax4.set_title('Dys vs Norm Difference in Harmonic Mean', fontsize=13, fontweight='bold')
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(models, rotation=45, ha='right')
-    ax4.grid(True, alpha=0.3, axis='y')
-    
-    max_abs_diff = max(abs(avg_data['harmonic_diff'].min()), abs(avg_data['harmonic_diff'].max()))
-    ax4.set_ylim(-max_abs_diff - 0.1, max_abs_diff + 0.1)
+    # Check if we have valid differences
+    diff_data = avg_data['harmonic_diff'].dropna()
+    if diff_data.empty:
+        print(f"Warning: No valid difference data for {task_type}")
+        # Create empty plot with message
+        ax4.text(0.5, 0.5, 'No valid difference data', 
+                horizontalalignment='center', verticalalignment='center',
+                transform=ax4.transAxes, fontsize=14)
+        ax4.set_title('Dys vs Norm Difference in Harmonic Mean', fontsize=13, fontweight='bold')
+    else:
+        colors = ['#2ECC71' if val >= 0 else '#E74C3C' for val in avg_data['harmonic_diff']]
+        bars7 = ax4.bar(x, avg_data['harmonic_diff'], color=colors, alpha=0.8)
+        
+        for bar, val in zip(bars7, avg_data['harmonic_diff']):
+            if not np.isnan(val):
+                ax4.annotate(f'{val:.3f}',
+                           xy=(bar.get_x() + bar.get_width() / 2, val),
+                           xytext=(0, 3 if val >= 0 else -15),
+                           textcoords="offset points",
+                           ha='center', va='bottom' if val >= 0 else 'top',
+                           fontsize=9)
+        
+        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+        ax4.set_xlabel('Model')
+        ax4.set_ylabel('Difference (Dys - Norm)')
+        ax4.set_title('Dys vs Norm Difference in Harmonic Mean', fontsize=13, fontweight='bold')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(models, rotation=45, ha='right')
+        ax4.grid(True, alpha=0.3, axis='y')
+        
+        # Calculate y-axis limits with safe handling
+        max_abs_diff = max(abs(avg_data['harmonic_diff'].min() or 0), abs(avg_data['harmonic_diff'].max() or 0))
+        if np.isnan(max_abs_diff) or max_abs_diff == 0:
+            max_abs_diff = 0.1
+        ax4.set_ylim(-max_abs_diff - 0.1, max_abs_diff + 0.1)
     
     plt.tight_layout()
     task_suffix = f"_{task_type}"
