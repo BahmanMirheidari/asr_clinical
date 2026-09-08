@@ -3961,9 +3961,9 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
 
-    parser.add_argument("--hpo-n-trials", type=int, default=10)
+    parser.add_argument("--hpo-n-trials", type=int, default=20)
     parser.add_argument("--hpo-timeout", type=int, default=None)
-    parser.add_argument("--hpo-folds", type=int, default=10)
+    parser.add_argument("--hpo-folds", type=int, default=5)
     parser.add_argument("--force-hpo", action="store_true")
 
     parser.add_argument("--meta-model",
