@@ -6,9 +6,9 @@ Key Metrics:
 - Classification: F1-Macro, Sensitivity, Specificity, Balanced Accuracy, AUC-ROC
 - Regression: RMSE, R²
 - Subgroup analysis: Dys vs Norm for all metrics with Sen/Spec pairs
-- Robustness: Confidence Intervals (95%), Bootstrap resampling
-- Ablation: Component removal analysis with statistical significance
-- Statistical tests: t-test, Wilcoxon signed-rank test
+- Robustness: Confidence Intervals (95%), Bootstrap resampling (1000 iterations)
+- Ablation: Component removal analysis using ALL patients data (not subgroups)
+- Scatter plots: Audio-Only vs Best Text vs Best Fusion for Dys subgroup
 
 Folder Structure:
 <main_dir>/
@@ -17,10 +17,11 @@ Folder Structure:
 │   │   ├── leakage_safe_5fold/
 │   │   │   ├── audio_only_aggregate_metrics.json
 │   │   │   ├── text_only_aggregate_metrics.json
-│   │   │   ├── fuse-audio_text_aggregate_metrics.json
+│   │   │   ├── fuse-*_aggregate_metrics.json
 │   │   │   └── ...
 │   │   └── meta_fusion/
 │   │       ├── meta_fusion_metrics.json
+│   │       ├── stacked_predictions.csv
 │   │       └── ...
 ├── regression-fusion-<model_name>/               
 │   └── ...
@@ -37,7 +38,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from scipy.stats import ttest_rel, wilcoxon, ttest_ind
+from scipy.stats import ttest_rel, wilcoxon, ttest_ind, linregress, pearsonr
 import argparse
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -126,6 +127,25 @@ class ExperimentConfig:
         'best': 'Best Method'
     })
     
+    # Model name mapping for shorter display names
+    model_name_mapping: Dict[str, str] = field(default_factory=lambda: {
+        'microsoft.deberta-v3-base': 'DeBERTa-Base',
+        'microsoft.deberta-v3-large': 'DeBERTa-Large',
+        'distilroberta-base': 'DistilRoBERTa',
+        'roberta-base': 'RoBERTa-Base',
+        'roberta-large': 'RoBERTa-Large',
+        'bert-base-uncased': 'BERT-Base',
+        'bert-large-uncased': 'BERT-Large',
+        'albert-base-v2': 'ALBERT-Base',
+        'albert-large-v2': 'ALBERT-Large',
+        'clinicalbert': 'ClinicalBERT',
+        'biomed-roberta-base': 'BioMed-RoBERTa',
+        'scibert-scivocab-uncased': 'SciBERT',
+        'legal-bert-base': 'LegalBERT',
+        'pubmedbert-base': 'PubMedBERT',
+        'bioclinicalbert': 'BioClinicalBERT',
+    })
+    
     # Classification metrics
     classification_metrics: List[str] = field(default_factory=lambda: [
         'macro_f1', 'sensitivity', 'specificity', 'balanced_accuracy', 'roc_auc'
@@ -187,14 +207,45 @@ class ExperimentConfig:
 #  HELPER FUNCTIONS
 # =======================================================================
 
+def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
+    """Get shortened display name for a model."""
+    if model_name in config.model_name_mapping:
+        return config.model_name_mapping[model_name]
+    
+    for key, value in config.model_name_mapping.items():
+        if key in model_name or model_name in key:
+            return value
+    
+    cleaned = model_name
+    prefixes = ['microsoft.', 'google.', 'facebook/', 'allenai/', 'emilyalsentzer/']
+    for prefix in prefixes:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    
+    suffixes = ['-uncased', '-cased', '-v2', '-base', '-large', '-small']
+    for suffix in suffixes:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[:-len(suffix)]
+    
+    return cleaned.title()
+
+
 def get_method_display_name(method_key: str, config: ExperimentConfig) -> str:
     """Get display name for a method."""
-    if method_key.startswith('fuse-'):
+    if method_key == 'audio_only':
+        return 'Audio-Only'
+    elif method_key == 'text_only':
+        return 'Text-Only'
+    elif method_key.startswith('fuse-'):
         if method_key in config.fusion_combination_display_names:
             return config.fusion_combination_display_names[method_key]
         else:
             parts = method_key.replace('fuse-', '').split('_')
             return ' + '.join([p.replace('_', ' ').title() for p in parts])
+    elif method_key.startswith('ensemble_'):
+        ensemble = method_key.replace('ensemble_', '')
+        return config.meta_fusion_display_names.get(ensemble, ensemble.title())
     else:
         return config.method_display_names.get(method_key, method_key.replace('_', ' ').title())
 
@@ -293,6 +344,75 @@ def parse_folder_name(folder_name: str) -> Dict[str, str]:
 
 
 # =======================================================================
+#  SUBGROUP MAPPING FUNCTIONS
+# =======================================================================
+
+def load_dys_speaker_ids(mapping_file: Path) -> List[str]:
+    """
+    Load Dys speaker IDs from a simple text file (one ID per line).
+    Returns a list of speaker IDs that belong to the Dys subgroup.
+    """
+    if not mapping_file or not mapping_file.exists():
+        print(f"Warning: Dys speaker ID file not found: {mapping_file}")
+        return []
+    
+    try:
+        with open(mapping_file, 'r') as f:
+            speaker_ids = [line.strip() for line in f.readlines() if line.strip()]
+        
+        print(f"\n✓ Loaded {len(speaker_ids)} Dys speaker IDs from: {mapping_file}")
+        if len(speaker_ids) <= 10:
+            print(f"  IDs: {speaker_ids}")
+        else:
+            print(f"  First 5 IDs: {speaker_ids[:5]}")
+            print(f"  Last 5 IDs: {speaker_ids[-5:]}")
+        
+        return speaker_ids
+        
+    except Exception as e:
+        print(f"Error loading Dys speaker IDs: {e}")
+        return []
+
+
+def filter_predictions_by_dys_ids(pred_df: pd.DataFrame, dys_ids: List[str]) -> Tuple[pd.DataFrame, int]:
+    """
+    Filter predictions DataFrame to only include speakers from the Dys subgroup.
+    Deduplicates by speaker ID to handle cross-validation folds.
+    """
+    if not dys_ids:
+        return pred_df, len(pred_df)
+    
+    # Try to find speaker ID column in predictions
+    id_col = None
+    for col in pred_df.columns:
+        col_lower = col.lower()
+        if any(x in col_lower for x in ['speaker', 'participant', 'subject', 'patient', 'id']):
+            id_col = col
+            break
+    
+    if id_col is None:
+        print(f"  Warning: No speaker ID column found in predictions")
+        print(f"  Available columns: {pred_df.columns.tolist()}")
+        return pred_df, len(pred_df)
+    
+    # Convert IDs to string for matching
+    pred_ids = pred_df[id_col].astype(str)
+    dys_ids_str = [str(id_val) for id_val in dys_ids]
+    
+    # Filter to Dys IDs only
+    filtered_df = pred_df[pred_ids.isin(dys_ids_str)]
+    
+    # Deduplicate by ID to get unique speakers (remove cross-validation folds)
+    if len(filtered_df) > 0 and id_col in filtered_df.columns:
+        filtered_df = filtered_df.drop_duplicates(subset=[id_col], keep='first')
+    
+    n_samples = len(filtered_df)
+    print(f"  Filtered to {n_samples} unique Dys samples (from {len(dys_ids)} Dys IDs)")
+    
+    return filtered_df, n_samples
+
+
+# =======================================================================
 #  METRIC LOADING FUNCTIONS
 # =======================================================================
 
@@ -346,6 +466,63 @@ def extract_metrics_from_result(result: Dict, task: str) -> Dict:
                     extracted[f'non_subgroup_{key}'] = value
     
     return extracted
+
+
+def load_predictions_file(file_path: Path) -> Optional[pd.DataFrame]:
+    """Load predictions from CSV file."""
+    if not file_path or not file_path.exists():
+        return None
+    try:
+        return pd.read_csv(file_path)
+    except Exception as e:
+        return None
+
+
+def load_subgroup_predictions(experiments: Dict, model_name: str, method_key: str,
+                              dys_ids: List[str] = None) -> Optional[pd.DataFrame]:
+    """
+    Load predictions for a specific model and method.
+    Filters for Dys subgroup if dys_ids are provided.
+    """
+    if model_name not in experiments:
+        return None
+    
+    model_data = experiments[model_name]
+    
+    # Try to find prediction file
+    pred_key = f'predictions_{method_key}'
+    if pred_key in model_data:
+        pred_file = model_data[pred_key].get('predictions_file')
+        if pred_file and pred_file.exists():
+            df = load_predictions_file(pred_file)
+            if df is not None and dys_ids:
+                df, n = filter_predictions_by_dys_ids(df, dys_ids)
+            return df
+    
+    # Try meta_fusion directory
+    meta_fusion_dir = Path(model_data.get('meta_fusion', {}).get('dir', '')) / 'fusion_results' / 'meta_fusion'
+    if meta_fusion_dir.exists():
+        pred_files = list(meta_fusion_dir.glob(f"*{method_key}*_predictions.csv"))
+        pred_files.extend(meta_fusion_dir.glob(f"*{method_key}*_predictions.txt"))
+        for pred_file in pred_files:
+            df = load_predictions_file(pred_file)
+            if df is not None:
+                if dys_ids:
+                    df, n = filter_predictions_by_dys_ids(df, dys_ids)
+                return df
+    
+    # Try leakage_safe_5fold directory
+    leakage_dir = Path(model_data.get('audio_only', {}).get('dir', '')) / 'fusion_results' / 'leakage_safe_5fold'
+    if leakage_dir.exists():
+        pred_files = list(leakage_dir.glob(f"*{method_key}*_predictions.csv"))
+        for pred_file in pred_files:
+            df = load_predictions_file(pred_file)
+            if df is not None:
+                if dys_ids:
+                    df, n = filter_predictions_by_dys_ids(df, dys_ids)
+                return df
+    
+    return None
 
 
 # =======================================================================
@@ -473,6 +650,21 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
                                 'ensemble_method': ensemble
                             }
                             print(f"    ✓ Found ensemble: {ensemble}")
+            
+            # Look for prediction files
+            pred_files = list(meta_fusion_dir.glob("*_predictions.csv"))
+            pred_files.extend(meta_fusion_dir.glob("*_predictions.txt"))
+            for pred_file in pred_files:
+                experiments[model_name][f'predictions_{pred_file.stem}'] = {
+                    'task': task,
+                    'model': model_name,
+                    'size': size,
+                    'family': family,
+                    'predictions_file': pred_file,
+                    'dir': folder_path,
+                    'source': 'predictions'
+                }
+                print(f"    ✓ Found predictions: {pred_file.name}")
         else:
             print(f"    ✗ meta_fusion NOT found")
         
@@ -500,11 +692,14 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
             regression_models += 1
         
         print(f"\nTask: {task}, Model: {model_key}")
-        method_count = len([m for m in model_data.keys() if not m.startswith('ensemble_')])
+        method_count = len([m for m in model_data.keys() if not m.startswith('ensemble_') and not m.startswith('predictions_')])
         ensemble_count = len([m for m in model_data.keys() if m.startswith('ensemble_')])
+        pred_count = len([m for m in model_data.keys() if m.startswith('predictions_')])
         print(f"  {method_count} fusion methods")
         if ensemble_count > 0:
             print(f"  {ensemble_count} ensemble methods")
+        if pred_count > 0:
+            print(f"  {pred_count} prediction files")
         total_methods += method_count + ensemble_count
     
     print(f"\nTotal: {len(experiments)} models ({classification_models} classification, {regression_models} regression)")
@@ -534,6 +729,9 @@ def aggregate_experiment_results(experiments: Dict, config: ExperimentConfig) ->
                 break
         
         for method_key, method_data in model_data.items():
+            if method_key.startswith('predictions_'):
+                continue
+                
             metrics_file = method_data.get('metrics_file')
             if metrics_file is None:
                 continue
@@ -646,21 +844,267 @@ def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config:
 
 
 # =======================================================================
+#  SCATTER PLOT FUNCTIONS
+# =======================================================================
+
+def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dict, output_dir: Path, 
+                                                config: ExperimentConfig, task_type: str = 'regression',
+                                                dys_ids: List[str] = None):
+    """
+    Create a single figure with three scatter plots for Dys subgroup showing:
+    - Audio-Only: ECAS Observed vs ECAS Predicted (using the only audio model)
+    - Best Text-Only: ECAS Observed vs ECAS Predicted (using the best text model by RMSE)
+    - Best Fusion: ECAS Observed vs ECAS Predicted (using the best fusion model by RMSE)
+    """
+    if task_type != 'regression':
+        print("Scatter plots only available for regression tasks")
+        return
+    
+    plot_df = df[df['Task'] == 'regression'].copy()
+    if plot_df.empty:
+        print("No regression data found")
+        return
+    
+    if dys_ids:
+        print(f"\nUsing Dys subgroup with {len(dys_ids)} speaker IDs")
+    else:
+        print("\n⚠ No Dys speaker IDs provided. Using all data (not filtering).")
+    
+    models = plot_df['Model'].unique()
+    print(f"\nFound {len(models)} models for regression")
+    
+    # ===== Find the BEST text-only model (by Dys RMSE) =====
+    best_text_model = None
+    best_text_method = None
+    best_text_rmse = float('inf')
+    best_text_r2 = -float('inf')
+    
+    # ===== Find the BEST fusion model (by Dys RMSE) =====
+    best_fusion_model = None
+    best_fusion_method = None
+    best_fusion_rmse = float('inf')
+    best_fusion_r2 = -float('inf')
+    
+    for model in models:
+        model_df = plot_df[plot_df['Model'] == model]
+        
+        # Find best text-only method for this model
+        text_methods = [m for m in model_df['Method'].unique() if 'text' in m.lower()]
+        for method in text_methods:
+            method_df = model_df[model_df['Method'] == method]
+            if 'subgroup_rmse' in method_df.columns and method_df['subgroup_rmse'].notna().any():
+                rmse_val = method_df['subgroup_rmse'].mean()
+                r2_val = method_df['subgroup_r2'].mean() if 'subgroup_r2' in method_df.columns else -float('inf')
+                if rmse_val < best_text_rmse:
+                    best_text_rmse = rmse_val
+                    best_text_r2 = r2_val
+                    best_text_model = model
+                    best_text_method = method
+        
+        # Find best fusion method for this model (not audio_only, not text_only)
+        fusion_methods = [m for m in model_df['Method'].unique() 
+                         if m not in ['audio_only'] and not m.startswith('ensemble_') 
+                         and 'text' not in m.lower()]
+        for method in fusion_methods:
+            method_df = model_df[model_df['Method'] == method]
+            if 'subgroup_rmse' in method_df.columns and method_df['subgroup_rmse'].notna().any():
+                rmse_val = method_df['subgroup_rmse'].mean()
+                r2_val = method_df['subgroup_r2'].mean() if 'subgroup_r2' in method_df.columns else -float('inf')
+                if rmse_val < best_fusion_rmse:
+                    best_fusion_rmse = rmse_val
+                    best_fusion_r2 = r2_val
+                    best_fusion_model = model
+                    best_fusion_method = method
+    
+    print(f"\nBest Text-Only: {best_text_model} - {best_text_method} (RMSE={best_text_rmse:.3f}, R²={best_text_r2:.3f})")
+    print(f"Best Fusion: {best_fusion_model} - {best_fusion_method} (RMSE={best_fusion_rmse:.3f}, R²={best_fusion_r2:.3f})")
+    
+    # Audio-Only: just use 'audio_only'
+    audio_method = 'audio_only'
+    audio_model = None
+    for model in models:
+        model_df = plot_df[plot_df['Model'] == model]
+        if audio_method in model_df['Method'].unique():
+            audio_model = model
+            break
+    
+    # Create a single figure with 3 subplots
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    method_types = [
+        ('audio_only', 'Audio-Only', axes[0], '#E74C3C', 'o', audio_model, audio_method),
+        ('text_only', 'Best Text-Only', axes[1], '#3498DB', 's', best_text_model, best_text_method),
+        ('fusion', 'Best Fusion', axes[2], '#2ECC71', '^', best_fusion_model, best_fusion_method)
+    ]
+    
+    all_predictions = {}
+    
+    for method_type, display_name, ax, color, marker, model, method in method_types:
+        if model is None or method is None:
+            print(f"\n⚠ No model found for {display_name}")
+            ax.text(0.5, 0.5, f'No model found\nfor {display_name}', 
+                   horizontalalignment='center', verticalalignment='center',
+                   transform=ax.transAxes, fontsize=12)
+            ax.set_xlabel('ECAS Observed', fontsize=12)
+            ax.set_ylabel('ECAS Predicted', fontsize=12)
+            ax.set_title(f'{display_name}\nDys Subgroup', fontsize=13, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            continue
+        
+        print(f"\n{'='*50}")
+        print(f"Collecting {display_name} predictions...")
+        print(f"  Model: {get_short_model_name(model, config)} ({model})")
+        print(f"  Method: {method}")
+        print(f"{'='*50}")
+        
+        # Try to load predictions for this specific model and method
+        pred_df = load_subgroup_predictions(experiments, model, method, dys_ids)
+        
+        if pred_df is not None:
+            print(f"  Found predictions with {len(pred_df)} Dys samples")
+            
+            # Find observed, predicted, and speaker ID columns
+            obs_col = None
+            pred_col = None
+            id_col = None
+            
+            for col in pred_df.columns:
+                col_lower = col.lower()
+                if any(x in col_lower for x in ['observed', 'true', 'actual', 'target', 'y_true']):
+                    obs_col = col
+                if any(x in col_lower for x in ['predicted', 'pred', 'y_pred', 'output']):
+                    pred_col = col
+                if any(x in col_lower for x in ['speaker', 'participant', 'subject', 'patient', 'id']):
+                    id_col = col
+            
+            if obs_col is not None and pred_col is not None:
+                # Get data
+                if id_col is not None:
+                    # Use speaker ID to deduplicate (in case of multiple folds)
+                    pred_df = pred_df.drop_duplicates(subset=[id_col], keep='first')
+                    obs_vals = pred_df[obs_col].values
+                    pred_vals = pred_df[pred_col].values
+                else:
+                    obs_vals = pred_df[obs_col].values
+                    pred_vals = pred_df[pred_col].values
+                
+                # Remove NaN values
+                mask = ~(np.isnan(obs_vals) | np.isnan(pred_vals))
+                obs_vals = obs_vals[mask]
+                pred_vals = pred_vals[mask]
+                
+                if len(obs_vals) > 0:
+                    print(f"  ✅ Extracted {len(obs_vals)} Dys samples")
+                    
+                    # Calculate metrics
+                    rmse = np.sqrt(np.mean((obs_vals - pred_vals) ** 2))
+                    r2 = pearsonr(obs_vals, pred_vals)[0] ** 2 if len(obs_vals) > 2 else np.nan
+                    n = len(obs_vals)
+                    
+                    # Scatter plot
+                    ax.scatter(obs_vals, pred_vals, alpha=0.5, s=30, color=color, marker=marker, 
+                              label=f'n={n}, RMSE={rmse:.3f}, R²={r2:.3f}')
+                    
+                    # Add identity line
+                    min_val = min(obs_vals.min(), pred_vals.min())
+                    max_val = max(obs_vals.max(), pred_vals.max())
+                    margin = (max_val - min_val) * 0.1
+                    ax.plot([min_val - margin, max_val + margin], 
+                           [min_val - margin, max_val + margin], 
+                           'k--', alpha=0.5, linewidth=1.5)
+                    
+                    # Add regression line
+                    if len(obs_vals) > 2:
+                        slope, intercept, r_value, p_value, std_err = linregress(obs_vals, pred_vals)
+                        x_line = np.linspace(min_val - margin, max_val + margin, 100)
+                        y_line = slope * x_line + intercept
+                        ax.plot(x_line, y_line, color='red', alpha=0.5, linewidth=1, 
+                               label=f'y={slope:.2f}x+{intercept:.2f}')
+                    
+                    ax.set_xlabel('ECAS Observed', fontsize=12)
+                    ax.set_ylabel('ECAS Predicted', fontsize=12)
+                    ax.set_title(f'{display_name}\nDys Subgroup', fontsize=13, fontweight='bold')
+                    ax.legend(loc='best', fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                    ax.set_aspect('equal', adjustable='box')
+                    
+                    # Set equal limits
+                    ax.set_xlim(min_val - margin, max_val + margin)
+                    ax.set_ylim(min_val - margin, max_val + margin)
+                    
+                    # Store predictions
+                    all_predictions[method_type] = {
+                        'model': model,
+                        'method': method,
+                        'obs': obs_vals,
+                        'pred': pred_vals,
+                        'rmse': rmse,
+                        'r2': r2,
+                        'n': n
+                    }
+                else:
+                    print(f"  ⚠ No valid samples found")
+                    ax.text(0.5, 0.5, f'No valid samples', 
+                           horizontalalignment='center', verticalalignment='center',
+                           transform=ax.transAxes, fontsize=12)
+            else:
+                print(f"  ⚠ Could not find obs/pred columns")
+                print(f"  Available columns: {pred_df.columns.tolist()}")
+                ax.text(0.5, 0.5, f'No obs/pred columns', 
+                       horizontalalignment='center', verticalalignment='center',
+                       transform=ax.transAxes, fontsize=12)
+        else:
+            print(f"  ⚠ No predictions file found")
+            ax.text(0.5, 0.5, f'No predictions file', 
+                   horizontalalignment='center', verticalalignment='center',
+                   transform=ax.transAxes, fontsize=12)
+        
+        ax.set_xlabel('ECAS Observed', fontsize=12)
+        ax.set_ylabel('ECAS Predicted', fontsize=12)
+        ax.set_title(f'{display_name}\nDys Subgroup', fontsize=13, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'dys_scatter_audio_text_fusion_single.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"\n✓ Dys scatter plot saved to: {output_dir / 'dys_scatter_audio_text_fusion_single.png'}")
+    
+    # Create summary table
+    if all_predictions:
+        summary_data = []
+        for method_type, data in all_predictions.items():
+            display_name = {'audio_only': 'Audio-Only', 'text_only': 'Best Text-Only', 'fusion': 'Best Fusion'}[method_type]
+            summary_data.append({
+                'Method': display_name,
+                'Model': get_short_model_name(data['model'], config),
+                'Model_Full': data['model'],
+                'Method_Used': get_method_display_name(data['method'], config),
+                'Method_Key': data['method'],
+                'RMSE': data['rmse'],
+                'R²': data['r2'],
+                'N': data['n']
+            })
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_csv(output_dir / 'dys_scatter_summary.csv', index=False)
+        print(f"✓ Dys scatter summary saved to: {output_dir / 'dys_scatter_summary.csv'}")
+        
+        print("\n  Dys Scatter Plot Summary:")
+        for _, row in summary_df.iterrows():
+            print(f"    {row['Method']}:")
+            print(f"      Model: {row['Model']} ({row['Model_Full']})")
+            print(f"      Method: {row['Method_Used']} ({row['Method_Key']})")
+            print(f"      RMSE: {row['RMSE']:.3f}, R²: {row['R²']:.3f}, n: {row['N']}")
+    
+    return all_predictions
+
+
+# =======================================================================
 #  BOOTSTRAP CONFIDENCE INTERVALS
 # =======================================================================
 
 def bootstrap_ci(data: np.ndarray, n_iterations: int = 1000, ci: float = 0.95) -> Tuple[float, float, float]:
-    """
-    Compute bootstrap confidence intervals for a metric.
-    
-    Args:
-        data: Array of values
-        n_iterations: Number of bootstrap iterations
-        ci: Confidence interval level (default 0.95)
-    
-    Returns:
-        Tuple of (mean, lower_ci, upper_ci)
-    """
+    """Compute bootstrap confidence intervals for a metric."""
     if len(data) == 0 or np.all(np.isnan(data)):
         return np.nan, np.nan, np.nan
     
@@ -677,7 +1121,6 @@ def bootstrap_ci(data: np.ndarray, n_iterations: int = 1000, ci: float = 0.95) -
     
     bootstrap_means = np.array(bootstrap_means)
     
-    # Handle case where all bootstrap means are the same
     if np.all(bootstrap_means == bootstrap_means[0]):
         mean = bootstrap_means[0]
         lower = mean
@@ -687,7 +1130,6 @@ def bootstrap_ci(data: np.ndarray, n_iterations: int = 1000, ci: float = 0.95) -
         lower = np.percentile(bootstrap_means, (1 - ci) / 2 * 100)
         upper = np.percentile(bootstrap_means, (1 + ci) / 2 * 100)
     
-    # Ensure lower and upper are finite
     if not np.isfinite(lower):
         lower = mean - 0.01
     if not np.isfinite(upper):
@@ -698,19 +1140,7 @@ def bootstrap_ci(data: np.ndarray, n_iterations: int = 1000, ci: float = 0.95) -
 
 def compute_confidence_intervals(df: pd.DataFrame, metric: str, group_cols: List[str], 
                                   n_iterations: int = 1000, ci: float = 0.95) -> pd.DataFrame:
-    """
-    Compute bootstrap confidence intervals for grouped data.
-    
-    Args:
-        df: DataFrame with results
-        metric: Metric to compute CI for
-        group_cols: Columns to group by
-        n_iterations: Number of bootstrap iterations
-        ci: Confidence interval level
-    
-    Returns:
-        DataFrame with mean, lower_ci, upper_ci for each group
-    """
+    """Compute bootstrap confidence intervals for grouped data."""
     results = []
     
     for name, group in df.groupby(group_cols):
@@ -728,7 +1158,6 @@ def compute_confidence_intervals(df: pd.DataFrame, metric: str, group_cols: List
         row[f'{metric}_std'] = np.nanstd(values) if len(values) > 0 else np.nan
         row['n_samples'] = len(values)
         
-        # Only add valid rows
         if not np.isnan(mean) and not np.isnan(lower) and not np.isnan(upper):
             results.append(row)
     
@@ -736,31 +1165,110 @@ def compute_confidence_intervals(df: pd.DataFrame, metric: str, group_cols: List
 
 
 # =======================================================================
-#  ABLATION ANALYSIS
+#  BOOTSTRAP SUMMARY FUNCTION
 # =======================================================================
 
-def perform_ablation_analysis(df: pd.DataFrame, config: ExperimentConfig, 
-                             task_type: str = 'classification') -> Dict:
-    """
-    Perform ablation analysis: compare full model vs removing each component.
+def print_bootstrap_summary(ci_df: pd.DataFrame, metric: str, config: ExperimentConfig, 
+                            task_type: str = 'classification'):
+    """Print a summary of bootstrap confidence intervals."""
+    if ci_df.empty:
+        print(f"\n  No bootstrap results for {task_type}")
+        return
     
-    Returns:
-        Dictionary with ablation results for each component
+    base_metric = metric.replace('_mean', '')
+    metric_label = config.metric_labels.get(base_metric, base_metric.upper())
+    
+    print(f"\n  {'='*50}")
+    print(f"  BOOTSTRAP SUMMARY: {task_type.upper()} - {metric_label}")
+    print(f"  {'='*50}")
+    print(f"  Bootstrap iterations: {ci_df['n_samples'].max() if not ci_df.empty else 'N/A'}")
+    print(f"  Total model-method combinations: {len(ci_df)}")
+    
+    # Best performing combination
+    if base_metric in ['rmse']:
+        best_idx = ci_df[f'{base_metric}_mean'].idxmin()
+    else:
+        best_idx = ci_df[f'{base_metric}_mean'].idxmax()
+    
+    best_row = ci_df.loc[best_idx]
+    print(f"\n  Best performing combination:")
+    print(f"    Model: {best_row['Model']}")
+    print(f"    Method: {best_row['Method_Label']}")
+    print(f"    {metric_label}: {best_row[f'{base_metric}_mean']:.4f} (95% CI: {best_row[f'{base_metric}_lower_ci']:.4f} - {best_row[f'{base_metric}_upper_ci']:.4f})")
+    
+    # Best model across all methods
+    model_means = ci_df.groupby('Model')[f'{base_metric}_mean'].mean()
+    if base_metric in ['rmse']:
+        best_model = model_means.idxmin()
+        best_model_score = model_means.min()
+    else:
+        best_model = model_means.idxmax()
+        best_model_score = model_means.max()
+    print(f"\n  Best model (averaged across methods):")
+    print(f"    Model: {best_model}")
+    print(f"    Avg {metric_label}: {best_model_score:.4f}")
+    
+    # Best method across all models
+    method_means = ci_df.groupby('Method_Label')[f'{base_metric}_mean'].mean()
+    if base_metric in ['rmse']:
+        best_method = method_means.idxmin()
+        best_method_score = method_means.min()
+    else:
+        best_method = method_means.idxmax()
+        best_method_score = method_means.max()
+    print(f"\n  Best method (averaged across models):")
+    print(f"    Method: {best_method}")
+    print(f"    Avg {metric_label}: {best_method_score:.4f}")
+    
+    # CI width summary
+    ci_widths = ci_df[f'{base_metric}_upper_ci'] - ci_df[f'{base_metric}_lower_ci']
+    print(f"\n  Confidence Interval Widths:")
+    print(f"    Min: {ci_widths.min():.4f}")
+    print(f"    Max: {ci_widths.max():.4f}")
+    print(f"    Mean: {ci_widths.mean():.4f}")
+    print(f"    Std: {ci_widths.std():.4f}")
+
+
+# =======================================================================
+#  ABLATION ANALYSIS - USING ALL PATIENTS DATA (NOT SUBGROUPS)
+# =======================================================================
+
+def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentConfig, 
+                                          task_type: str = 'classification', verbose: bool = True) -> Dict:
+    """
+    Perform ablation analysis using ALL patients data (not subgroups).
+    Compares each method against the best method using overall metrics.
     """
     if task_type == 'classification':
         metric = config.ranking_metric_classification
         lower_is_better = False
+        metric_name = 'macro_f1'
     else:
         metric = config.ranking_metric_regression
         lower_is_better = True
+        metric_name = 'r2'
     
     task_df = df[df['Task'] == task_type]
     if task_df.empty:
         return {}
     
+    # Filter to methods that have the overall metric
+    task_df = task_df[task_df[metric_name].notna()].copy()
+    
+    if task_df.empty:
+        if verbose:
+            print(f"  Warning: No methods with {metric_name} for {task_type}")
+        return {}
+    
     all_methods = task_df['Method_Label'].unique()
     
-    method_performance = task_df.groupby('Method_Label')[metric].mean()
+    if verbose:
+        print(f"\n  Methods with {metric_name} for {task_type}: {len(all_methods)}")
+        for m in sorted(all_methods):
+            print(f"    ✓ {m}")
+    
+    # Find best method using the ranking metric
+    method_performance = task_df.groupby('Method_Label')[metric_name].mean()
     if lower_is_better:
         best_method = method_performance.idxmin()
         best_score = method_performance.min()
@@ -768,7 +1276,11 @@ def perform_ablation_analysis(df: pd.DataFrame, config: ExperimentConfig,
         best_method = method_performance.idxmax()
         best_score = method_performance.max()
     
+    if verbose:
+        print(f"\n  Best method: {best_method} ({best_score:.4f})")
+    
     ablation_results = []
+    skipped_methods = []
     
     for method in all_methods:
         if method == best_method:
@@ -777,32 +1289,42 @@ def perform_ablation_analysis(df: pd.DataFrame, config: ExperimentConfig,
         method_df = task_df[task_df['Method_Label'] == method]
         best_df = task_df[task_df['Method_Label'] == best_method]
         
+        # Get paired data
         method_values = []
         best_values = []
+        paired_models = []
         
         for model in method_df['Model'].unique():
-            m_val = method_df[method_df['Model'] == model][metric].values
-            b_val = best_df[best_df['Model'] == model][metric].values
+            m_val = method_df[method_df['Model'] == model][metric_name].values
+            b_val = best_df[best_df['Model'] == model][metric_name].values
             
             if len(m_val) > 0 and len(b_val) > 0 and not np.isnan(m_val[0]) and not np.isnan(b_val[0]):
                 method_values.append(m_val[0])
                 best_values.append(b_val[0])
+                paired_models.append(model)
         
         if len(method_values) < 2:
+            skipped_methods.append((method, f"only {len(method_values)} paired samples"))
             continue
         
         method_values = np.array(method_values)
         best_values = np.array(best_values)
         
+        # Calculate difference (positive means best is better)
         diff = best_values - method_values if not lower_is_better else method_values - best_values
         
-        t_stat, p_value_ttest = ttest_rel(best_values, method_values)
+        # Statistical tests
+        try:
+            t_stat, p_value_ttest = ttest_rel(best_values, method_values)
+        except:
+            t_stat, p_value_ttest = np.nan, np.nan
         
         try:
             w_stat, p_value_wilcoxon = wilcoxon(best_values, method_values)
         except:
             w_stat, p_value_wilcoxon = np.nan, np.nan
         
+        # Effect size
         pooled_std = np.sqrt((np.std(best_values, ddof=1)**2 + np.std(method_values, ddof=1)**2) / 2)
         effect_size = np.mean(diff) / pooled_std if pooled_std > 0 else np.nan
         
@@ -818,116 +1340,56 @@ def perform_ablation_analysis(df: pd.DataFrame, config: ExperimentConfig,
             'p_value_wilcoxon': p_value_wilcoxon,
             'effect_size': effect_size,
             'n_pairs': len(method_values),
-            'significant': p_value_ttest < 0.05
+            'paired_models': paired_models,
+            'significant': p_value_ttest < 0.05 if not np.isnan(p_value_ttest) else False
         })
+    
+    if verbose and skipped_methods:
+        print(f"\n  Skipped methods (insufficient paired data):")
+        for method, reason in skipped_methods:
+            print(f"    ✗ {method}: {reason}")
     
     ablation_df = pd.DataFrame(ablation_results)
     if not ablation_df.empty:
         ablation_df = ablation_df.sort_values('Difference', ascending=False)
+        if verbose:
+            print(f"\n  Included in ablation analysis: {len(ablation_df)} methods")
     
     return {
         'best_method': best_method,
         'best_score': best_score,
         'ablation_results': ablation_df,
         'metric': metric,
-        'lower_is_better': lower_is_better
+        'metric_name': metric_name,
+        'lower_is_better': lower_is_better,
+        'skipped_methods': skipped_methods
     }
 
 
-# =======================================================================
-#  ROBUSTNESS VISUALIZATIONS
-# =======================================================================
-
-def plot_confidence_intervals(ci_df: pd.DataFrame, metric: str, output_dir: Path, 
-                              config: ExperimentConfig, task_type: str = 'classification',
-                              title: str = None):
-    """Plot confidence intervals for each model-method combination."""
-    if ci_df.empty:
-        print(f"Warning: No CI data for {metric}")
-        return
-    
-    base_metric = metric.replace('_mean', '')
-    
-    # Clean data - remove rows with NaN or invalid values
-    ci_df = ci_df.dropna(subset=[f'{base_metric}_mean', f'{base_metric}_lower_ci', f'{base_metric}_upper_ci'])
-    
-    if ci_df.empty:
-        print(f"Warning: No valid CI data after cleaning for {metric}")
-        return
-    
-    fig, ax = plt.subplots(figsize=(14, max(6, len(ci_df) * 0.3)))
-    
-    ci_df = ci_df.sort_values(f'{base_metric}_mean', ascending=False)
-    
-    labels = [f"{row['Model']} - {row['Method_Label']}" for _, row in ci_df.iterrows()]
-    
-    y_pos = np.arange(len(ci_df))
-    means = ci_df[f'{base_metric}_mean'].values
-    lower = ci_df[f'{base_metric}_lower_ci'].values
-    upper = ci_df[f'{base_metric}_upper_ci'].values
-    
-    # Ensure lower <= upper and values are finite
-    lower = np.maximum(lower, means - 10)  # Prevent extreme negative values
-    upper = np.minimum(upper, means + 10)
-    
-    # Calculate xerr safely
-    xerr_lower = means - lower
-    xerr_upper = upper - means
-    
-    # Replace any negative or NaN values with small positive values
-    xerr_lower = np.maximum(xerr_lower, 0.001)
-    xerr_upper = np.maximum(xerr_upper, 0.001)
-    
-    methods = ci_df['Method_Label'].unique()
-    color_map = {m: plt.cm.tab10(i % 10) for i, m in enumerate(methods)}
-    colors = [color_map[row['Method_Label']] for _, row in ci_df.iterrows()]
-    
-    ax.errorbar(means, y_pos, xerr=[xerr_lower, xerr_upper], 
-                fmt='o', color='black', capsize=3, elinewidth=1, alpha=0.3)
-    ax.scatter(means, y_pos, c=colors, s=80, alpha=0.8, zorder=3)
-    
-    metric_label = config.metric_labels.get(base_metric, base_metric.upper())
-    ax.set_xlabel(f'{metric_label} (95% CI)', fontsize=12)
-    ax.set_ylabel('Model - Method', fontsize=12)
-    
-    title_text = title or f'{metric_label} with 95% Confidence Intervals ({task_type.title()})'
-    ax.set_title(title_text, fontsize=14, fontweight='bold')
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.grid(True, alpha=0.3, axis='x')
-    
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor=color, label=method) for method, color in color_map.items()]
-    ax.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
-    
-    plt.tight_layout()
-    plt.subplots_adjust(right=0.7)
-    task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'confidence_intervals_{base_metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Confidence intervals saved to: {output_dir / f'confidence_intervals_{base_metric}{task_suffix}.png'}")
-
-def plot_ablation_results(ablation_data: Dict, output_dir: Path, config: ExperimentConfig,
-                         task_type: str = 'classification'):
-    """Plot ablation study results."""
+def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, config: ExperimentConfig,
+                                       task_type: str = 'classification'):
+    """Plot ablation study results using ALL patients data."""
     ablation_df = ablation_data['ablation_results']
     if ablation_df.empty:
         print("Warning: No ablation data to plot")
         return
     
-    metric = ablation_data['metric']
-    metric_label = config.metric_labels.get(metric, metric.upper())
+    metric_label = config.metric_labels.get(ablation_data['metric_name'], ablation_data['metric_name'].upper())
     best_method = ablation_data['best_method']
     
+    # Create figure with two subplots
     fig, axes = plt.subplots(1, 2, figsize=(16, max(6, len(ablation_df) * 0.4)))
     
+    # Sort by difference
     ablation_df = ablation_df.sort_values('Difference', ascending=False)
     
+    # ===== Plot 1: Performance Difference =====
     ax1 = axes[0]
     colors = ['#2ECC71' if row['significant'] else '#E74C3C' for _, row in ablation_df.iterrows()]
     
     bars = ax1.barh(ablation_df['Removed_Component'], ablation_df['Difference'], color=colors, alpha=0.7)
     
+    # Add value labels
     for bar, val in zip(bars, ablation_df['Difference']):
         ax1.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2, 
                 f'{val:.4f}', va='center', fontsize=9)
@@ -946,21 +1408,25 @@ def plot_ablation_results(ablation_data: Dict, output_dir: Path, config: Experim
     ]
     ax1.legend(handles=legend_elements, loc='best', fontsize=9)
     
+    # ===== Plot 2: Statistical Significance =====
     ax2 = axes[1]
     
     p_values = ablation_df['p_value_ttest'].values
     significant = ablation_df['significant'].values
     
+    # Log transform p-values for better visualization
     log_p = -np.log10(p_values + 1e-10)
     
     colors2 = ['#2ECC71' if sig else '#E74C3C' for sig in significant]
     bars2 = ax2.barh(ablation_df['Removed_Component'], log_p, color=colors2, alpha=0.7)
     
+    # Add value labels
     for bar, p_val in zip(bars2, p_values):
         label = f'{p_val:.4f}' if p_val >= 0.001 else f'{p_val:.2e}'
         ax2.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height()/2, 
                 label, va='center', fontsize=8)
     
+    # Add significance threshold line
     threshold = -np.log10(0.05)
     ax2.axvline(x=threshold, color='red', linestyle='--', alpha=0.7, label='p = 0.05')
     
@@ -972,75 +1438,89 @@ def plot_ablation_results(ablation_data: Dict, output_dir: Path, config: Experim
     
     plt.tight_layout()
     task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'ablation_analysis_{task_type}.png', dpi=300, bbox_inches='tight')
+    plt.savefig(output_dir / f'ablation_analysis_all_patients_{task_type}.png', dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✓ Ablation analysis saved to: {output_dir / f'ablation_analysis_{task_type}.png'}")
+    print(f"✓ Ablation analysis (all patients) saved to: {output_dir / f'ablation_analysis_all_patients_{task_type}.png'}")
     
+    # Save summary table
     summary_cols = ['Removed_Component', 'Removed_Score', 'Difference', 
                     'p_value_ttest', 'significant', 'effect_size', 'n_pairs']
     summary_df = ablation_df[summary_cols].round(4)
-    summary_df.to_csv(output_dir / f'ablation_summary_{task_type}.csv', index=False)
-    print(f"✓ Ablation summary saved to: {output_dir / f'ablation_summary_{task_type}.csv'}")
-
-
-def plot_robustness_summary(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
-                           task_type: str = 'classification', n_iterations: int = 1000):
-    """Create comprehensive robustness summary with CIs and statistics."""
-    if df.empty:
-        print(f"Warning: Empty dataframe for task {task_type}")
-        return
-    
-    task_df = df[df['Task'] == task_type]
-    if task_df.empty:
-        print(f"Warning: No data for task {task_type}")
-        return
-    
-    if task_type == 'classification':
-        metric = config.ranking_metric_classification
-    else:
-        metric = config.ranking_metric_regression
-    
-    try:
-        ci_df = compute_confidence_intervals(
-            task_df, metric, ['Model', 'Method_Label'], 
-            n_iterations=n_iterations, ci=0.95
-        )
-        
-        if not ci_df.empty:
-            plot_confidence_intervals(ci_df, metric, output_dir, config, task_type)
-            ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv', index=False)
-            print(f"✓ Confidence intervals data saved to: {output_dir / f'confidence_intervals_{task_type}.csv'}")
-        else:
-            print(f"⚠ No confidence intervals could be computed for {task_type}")
-    except Exception as e:
-        print(f"⚠ Error computing confidence intervals for {task_type}: {e}")
-    
-    try:
-        ablation_data = perform_ablation_analysis(task_df, config, task_type)
-        
-        if ablation_data and not ablation_data['ablation_results'].empty:
-            ablation_df = ablation_data['ablation_results']
-            ablation_df.to_csv(output_dir / f'ablation_detailed_{task_type}.csv', index=False)
-            print(f"✓ Detailed ablation results saved to: {output_dir / f'ablation_detailed_{task_type}.csv'}")
-            
-            plot_ablation_results(ablation_data, output_dir, config, task_type)
-            
-            print(f"\n  Ablation Summary for {task_type.upper()}:")
-            print(f"    Best Method: {ablation_data['best_method']} ({ablation_data['best_score']:.4f})")
-            if not ablation_df.empty:
-                print(f"    Most impactful removal: {ablation_df.iloc[0]['Removed_Component']} "
-                      f"(Δ = {ablation_df.iloc[0]['Difference']:.4f}, p = {ablation_df.iloc[0]['p_value_ttest']:.4f})")
-        else:
-            print(f"⚠ No ablation results could be computed for {task_type}")
-    except Exception as e:
-        print(f"⚠ Error computing ablation analysis for {task_type}: {e}")
-    
-    return ci_df if 'ci_df' in locals() else None, ablation_data if 'ablation_data' in locals() else None
+    summary_df.to_csv(output_dir / f'ablation_summary_all_patients_{task_type}.csv', index=False)
+    print(f"✓ Ablation summary (all patients) saved to: {output_dir / f'ablation_summary_all_patients_{task_type}.csv'}")
 
 
 # =======================================================================
-#  VISUALIZATION FUNCTIONS (ORIGINAL)
+#  VISUALIZATION FUNCTIONS
 # =======================================================================
+
+def plot_confidence_intervals(ci_df: pd.DataFrame, metric: str, output_dir: Path, 
+                              config: ExperimentConfig, task_type: str = 'classification',
+                              title: str = None):
+    """Plot confidence intervals for each model-method combination."""
+    if ci_df.empty:
+        print(f"Warning: No CI data for {metric}")
+        return
+    
+    base_metric = metric.replace('_mean', '')
+    
+    ci_df = ci_df.dropna(subset=[f'{base_metric}_mean', f'{base_metric}_lower_ci', f'{base_metric}_upper_ci'])
+    
+    if ci_df.empty:
+        print(f"Warning: No valid CI data after cleaning for {metric}")
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, max(6, len(ci_df) * 0.3)))
+    
+    ci_df = ci_df.sort_values(f'{base_metric}_mean', ascending=False)
+    
+    labels = []
+    for _, row in ci_df.iterrows():
+        short_model = get_short_model_name(row['Model'], config)
+        labels.append(f"{short_model} - {row['Method_Label']}")
+    
+    y_pos = np.arange(len(ci_df))
+    means = ci_df[f'{base_metric}_mean'].values
+    lower = ci_df[f'{base_metric}_lower_ci'].values
+    upper = ci_df[f'{base_metric}_upper_ci'].values
+    
+    lower = np.maximum(lower, means - 10)
+    upper = np.minimum(upper, means + 10)
+    
+    xerr_lower = means - lower
+    xerr_upper = upper - means
+    xerr_lower = np.maximum(xerr_lower, 0.001)
+    xerr_upper = np.maximum(xerr_upper, 0.001)
+    
+    methods = ci_df['Method_Label'].unique()
+    color_map = {m: plt.cm.tab10(i % 10) for i, m in enumerate(methods)}
+    colors = [color_map[row['Method_Label']] for _, row in ci_df.iterrows()]
+    
+    ax.errorbar(means, y_pos, xerr=[xerr_lower, xerr_upper], 
+                fmt='o', color='black', capsize=3, elinewidth=1, alpha=0.3)
+    ax.scatter(means, y_pos, c=colors, s=80, alpha=0.8, zorder=3)
+    
+    metric_label = config.metric_labels.get(base_metric, base_metric.upper())
+    ax.set_xlabel(f'{metric_label} (95% CI)', fontsize=12)
+    ax.set_ylabel('Model - Method', fontsize=12)
+    
+    title_text = title or f'{metric_label} with 95% Confidence Intervals ({task_type.title()})'
+    ax.set_title(title_text, fontsize=14, fontweight='bold')
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=color, label=method) for method, color in color_map.items()]
+    ax.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(right=0.7)
+    task_suffix = f"_{task_type}"
+    plt.savefig(output_dir / f'confidence_intervals_{base_metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Confidence intervals plot saved to: {output_dir / f'confidence_intervals_{base_metric}{task_suffix}.png'}")
+
 
 def plot_method_comparison(df: pd.DataFrame, metric: str, output_dir: Path, 
                            config: ExperimentConfig, title: str = None, 
@@ -1055,10 +1535,12 @@ def plot_method_comparison(df: pd.DataFrame, metric: str, output_dir: Path,
         print(f"Warning: No data for task {task_type}")
         return
     
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    
     method_col = 'Method_Label' if 'Method_Label' in plot_df.columns else 'Method'
     
     pivot = plot_df.pivot_table(
-        index='Model',
+        index='Model_Short',
         columns=method_col,
         values=metric,
         aggfunc='mean'
@@ -1116,11 +1598,13 @@ def plot_heatmap(df: pd.DataFrame, metric: str, output_dir: Path, config: Experi
         print(f"Warning: No data for task {task_type}")
         return
     
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    
     method_col = 'Method_Label' if 'Method_Label' in plot_df.columns else 'Method'
     
     pivot = plot_df.pivot_table(
         index=method_col,
-        columns='Model',
+        columns='Model_Short',
         values=metric,
         aggfunc='mean'
     )
@@ -1172,6 +1656,8 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
         print(f"Warning: No data for task {task_type}")
         return
     
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    
     if subgroup_prefix:
         if subgroup_prefix == 'subgroup':
             sen_col = 'subgroup_sensitivity'
@@ -1194,7 +1680,7 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
         print(f"Warning: {sen_col} or {spec_col} not found")
         return
     
-    avg_data = plot_df.groupby('Model').agg({
+    avg_data = plot_df.groupby('Model_Short').agg({
         sen_col: 'mean',
         spec_col: 'mean'
     }).reset_index()
@@ -1210,7 +1696,7 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
     
     fig, axes = plt.subplots(1, 3, figsize=(18, max(6, len(avg_data) * 0.3)))
     
-    models = avg_data['Model'].values
+    models = avg_data['Model_Short'].values
     x = np.arange(len(models))
     width = 0.35
     
@@ -1311,6 +1797,8 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         print(f"Warning: No data for task {task_type}")
         return
     
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    
     subgroup_sen = 'subgroup_sensitivity'
     subgroup_spec = 'subgroup_specificity'
     non_subgroup_sen = 'non_subgroup_sensitivity'
@@ -1320,7 +1808,7 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         print(f"Warning: Subgroup Sen/Spec columns not found")
         return
     
-    avg_data = plot_df.groupby('Model').agg({
+    avg_data = plot_df.groupby('Model_Short').agg({
         subgroup_sen: 'mean',
         subgroup_spec: 'mean',
         non_subgroup_sen: 'mean',
@@ -1340,7 +1828,7 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
-    models = avg_data['Model'].values
+    models = avg_data['Model_Short'].values
     x = np.arange(len(models))
     width = 0.35
     
@@ -1516,7 +2004,10 @@ def plot_subgroup_comparison(df: pd.DataFrame, output_dir: Path, config: Experim
             print(f"  Warning: Subgroup metrics not found for {metric}")
             continue
         
-        plot_data = df[df['Task'] == task_type].groupby('Model').agg({
+        plot_data = df[df['Task'] == task_type].copy()
+        plot_data['Model_Short'] = plot_data['Model'].apply(lambda x: get_short_model_name(x, config))
+        
+        plot_data = plot_data.groupby('Model_Short').agg({
             subgroup_metric: 'mean',
             non_subgroup_metric: 'mean'
         }).reset_index()
@@ -1566,7 +2057,7 @@ def plot_subgroup_comparison(df: pd.DataFrame, output_dir: Path, config: Experim
         ax.set_xlabel('Model')
         ax.set_ylabel(metric_label)
         ax.set_xticks(x)
-        ax.set_xticklabels(plot_data['Model'], rotation=45, ha='right')
+        ax.set_xticklabels(plot_data['Model_Short'], rotation=45, ha='right')
         ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
         
@@ -1608,7 +2099,9 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
             print(f"  Warning: No metrics found for {task}")
             continue
         
-        group_cols = ['Model']
+        task_df['Model_Short'] = task_df['Model'].apply(lambda x: get_short_model_name(x, config))
+        
+        group_cols = ['Model_Short']
         if 'Method_Label' in task_df.columns:
             group_cols.append('Method_Label')
         elif 'Method' in task_df.columns:
@@ -1618,10 +2111,10 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
             if len(group_cols) > 1:
                 summary = task_df.groupby(group_cols).agg(agg_dict)
             else:
-                summary = task_df.groupby('Model').agg(agg_dict)
+                summary = task_df.groupby('Model_Short').agg(agg_dict)
         except KeyError as e:
             print(f"  Warning: Groupby failed for {task}: {e}")
-            summary = task_df.groupby('Model').agg(agg_dict)
+            summary = task_df.groupby('Model_Short').agg(agg_dict)
         
         summary = summary.round(4)
         
@@ -1633,6 +2126,71 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
         flat_summary.columns = [f'{col[0]}_{col[1]}' for col in flat_summary.columns]
         flat_filename = f'{prefix}summary_table_flat_{task}.csv' if prefix else f'summary_table_flat_{task}.csv'
         flat_summary.reset_index().to_csv(output_dir / flat_filename, index=False)
+
+
+# =======================================================================
+#  ROBUSTNESS SUMMARY FUNCTION
+# =======================================================================
+
+def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
+                                        task_type: str = 'classification', n_iterations: int = 1000):
+    """Create comprehensive robustness summary with CIs and ablation using ALL patients."""
+    if df.empty:
+        print(f"Warning: Empty dataframe for task {task_type}")
+        return
+    
+    task_df = df[df['Task'] == task_type]
+    if task_df.empty:
+        print(f"Warning: No data for task {task_type}")
+        return
+    
+    if task_type == 'classification':
+        metric = config.ranking_metric_classification
+    else:
+        metric = config.ranking_metric_regression
+    
+    # Confidence intervals
+    ci_df = None
+    try:
+        ci_df = compute_confidence_intervals(
+            task_df, metric, ['Model', 'Method_Label'], 
+            n_iterations=n_iterations, ci=0.95
+        )
+        
+        if not ci_df.empty:
+            # Save full CI data
+            ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv', index=False)
+            print(f"✓ Confidence intervals data saved to: {output_dir / f'confidence_intervals_{task_type}.csv'}")
+            
+            # Plot confidence intervals
+            plot_confidence_intervals(ci_df, metric, output_dir, config, task_type)
+            
+            # Print bootstrap summary
+            print_bootstrap_summary(ci_df, metric, config, task_type)
+        else:
+            print(f"⚠ No confidence intervals could be computed for {task_type}")
+    except Exception as e:
+        print(f"⚠ Error computing confidence intervals for {task_type}: {e}")
+    
+    # Ablation analysis using ALL patients
+    try:
+        ablation_data = perform_ablation_analysis_all_patients(task_df, config, task_type)
+        
+        if ablation_data and not ablation_data['ablation_results'].empty:
+            plot_ablation_results_all_patients(ablation_data, output_dir, config, task_type)
+            
+            ablation_df = ablation_data['ablation_results']
+            print(f"\n  Ablation Summary for {task_type.upper()} (ALL Patients):")
+            print(f"    Best method: {ablation_data['best_method']} ({ablation_data['best_score']:.4f})")
+            if not ablation_df.empty:
+                print(f"    Most impactful removal: {ablation_df.iloc[0]['Removed_Component']} "
+                      f"(Δ = {ablation_df.iloc[0]['Difference']:.4f}, p = {ablation_df.iloc[0]['p_value_ttest']:.4f})")
+        else:
+            print(f"⚠ No ablation results could be computed for {task_type}")
+    except Exception as e:
+        print(f"⚠ Error computing ablation analysis for {task_type}: {e}")
+    
+    return ci_df, ablation_data
 
 
 # =======================================================================
@@ -1659,10 +2217,14 @@ def main():
                         help='Metrics to include in figures')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Select top K models based on ranking metric')
+    parser.add_argument('--dys-ids', type=str, default=None,
+                        help='Text file with Dys speaker IDs (one per line)')
     parser.add_argument('--bootstrap-iterations', type=int, default=1000,
                         help='Number of bootstrap iterations for confidence intervals (default: 1000)')
     parser.add_argument('--no-robustness', action='store_true',
                         help='Skip robustness analysis (CI and ablation)')
+    parser.add_argument('--no-scatter', action='store_true',
+                        help='Skip scatter plots for Dys subgroup')
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed progress information')
     parser.add_argument('--no-plots', action='store_true',
@@ -1677,6 +2239,16 @@ def main():
     
     config = ExperimentConfig()
     config.bootstrap_iterations = args.bootstrap_iterations
+    
+    # Load Dys speaker IDs if provided
+    dys_ids = []
+    if args.dys_ids:
+        dys_ids = load_dys_speaker_ids(Path(args.dys_ids))
+        if not dys_ids:
+            print("Warning: No Dys speaker IDs loaded. Scatter plots will use all data.")
+    else:
+        print("\nNo Dys speaker ID file provided. Scatter plots will use all data.")
+        print("To filter for Dys subgroup, provide --dys-ids with a file containing speaker IDs.")
     
     base_dir = Path(args.input_dir)
     experiments = discover_experiments(base_dir, args.task, config)
@@ -1767,10 +2339,10 @@ def main():
     
     create_summary_table(df, output_dir, config)
     
-    # ===== ROBUSTNESS ANALYSIS =====
+    # ===== ROBUSTNESS ANALYSIS (ALL PATIENTS) =====
     if not args.no_robustness:
         print(f"\n{'='*60}")
-        print(f"ROBUSTNESS ANALYSIS (Bootstrap CI & Ablation)")
+        print(f"ROBUSTNESS ANALYSIS (Bootstrap CI & Ablation - ALL Patients)")
         print(f"{'='*60}")
         print(f"Bootstrap iterations: {args.bootstrap_iterations}")
         
@@ -1778,7 +2350,14 @@ def main():
         
         for task in tasks_to_process:
             print(f"\nProcessing {task} task...")
-            plot_robustness_summary(df, output_dir, config, task, args.bootstrap_iterations)
+            plot_robustness_summary_all_patients(df, output_dir, config, task, args.bootstrap_iterations)
+    
+    # ===== SCATTER PLOTS FOR DYS SUBGROUP =====
+    if not args.no_scatter and 'regression' in df['Task'].unique():
+        print(f"\n{'='*60}")
+        print(f"GENERATING DYS SCATTER PLOTS")
+        print(f"{'='*60}")
+        plot_dys_scatter_audio_text_fusion_single(df, experiments, output_dir, config, 'regression', dys_ids)
     
     # ===== PLOTS =====
     if not args.no_plots:
@@ -1845,7 +2424,8 @@ def main():
             else:
                 best_by_model = best_by_model.sort_values(ascending=False)
             for model, val in best_by_model.head(5).items():
-                print(f"    {model}: {val:.4f}")
+                short_name = get_short_model_name(model, config)
+                print(f"    {short_name}: {val:.4f}")
             
             if args.subgroup:
                 subgroup_metric = f'subgroup_{ranking_metric}'
@@ -1873,7 +2453,10 @@ def main():
     print(f"{'='*60}")
     print(f"\nAdditional outputs:")
     print(f"  - Confidence intervals: confidence_intervals_*.csv and plots")
-    print(f"  - Ablation analysis: ablation_*.csv and plots")
+    print(f"  - Bootstrap summary printed above")
+    print(f"  - Ablation analysis (ALL patients): ablation_*_all_patients_*.csv and plots")
+    print(f"  - Dys scatter plots: dys_scatter_*.png")
+    print(f"  - Dys scatter summary: dys_scatter_summary.csv (includes which models were used)")
     print(f"  - Bootstrap iterations: {args.bootstrap_iterations}")
 
 
@@ -1881,5 +2464,5 @@ if __name__ == "__main__":
     main()
 
 '''
-python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate --subgroup --top-k 5 --bootstrap-iterations 10000 --ignore-methods mlp | tee outputs-ensemble-aggregate/log.txt
+python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate --subgroup --top-k 5 --bootstrap-iterations 10000 --ignore-methods mlp --verbose --dys-ids dysarthria-list.txt| tee outputs-ensemble-aggregate/log.txt
 '''
