@@ -248,30 +248,7 @@ class ExperimentConfig:
 # =======================================================================
 #  HELPER FUNCTIONS
 # =======================================================================
-
-def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
-    """Get shortened display name for a model."""
-    if model_name in config.model_name_mapping:
-        return config.model_name_mapping[model_name]
-    
-    for key, value in config.model_name_mapping.items():
-        if key in model_name or model_name in key:
-            return value
-    
-    cleaned = model_name
-    prefixes = ['microsoft.', 'google.', 'facebook/', 'allenai/', 'emilyalsentzer/']
-    for prefix in prefixes:
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
-            break
-    
-    suffixes = ['-uncased', '-cased', '-v2', '-base', '-large', '-small']
-    for suffix in suffixes:
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[:-len(suffix)]
-    
-    return cleaned.title()
-
+ 
 
 def get_method_display_name(method_key: str, config: ExperimentConfig) -> str:
     """Get display name for a method, handling all 14 methods + fuse- combinations."""
@@ -804,7 +781,7 @@ def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: Expe
     
     # Add Model_Short column - THIS WAS MISSING!
     meta_df['Model_Short'] = meta_df['Model'].apply(
-        lambda x: get_short_model_name(x, config)
+        lambda x: get_ultra_short_model_name(x, config)
     )
     
     # Filter to task
@@ -1133,7 +1110,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         
         print(f"\n{'='*50}")
         print(f"Collecting {display_name} predictions...")
-        print(f"  Model: {get_short_model_name(model, config)} ({model})")
+        print(f"  Model: {get_ultra_short_model_name(model, config)} ({model})")
         print(f"  Method: {method}")
         print(f"{'='*50}")
         
@@ -1275,7 +1252,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
             display_name = {'audio_only': 'Audio-Only', 'text_only': 'Best Text-Only', 'fusion': 'Best Fusion'}[method_type]
             summary_data.append({
                 'Method': display_name,
-                'Model': get_short_model_name(data['model'], config),
+                'Model': get_ultra_short_model_name(data['model'], config),
                 'Model_Full': data['model'],
                 'Method_Used': get_method_display_name(data['method'], config),
                 'Method_Key': data['method'],
@@ -1682,6 +1659,72 @@ def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path, con
 
     return ci_df, ablation_data
 
+def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
+    """Get shortened display name for a model."""
+    if model_name in config.model_name_mapping:
+        return config.model_name_mapping[model_name]
+    
+    for key, value in config.model_name_mapping.items():
+        if key in model_name or model_name in key:
+            return value
+    
+    cleaned = model_name
+    prefixes = ['microsoft.', 'google.', 'facebook/', 'allenai/', 'emilyalsentzer/']
+    for prefix in prefixes:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    
+    suffixes = ['-uncased', '-cased', '-v2', '-base', '-large', '-small']
+    for suffix in suffixes:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[:-len(suffix)]
+    
+    return cleaned.title()
+
+def get_ultra_short_model_name(model_name: str, config: ExperimentConfig) -> str:
+    """
+    Very compact model name for x-axis tick labels.
+    'microsoft.deberta-v3-base'  -> 'DeBERTa-B'
+    'distilroberta-base'         -> 'DistilR'
+    'roberta-large'              -> 'RoBERTa-L'
+    'bert-base-uncased'          -> 'BERT-B'
+    'bioclinicalbert'            -> 'BioClin'
+    """
+    name = get_short_model_name(model_name, config)
+
+    # Replace size words with single letters
+    replacements = [
+        ('-Base',       '-B'),
+        ('-Large',      '-L'),
+        ('-Small',      '-S'),
+        ('-base',       '-B'),
+        ('-large',      '-L'),
+        ('-small',      '-S'),
+    ]
+    for full, short in replacements:
+        name = name.replace(full, short)
+
+    # Shorten common family prefixes
+    family_map = {
+        'DistilRoBERTa': 'DistilR',
+        'BioClinicalBERT': 'BioClin',
+        'ClinicalBERT':  'ClinBERT',
+        'BioMed': 'BioMedPMed', 
+        'PubMedBERT':    'PubMed',
+        'RoBERTa':       'RoBERTa',
+        'DeBERTa':       'DeBERTa',
+        'SciBERT':       'SciBERT',
+        'LegalBERT':     'LegalB',
+        'ALBERT':        'ALBERT',
+    }
+    for full, short in family_map.items():
+        if name.startswith(full):
+            name = short + name[len(full):]
+            break
+
+    return name
+
 
 # =======================================================================
 #  ABLATION PLOT
@@ -1971,7 +2014,7 @@ def plot_confidence_intervals(ci_df: pd.DataFrame, metric: str, output_dir: Path
     
     labels = []
     for _, row in ci_df.iterrows():
-        short_model = get_short_model_name(row['Model'], config)
+        short_model = get_ultra_short_model_name(row['Model'], config)
         labels.append(f"{short_model} - {row['Method_Label']}")
     
     y_pos = np.arange(len(ci_df))
@@ -2030,7 +2073,7 @@ def plot_method_comparison(df: pd.DataFrame, metric: str, output_dir: Path,
         print(f"Warning: No data for task {task_type}")
         return
     
-    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
     
     method_col = 'Method_Label' if 'Method_Label' in plot_df.columns else 'Method'
     
@@ -2093,7 +2136,7 @@ def plot_heatmap(df: pd.DataFrame, metric: str, output_dir: Path, config: Experi
         print(f"Warning: No data for task {task_type}")
         return
     
-    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
     
     method_col = 'Method_Label' if 'Method_Label' in plot_df.columns else 'Method'
     
@@ -2151,7 +2194,7 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
         print(f"Warning: No data for task {task_type}")
         return
     
-    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
     
     sen_col_dys = 'subgroup_sensitivity'
     spec_col_dys = 'subgroup_specificity'
@@ -2242,7 +2285,7 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         print(f"Warning: No data for task {task_type}")
         return
     
-    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
+    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
     
     subgroup_sen = 'subgroup_sensitivity'
     subgroup_spec = 'subgroup_specificity'
@@ -2354,7 +2397,7 @@ def plot_subgroup_comparison(df: pd.DataFrame, output_dir: Path, config: Experim
             continue
         
         plot_data = df[df['Task'] == task_type].copy()
-        plot_data['Model_Short'] = plot_data['Model'].apply(lambda x: get_short_model_name(x, config))
+        plot_data['Model_Short'] = plot_data['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
         
         plot_data = plot_data.groupby('Model_Short').agg({
             subgroup_metric: 'mean',
@@ -2448,7 +2491,7 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
             print(f"  Warning: No metrics found for {task}")
             continue
         
-        task_df['Model_Short'] = task_df['Model'].apply(lambda x: get_short_model_name(x, config))
+        task_df['Model_Short'] = task_df['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
         
         group_cols = ['Model_Short']
         if 'Method_Label' in task_df.columns:
@@ -2729,7 +2772,7 @@ def main():
             else:
                 best_by_model = best_by_model.sort_values(ascending=False)
             for model, val in best_by_model.head(5).items():
-                short_name = get_short_model_name(model, config)
+                short_name = get_ultra_short_model_name(model, config)
                 print(f"    {short_name}: {val:.4f}")
             
             if args.subgroup:
