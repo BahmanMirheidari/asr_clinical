@@ -1582,25 +1582,133 @@ def perform_ablation_analysis_all_patients(df, config, task_type='classification
     }
 
 
+# =======================================================================
+#  ROBUSTNESS SUMMARY FUNCTION  (CI + Ablation)
+# =======================================================================
+
+def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
+                                        task_type: str = 'classification', n_iterations: int = 1000):
+    """
+    Robustness summary for a task:
+      1) Cross-model bootstrap confidence intervals per method
+      2) Ablation analysis (all patients) + plot
+    """
+    if df.empty:
+        print(f"Warning: Empty dataframe for task {task_type}")
+        return None, None
+
+    task_df = df[df['Task'] == task_type]
+    if task_df.empty:
+        print(f"Warning: No data for task {task_type}")
+        return None, None
+
+    ci_df = None
+    ablation_data = None
+
+    if task_type == 'classification':
+        metric = config.ranking_metric_classification
+    else:
+        metric = config.ranking_metric_regression
+
+    # ------------------------------------------------------------------
+    # 1) Confidence intervals — bootstrap ACROSS models, per method
+    # ------------------------------------------------------------------
+    try:
+        print(f"\n[CI] Computing cross-model CIs for {task_type}...")
+        ci_rows = []
+        for method_label, g in task_df.groupby('Method_Label'):
+            vals = g[metric].dropna().values
+            if len(vals) < 2:
+                print(f"  [CI] Skipping '{method_label}': only {len(vals)} model(s)")
+                continue
+            mean, lower, upper = bootstrap_ci(vals, n_iterations=n_iterations, ci=0.95)
+            ci_rows.append({
+                'Method_Label': method_label,
+                f'{metric}_mean': mean,
+                f'{metric}_lower_ci': lower,
+                f'{metric}_upper_ci': upper,
+                f'{metric}_std': np.nanstd(vals, ddof=1),
+                'n_models': len(vals),
+                'models': list(g['Model'].unique()),
+            })
+        ci_df = pd.DataFrame(ci_rows)
+
+        if not ci_df.empty:
+            ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv', index=False)
+            print(f"✓ Confidence intervals data saved to: "
+                  f"{output_dir / f'confidence_intervals_{task_type}.csv'}")
+
+            print(f"\n  Cross-model bootstrap CIs ({metric}, {n_iterations} iters):")
+            for _, row in ci_df.sort_values(f'{metric}_mean', ascending=False).iterrows():
+                print(f"    {row['Method_Label']:32s} "
+                      f"{row[f'{metric}_mean']:.3f} "
+                      f"[{row[f'{metric}_lower_ci']:.3f}, {row[f'{metric}_upper_ci']:.3f}] "
+                      f"n_models={row['n_models']}")
+        else:
+            print(f"⚠ No method had ≥2 models with non-NaN {metric} values")
+    except Exception as e:
+        import traceback
+        print(f"⚠ Error computing confidence intervals for {task_type}: {e}")
+        traceback.print_exc()
+        ci_df = None
+
+    # ------------------------------------------------------------------
+    # 2) Ablation analysis (ALL patients)
+    # ------------------------------------------------------------------
+    try:
+        print(f"\n[ABLATION] Running ablation for {task_type}...")
+        ablation_data = perform_ablation_analysis_all_patients(
+            task_df, config, task_type, verbose=True,
+        )
+
+        if ablation_data and not ablation_data.get('ablation_results', pd.DataFrame()).empty:
+            plot_ablation_results_all_patients(ablation_data, output_dir, config, task_type)
+
+            ablation_df = ablation_data['ablation_results']
+            print(f"\n  Ablation Summary for {task_type.upper()} (ALL Patients):")
+            print(f"    Reference method: {ablation_data['best_method']} "
+                  f"({ablation_data['best_score']:.3f})")
+            if not ablation_df.empty:
+                top = ablation_df.iloc[0]
+                print(f"    Most impactful removal: {top['Removed_Component']} "
+                      f"(Δ = {top['Difference']:.3f}, p = {top['p_value_ttest']:.3f})")
+        else:
+            print(f"⚠ No ablation results could be computed for {task_type}")
+    except Exception as e:
+        import traceback
+        print(f"⚠ Error computing ablation analysis for {task_type}: {e}")
+        traceback.print_exc()
+        ablation_data = None
+
+    return ci_df, ablation_data
+
+
+# =======================================================================
+#  ABLATION PLOT
+# =======================================================================
+
 def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, config: ExperimentConfig,
                                        task_type: str = 'classification'):
     """
     Plot ablation study results.
 
     Contract with the caller (perform_ablation_analysis_all_patients):
-      - ablation_data['best_method']    : the reference method's DISPLAY label
+      - ablation_data['best_method']    : reference method's DISPLAY label
                                           (may be an ensemble, e.g. "Voting Ensemble")
-      - ablation_data['best_score']     : the reference's mean score
-      - ablation_data['metric_name']    : e.g. 'macro_f1' or 'r2'
+      - ablation_data['best_score']     : reference's mean score
+      - ablation_data['metric_name']    : 'macro_f1' or 'r2'
       - ablation_data['lower_is_better']: bool
       - ablation_data['ablation_results']: DataFrame with columns
             Removed_Component, Removed_Score, Difference,
             p_value_ttest, significant, effect_size, n_pairs
 
     Layout notes:
-      - No constrained_layout, no tight_layout — subplots_adjust is the sole
-        spacing mechanism, so wspace takes effect exactly as written.
-      - Wider figure (20 inches) so a bigger wspace does not shrink the panels.
+      - sharey=True: panel 2 inherits panel 1's y-axis.
+      - The y-tick system is bypassed entirely: labels are drawn with
+        ax1.text(...) using get_yaxis_transform(). This avoids the
+        sharey+invert_yaxis label-loss bug on all Matplotlib versions.
+      - subplots_adjust is the sole spacing mechanism (no tight_layout,
+        no constrained_layout) so wspace takes effect exactly as written.
       - Reference is named only in the panel-1 title; no annotation box.
     """
     ablation_df = ablation_data.get('ablation_results')
@@ -1672,29 +1780,31 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
         return
 
     # ------------------------------------------------------------------
-    # 2. Sort and prepare y-positions
+    # 2. Sort, drop NaNs, prepare y-positions
     # ------------------------------------------------------------------
     plot_df = plot_df.sort_values('Difference', ascending=False).reset_index(drop=True)
+    plot_df = plot_df.dropna(subset=['Difference', 'p_value_ttest']).reset_index(drop=True)
+    if plot_df.empty:
+        print("Warning: No valid (non-NaN) ablation rows to plot")
+        return
 
     n_bars = len(plot_df)
     y_positions = np.arange(n_bars) * 0.5
 
     # ------------------------------------------------------------------
-    # 3. Figure — WIDE with a BIG gap between panels
-    #    figsize widened to 20 so wspace=0.55 doesn't shrink the panels.
-    #    subplots_adjust is the only spacing mechanism: no tight_layout,
-    #    no constrained_layout.
+    # 3. Figure
     # ------------------------------------------------------------------
     fig, axes = plt.subplots(
         1, 2,
-        figsize=(20, max(6.5, n_bars * 0.55)),
+        figsize=(20, max(6.75, n_bars * 0.55)),
+        sharey=True,
     )
     fig.subplots_adjust(
-        left=0.16,     # room for long y-axis tick labels on panel 1
-        right=0.98,    # extend almost to the right edge
-        top=0.88,      # room for the two-line titles
-        bottom=0.12,   # room for x-axis labels
-        wspace=0.55,   # ← BIG gap between panels
+        left=0.22,     # room for the text labels drawn on panel 1
+        right=0.95,
+        top=0.88,
+        bottom=0.12,
+        wspace=0.55,
     )
 
     # =============================================================
@@ -1723,10 +1833,8 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
 
     ax1.axvline(x=0, color='black', linestyle='-', alpha=0.6, linewidth=1.5)
 
-    ax1.set_yticks(y_positions)
-    ax1.set_yticklabels(plot_df['Removed_Component'].values, fontsize=12)
-    ax1.set_xlabel(f'Performance Drop (Δ{metric_label}) vs Reference', fontsize=13)
-    ax1.set_ylabel('Base Method', fontsize=13)
+    ax1.set_xlabel(f'Performance Drop (Δ{metric_label}) vs Reference', fontsize=12)
+    ax1.set_ylabel('')
     ax1.set_title(
         f'Ablation vs Reference ({task_type.title()})\n'
         f'Reference: {best_method} = {best_score:.3f}',
@@ -1734,7 +1842,14 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
     )
     ax1.grid(True, alpha=0.3, axis='x')
     ax1.tick_params(axis='x', labelsize=11)
-    ax1.invert_yaxis()
+    ax1.invert_yaxis()          # invert FIRST
+
+    # ---- Draw category labels with ax1.text (bypasses the tick system) ----
+    for y, name in zip(y_positions, plot_df['Removed_Component'].values):
+        ax1.text(-0.02, y, name,
+                 transform=ax1.get_yaxis_transform(),
+                 ha='right', va='center', fontsize=11)
+    ax1.set_yticks([])          # remove default ticks entirely
 
     from matplotlib.patches import Patch
     legend_elements = [
@@ -1748,6 +1863,7 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
 
     # =============================================================
     # Panel 2 — Statistical Significance
+    #   sharey=True + set_yticks([]) → no duplicate labels, no second invert
     # =============================================================
     ax2 = axes[1]
 
@@ -1772,10 +1888,11 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
     ax2.axvline(x=threshold, color='red', linestyle='--',
                 alpha=0.8, linewidth=2, label='p = 0.05')
 
-    ax2.set_yticks(y_positions)
-    ax2.set_yticklabels(plot_df['Removed_Component'].values, fontsize=12)
+    # No tick labels on panel 2 — panel 1 owns them; leave sharey to align.
+    ax2.set_yticks([])
+    ax2.set_ylabel('')
+
     ax2.set_xlabel('−log10(p-value)  (paired t-test vs reference)', fontsize=13)
-    ax2.set_ylabel('Base Method', fontsize=13)
     ax2.set_title(
         f'Statistical Significance ({task_type.title()})',
         fontsize=14, fontweight='bold', pad=10,
@@ -1783,10 +1900,10 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
     ax2.legend(loc='lower right', fontsize=10, framealpha=0.95)
     ax2.grid(True, alpha=0.3, axis='x')
     ax2.tick_params(axis='x', labelsize=11)
-    ax2.invert_yaxis()
+    # No ax2.invert_yaxis() — shared axis already inverted via ax1.
 
     # ------------------------------------------------------------------
-    # 3b. Diagnostic — print the actual gap between panels
+    # 3b. Diagnostic — actual gap between panels
     # ------------------------------------------------------------------
     fig.canvas.draw()
     b1 = axes[0].get_position()
@@ -1794,17 +1911,16 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
     print(f"  [LAYOUT] Panel 1 x-extent: {b1.x0:.3f} → {b1.x1:.3f}")
     print(f"  [LAYOUT] Panel 2 x-extent: {b2.x0:.3f} → {b2.x1:.3f}")
     print(f"  [LAYOUT] Gap between panels (fig fraction): {b2.x0 - b1.x1:.3f}")
+    print(f"  [LAYOUT] n_bars={n_bars}  plot_df rows={len(plot_df)}")
 
     # ------------------------------------------------------------------
     # 4. Save figure + CSVs
     # ------------------------------------------------------------------
-    plt.savefig(
-        output_dir / f'ablation_analysis_all_patients_{task_type}.png',
-        dpi=300, bbox_inches='tight',
-    )
+    out_png = output_dir / f'ablation_analysis_all_patients_{task_type}.png'
+    print(f"  [SAVE] Writing {out_png}  (parent exists: {output_dir.exists()})")
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\n✓ Ablation figure saved: "
-          f"{output_dir / f'ablation_analysis_all_patients_{task_type}.png'}")
+    print(f"\n✓ Ablation figure saved: {out_png}")
 
     summary_cols = ['Removed_Component', 'Removed_Score', 'Difference',
                     'p_value_ttest', 'significant', 'effect_size', 'n_pairs']
@@ -2360,76 +2476,6 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
         flat_filename = f'{prefix}summary_table_flat_{task}.csv' if prefix else f'summary_table_flat_{task}.csv'
         flat_summary.reset_index().to_csv(output_dir / flat_filename, index=False)
 
-
-# =======================================================================
-#  ROBUSTNESS SUMMARY FUNCTION
-# =======================================================================
-
-def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
-                                        task_type: str = 'classification', n_iterations: int = 1000):
-    """Create comprehensive robustness summary with CIs and ablation using ALL patients."""
-    if df.empty:
-        print(f"Warning: Empty dataframe for task {task_type}")
-        return None, None
-
-    task_df = df[df['Task'] == task_type]
-    if task_df.empty:
-        print(f"Warning: No data for task {task_type}")
-        return None, None
-
-    # ---------------------------------------------------------------
-    # Initialize both variables so the final return is always safe
-    # ---------------------------------------------------------------
-    ci_df = None
-    ablation_data = None
-
-    if task_type == 'classification':
-        metric = config.ranking_metric_classification
-    else:
-        metric = config.ranking_metric_regression
-
-    # Confidence intervals — bootstrap ACROSS models, per method
-    try:
-        print(f"\n[CI] Computing cross-model CIs for {task_type}...")
-        ci_rows = []
-        for method_label, g in task_df.groupby('Method_Label'):
-            vals = g[metric].dropna().values
-            if len(vals) < 2:
-                print(f"  [CI] Skipping '{method_label}': only {len(vals)} model(s)")
-                continue
-            mean, lower, upper = bootstrap_ci(vals, n_iterations=n_iterations, ci=0.95)
-            ci_rows.append({
-                'Method_Label': method_label,
-                f'{metric}_mean': mean,
-                f'{metric}_lower_ci': lower,
-                f'{metric}_upper_ci': upper,
-                f'{metric}_std': np.nanstd(vals, ddof=1),
-                'n_models': len(vals),
-                'models': list(g['Model'].unique()),
-            })
-        ci_df = pd.DataFrame(ci_rows)
-
-        if not ci_df.empty:
-            ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv', index=False)
-            print(f"✓ Confidence intervals data saved to: "
-                  f"{output_dir / f'confidence_intervals_{task_type}.csv'}")
-
-            # Print a compact summary instead of the old plot
-            print(f"\n  Cross-model bootstrap CIs ({metric}, {n_iterations} iters):")
-            for _, row in ci_df.sort_values(f'{metric}_mean', ascending=False).iterrows():
-                print(f"    {row['Method_Label']:32s} "
-                      f"{row[f'{metric}_mean']:.3f} "
-                      f"[{row[f'{metric}_lower_ci']:.3f}, {row[f'{metric}_upper_ci']:.3f}] "
-                      f"n_models={row['n_models']}")
-        else:
-            print(f"⚠ No method had ≥2 models with non-NaN {metric} values")
-    except Exception as e:
-        import traceback
-        print(f"⚠ Error computing confidence intervals for {task_type}: {e}")
-        traceback.print_exc()
-        ci_df = None
-
-    return ci_df, ablation_data
 
 
 # =======================================================================
