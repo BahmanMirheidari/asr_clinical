@@ -198,15 +198,15 @@ class ExperimentConfig:
         'subgroup_specificity': 'Dys - Specificity',
         'subgroup_balanced_accuracy': 'Dys - Balanced Accuracy',
         'subgroup_roc_auc': 'Dys - AUC-ROC',
-        'non_subgroup_macro_f1': 'Norm - F1-Macro',
-        'non_subgroup_sensitivity': 'Norm - Sensitivity',
-        'non_subgroup_specificity': 'Norm - Specificity',
-        'non_subgroup_balanced_accuracy': 'Norm - Balanced Accuracy',
-        'non_subgroup_roc_auc': 'Norm - AUC-ROC',
+        'non_subgroup_macro_f1': 'Typ - F1-Macro',
+        'non_subgroup_sensitivity': 'Typ - Sensitivity',
+        'non_subgroup_specificity': 'Typ - Specificity',
+        'non_subgroup_balanced_accuracy': 'Typ - Balanced Accuracy',
+        'non_subgroup_roc_auc': 'Typ - AUC-ROC',
         'subgroup_rmse': 'Dys - RMSE',
         'subgroup_r2': 'Dys - R²',
-        'non_subgroup_rmse': 'Norm - RMSE',
-        'non_subgroup_r2': 'Norm - R²'
+        'non_subgroup_rmse': 'Typ - RMSE',
+        'non_subgroup_r2': 'Typ - R²'
     })
     
     # Ranking metrics
@@ -793,17 +793,30 @@ def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: Expe
     
     meta_df = df[df['Method'].isin(meta_methods)].copy()
     
+    if meta_df.empty:
+        print("No meta-fusion data found")
+        return
+    
     # Get display names
     meta_df['Method_Label'] = meta_df['Method'].apply(
         lambda x: get_method_display_name(x, config)
     )
     
+    # Add Model_Short column - THIS WAS MISSING!
+    meta_df['Model_Short'] = meta_df['Model'].apply(
+        lambda x: get_short_model_name(x, config)
+    )
+    
+    # Filter to task
+    meta_df = meta_df[meta_df['Task'] == task_type]
+    
     if meta_df.empty:
+        print(f"No meta-fusion data for task {task_type}")
         return
     
     # Get metrics based on task
     if task_type == 'classification':
-        metrics = ['macro_f1', 'roc_auc', 'accuracy', 'balanced_accuracy']
+        metrics = ['macro_f1', 'roc_auc', 'balanced_accuracy']
     else:
         metrics = ['rmse', 'r2']
     
@@ -812,10 +825,16 @@ def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: Expe
         if metric not in meta_df.columns:
             continue
         
-        fig, ax = plt.subplots(figsize=(12, 6))
+        # Check if we have valid data
+        valid_data = meta_df[meta_df[metric].notna()]
+        if valid_data.empty:
+            print(f"No valid {metric} data for meta-fusion comparison")
+            continue
+        
+        fig, ax = plt.subplots(figsize=(14, max(6, len(valid_data['Model_Short'].unique()) * 0.5)))
         
         # Pivot table
-        pivot = meta_df.pivot_table(
+        pivot = valid_data.pivot_table(
             index='Model_Short',
             columns='Method_Label',
             values=metric,
@@ -823,31 +842,37 @@ def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: Expe
         )
         
         if pivot.empty:
+            print(f"Empty pivot for {metric}")
             continue
         
         # Sort by best method
         if metric in ['rmse']:
             best_vals = pivot.min(axis=1)
+            pivot = pivot.loc[best_vals.sort_values(ascending=True).index]
         else:
             best_vals = pivot.max(axis=1)
-        pivot = pivot.loc[best_vals.sort_values(ascending=metric in ['rmse']).index]
+            pivot = pivot.loc[best_vals.sort_values(ascending=False).index]
         
         # Plot
-        pivot.plot(kind='bar', ax=ax, width=0.8, colormap='viridis')
+        pivot.plot(kind='barh', ax=ax, width=0.7, colormap='viridis')
+        
+        # Add value labels
+        for container in ax.containers:
+            ax.bar_label(container, fmt='%.3f', fontsize=9, padding=2)
         
         metric_label = config.metric_labels.get(metric, metric.upper())
         ax.set_title(f'Meta-Fusion Comparison: {metric_label} ({task_type.title()})', 
                     fontsize=14, fontweight='bold')
-        ax.set_xlabel('Model')
-        ax.set_ylabel(metric_label)
-        ax.legend(loc='best', fontsize=9)
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_xlabel(metric_label, fontsize=12)
+        ax.set_ylabel('Model', fontsize=12)
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
+        ax.grid(True, alpha=0.3, axis='x')
         
         if metric not in ['rmse']:
-            ax.set_ylim(0, 1.05)
+            ax.set_xlim(0, 1.05)
         
         plt.tight_layout()
+        plt.subplots_adjust(right=0.75)
         task_suffix = f"_{task_type}"
         plt.savefig(output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
         plt.close()
@@ -1073,8 +1098,18 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
             audio_model = model
             break
     
-    # Create a single figure with 3 subplots
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # Create a single figure with 3 subplots - larger figure for better readability
+    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+    
+    # Increase font sizes globally for this figure
+    plt.rcParams.update({
+        'font.size': 16,
+        'axes.titlesize': 20,
+        'axes.labelsize': 18,
+        'xtick.labelsize': 15,
+        'ytick.labelsize': 15,
+        'legend.fontsize': 15,   # Bigger legend font
+    })
     
     method_types = [
         ('audio_only', 'Audio-Only', axes[0], '#E74C3C', 'o', audio_model, audio_method),
@@ -1089,10 +1124,10 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
             print(f"\n⚠ No model found for {display_name}")
             ax.text(0.5, 0.5, f'No model found\nfor {display_name}', 
                    horizontalalignment='center', verticalalignment='center',
-                   transform=ax.transAxes, fontsize=12)
-            ax.set_xlabel('ECAS Observed', fontsize=12)
-            ax.set_ylabel('ECAS Predicted', fontsize=12)
-            ax.set_title(f'{display_name}\nDys Subgroup', fontsize=13, fontweight='bold')
+                   transform=ax.transAxes, fontsize=18)
+            ax.set_xlabel('ECAS Observed', fontsize=18)
+            ax.set_ylabel('ECAS Predicted', fontsize=18)
+            ax.set_title(f'{display_name}\nDys Subgroup', fontsize=20, fontweight='bold')
             ax.grid(True, alpha=0.3)
             continue
         
@@ -1146,36 +1181,45 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
                     r2 = pearsonr(obs_vals, pred_vals)[0] ** 2 if len(obs_vals) > 2 else np.nan
                     n = len(obs_vals)
                     
-                    # Scatter plot
-                    ax.scatter(obs_vals, pred_vals, alpha=0.5, s=30, color=color, marker=marker, 
+                    # Scatter plot - BIGGER markers with THICKER edges
+                    ax.scatter(obs_vals, pred_vals, alpha=0.75, s=150, color=color, marker=marker, 
+                              edgecolors='black', linewidths=1.5,
                               label=f'n={n}, RMSE={rmse:.3f}, R²={r2:.3f}')
                     
-                    # Add identity line
-                    min_val = min(obs_vals.min(), pred_vals.min())
-                    max_val = max(obs_vals.max(), pred_vals.max())
-                    margin = (max_val - min_val) * 0.1
-                    ax.plot([min_val - margin, max_val + margin], 
-                           [min_val - margin, max_val + margin], 
-                           'k--', alpha=0.5, linewidth=1.5)
+                    # Get data range for auto-scaling
+                    data_min = min(obs_vals.min(), pred_vals.min())
+                    data_max = max(obs_vals.max(), pred_vals.max())
+                    data_range = data_max - data_min
                     
-                    # Add regression line
+                    # Add some padding (5% of range)
+                    padding = data_range * 0.05 if data_range > 0 else 1.0
+                    plot_min = data_min - padding
+                    plot_max = data_max + padding
+                    
+                    # Add identity line (y=x) - THICKER
+                    ax.plot([plot_min, plot_max], [plot_min, plot_max], 
+                           'k--', alpha=0.6, linewidth=3, label='y = x (perfect)')
+                    
+                    # Add regression line - THICKER
                     if len(obs_vals) > 2:
                         slope, intercept, r_value, p_value, std_err = linregress(obs_vals, pred_vals)
-                        x_line = np.linspace(min_val - margin, max_val + margin, 100)
+                        x_line = np.linspace(plot_min, plot_max, 100)
                         y_line = slope * x_line + intercept
-                        ax.plot(x_line, y_line, color='red', alpha=0.5, linewidth=1, 
+                        ax.plot(x_line, y_line, color='red', alpha=0.8, linewidth=3, 
                                label=f'y={slope:.2f}x+{intercept:.2f}')
                     
-                    ax.set_xlabel('ECAS Observed', fontsize=12)
-                    ax.set_ylabel('ECAS Predicted', fontsize=12)
-                    ax.set_title(f'{display_name}\nDys Subgroup', fontsize=13, fontweight='bold')
-                    ax.legend(loc='best', fontsize=8)
+                    ax.set_xlabel('ECAS Observed', fontsize=18)
+                    ax.set_ylabel('ECAS Predicted', fontsize=18)
+                    ax.set_title(f'{display_name}\nDys Subgroup', fontsize=20, fontweight='bold')
+                    # BIGGER legend font
+                    ax.legend(loc='best', fontsize=15, framealpha=0.95, 
+                              handletextpad=0.5, borderpad=0.6, labelspacing=0.6)
                     ax.grid(True, alpha=0.3)
                     ax.set_aspect('equal', adjustable='box')
                     
-                    # Set equal limits
-                    ax.set_xlim(min_val - margin, max_val + margin)
-                    ax.set_ylim(min_val - margin, max_val + margin)
+                    # Set limits from min to max with padding (NOT 0 to 136)
+                    ax.set_xlim(plot_min, plot_max)
+                    ax.set_ylim(plot_min, plot_max)
                     
                     # Store predictions
                     all_predictions[method_type] = {
@@ -1191,28 +1235,38 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
                     print(f"  ⚠ No valid samples found")
                     ax.text(0.5, 0.5, f'No valid samples', 
                            horizontalalignment='center', verticalalignment='center',
-                           transform=ax.transAxes, fontsize=12)
+                           transform=ax.transAxes, fontsize=18)
             else:
                 print(f"  ⚠ Could not find obs/pred columns")
                 print(f"  Available columns: {pred_df.columns.tolist()}")
                 ax.text(0.5, 0.5, f'No obs/pred columns', 
                        horizontalalignment='center', verticalalignment='center',
-                       transform=ax.transAxes, fontsize=12)
+                       transform=ax.transAxes, fontsize=18)
         else:
             print(f"  ⚠ No predictions file found")
             ax.text(0.5, 0.5, f'No predictions file', 
                    horizontalalignment='center', verticalalignment='center',
-                   transform=ax.transAxes, fontsize=12)
+                   transform=ax.transAxes, fontsize=18)
         
-        ax.set_xlabel('ECAS Observed', fontsize=12)
-        ax.set_ylabel('ECAS Predicted', fontsize=12)
-        ax.set_title(f'{display_name}\nDys Subgroup', fontsize=13, fontweight='bold')
+        ax.set_xlabel('ECAS Observed', fontsize=18)
+        ax.set_ylabel('ECAS Predicted', fontsize=18)
+        ax.set_title(f'{display_name}\nDys Subgroup', fontsize=20, fontweight='bold')
         ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_dir / 'dys_scatter_audio_text_fusion_single.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"\n✓ Dys scatter plot saved to: {output_dir / 'dys_scatter_audio_text_fusion_single.png'}")
+    
+    # Reset font sizes to defaults
+    plt.rcParams.update({
+        'font.size': 11,
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 10,
+    })
     
     # Create summary table
     if all_predictions:
@@ -1378,12 +1432,7 @@ def print_bootstrap_summary(ci_df: pd.DataFrame, metric: str, config: Experiment
 #  ABLATION ANALYSIS - USING ALL PATIENTS DATA (NOT SUBGROUPS)
 # =======================================================================
 
-def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentConfig, 
-                                          task_type: str = 'classification', verbose: bool = True) -> Dict:
-    """
-    Perform ablation analysis using ONLY base methods (no ensembles).
-    Ensembles are meta-methods and should not be included in ablation.
-    """
+def perform_ablation_analysis_all_patients(df, config, task_type='classification', verbose=True):
     if task_type == 'classification':
         metric = config.ranking_metric_classification
         lower_is_better = False
@@ -1392,41 +1441,50 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
         metric = config.ranking_metric_regression
         lower_is_better = True
         metric_name = 'r2'
-    
+
     task_df = df[df['Task'] == task_type]
     if task_df.empty:
         return {}
-    
-    # EXCLUDE ensemble methods from ablation
-    # Ensemble methods are those from meta_fusion (average, voting, stacking, weighted, confidence_selection, best)
-    ensemble_patterns = ['average', 'voting', 'stacking', 'weighted', 'confidence_selection', 'best', 'ensemble_']
-    is_ensemble = task_df['Method_Label'].str.lower().str.contains('|'.join(ensemble_patterns), na=False)
-    
-    # Also exclude methods that clearly indicate they're ensembles
-    base_df = task_df[~is_ensemble].copy()
-    
+
+    # ---- Ensemble labels defined HERE, unconditionally ----
+    ensemble_labels = {
+        'average ensemble',
+        'voting ensemble',
+        'stacking ensemble',
+        'weighted ensemble',
+        'confidence selection',
+        'best method',
+    }
+    is_ensemble = task_df['Method_Label'].str.lower().str.strip().isin(ensemble_labels)
+    base_df = task_df.copy()      # keep everything for ranking
+
+    if verbose:
+        print(f"\n  Ensemble labels recognised: {sorted(ensemble_labels)}")
+        ens_in = task_df[is_ensemble]['Method_Label'].unique().tolist()
+        print(f"  Ensemble rows present (kept for ranking): {sorted(ens_in)}")
+    # ---- end ----
+
     # Filter to methods that have the overall metric
     base_df = base_df[base_df[metric_name].notna()].copy()
-    
+
     if base_df.empty:
         if verbose:
-            print(f"  Warning: No base methods with {metric_name} for {task_type}")
+            print(f"  Warning: No methods with {metric_name} for {task_type}")
         return {}
-    
+
     all_methods = base_df['Method_Label'].unique()
-    
+
     if verbose:
         print(f"\n  Base methods with {metric_name} for {task_type}: {len(all_methods)}")
         for m in sorted(all_methods):
             print(f"    ✓ {m}")
-        
         # List excluded ensemble methods for clarity
         ensemble_methods = task_df[is_ensemble]['Method_Label'].unique()
         if len(ensemble_methods) > 0:
             print(f"\n  Excluded ensemble methods (not in ablation):")
             for m in sorted(ensemble_methods):
                 print(f"    ✗ {m} (ensemble method)")
-    
+
     # Find best method using the ranking metric
     method_performance = base_df.groupby('Method_Label')[metric_name].mean()
     if lower_is_better:
@@ -1435,7 +1493,7 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
     else:
         best_method = method_performance.idxmax()
         best_score = method_performance.max()
-    
+
     if verbose:
         print(f"\n  Best base method: {best_method} ({best_score:.4f})")
     
@@ -1526,87 +1584,250 @@ def perform_ablation_analysis_all_patients(df: pd.DataFrame, config: ExperimentC
 
 def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, config: ExperimentConfig,
                                        task_type: str = 'classification'):
-    """Plot ablation study results using ALL patients data."""
-    ablation_df = ablation_data['ablation_results']
-    if ablation_df.empty:
+    """
+    Plot ablation study results.
+
+    Contract with the caller (perform_ablation_analysis_all_patients):
+      - ablation_data['best_method']    : the reference method's DISPLAY label
+                                          (may be an ensemble, e.g. "Voting Ensemble")
+      - ablation_data['best_score']     : the reference's mean score
+      - ablation_data['metric_name']    : e.g. 'macro_f1' or 'r2'
+      - ablation_data['lower_is_better']: bool
+      - ablation_data['ablation_results']: DataFrame with columns
+            Removed_Component, Removed_Score, Difference,
+            p_value_ttest, significant, effect_size, n_pairs
+
+    Layout notes:
+      - No constrained_layout, no tight_layout — subplots_adjust is the sole
+        spacing mechanism, so wspace takes effect exactly as written.
+      - Wider figure (20 inches) so a bigger wspace does not shrink the panels.
+      - Reference is named only in the panel-1 title; no annotation box.
+    """
+    ablation_df = ablation_data.get('ablation_results')
+    if ablation_df is None or ablation_df.empty:
         print("Warning: No ablation data to plot")
         return
-    
-    metric_label = config.metric_labels.get(ablation_data['metric_name'], ablation_data['metric_name'].upper())
-    best_method = ablation_data['best_method']
-    
-    # Create figure with two subplots
-    fig, axes = plt.subplots(1, 2, figsize=(16, max(6, len(ablation_df) * 0.4)))
-    
-    # Sort by difference
-    ablation_df = ablation_df.sort_values('Difference', ascending=False)
-    
-    # ===== Plot 1: Performance Difference =====
+
+    metric_name  = ablation_data['metric_name']
+    metric_label = config.metric_labels.get(metric_name, metric_name.upper())
+    best_method  = ablation_data['best_method']
+    best_score   = ablation_data['best_score']
+    lower_is_better = ablation_data['lower_is_better']
+
+    # ------------------------------------------------------------------
+    # 0. TRACE
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print(f"ABLATION PLOT TRACE ({task_type})")
+    print("=" * 70)
+    print(f"  Reference method : {best_method}")
+    print(f"  Reference score  : {best_score:.3f}  ({metric_label}, "
+          f"{'lower is better' if lower_is_better else 'higher is better'})")
+    print(f"  Rows in ablation_results: {len(ablation_df)}")
+    print(f"  Components present:")
+    for comp in ablation_df['Removed_Component'].tolist():
+        print(f"    - {comp}")
+
+    # ------------------------------------------------------------------
+    # 1. Filter ensembles + reference from the bars
+    # ------------------------------------------------------------------
+    ENSEMBLE_LABELS = {
+        'average ensemble', 'voting ensemble', 'stacking ensemble',
+        'weighted ensemble', 'confidence selection', 'best method',
+        'meta-fusion', 'meta fusion',
+    }
+
+    def _is_ensemble(label: str) -> bool:
+        if not isinstance(label, str):
+            return False
+        ll = label.lower().strip()
+        if ll in ENSEMBLE_LABELS:
+            return True
+        if 'ensemble' in ll:
+            return True
+        if 'meta-fusion' in ll or ll == 'meta fusion':
+            return True
+        return False
+
+    is_ens = ablation_df['Removed_Component'].apply(_is_ensemble)
+    is_ref = ablation_df['Removed_Component'].str.lower() == str(best_method).lower()
+
+    base_only = ablation_df[~is_ens & ~is_ref].copy()
+
+    if base_only.empty:
+        print("  ⚠ No base methods left after ensemble filter — "
+              "falling back to all non-reference rows")
+        plot_df = ablation_df[~is_ref].copy()
+    else:
+        plot_df = base_only
+
+    excluded = ablation_df[is_ens | is_ref]['Removed_Component'].tolist()
+
+    print(f"\n  Excluded from bars ({len(excluded)}): {excluded}")
+    print(f"  Bars to plot       ({len(plot_df)}): "
+          f"{plot_df['Removed_Component'].tolist()}")
+
+    if plot_df.empty:
+        print("Warning: Nothing left to plot after removing ensembles and reference")
+        return
+
+    # ------------------------------------------------------------------
+    # 2. Sort and prepare y-positions
+    # ------------------------------------------------------------------
+    plot_df = plot_df.sort_values('Difference', ascending=False).reset_index(drop=True)
+
+    n_bars = len(plot_df)
+    y_positions = np.arange(n_bars) * 0.5
+
+    # ------------------------------------------------------------------
+    # 3. Figure — WIDE with a BIG gap between panels
+    #    figsize widened to 20 so wspace=0.55 doesn't shrink the panels.
+    #    subplots_adjust is the only spacing mechanism: no tight_layout,
+    #    no constrained_layout.
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(20, max(6.5, n_bars * 0.55)),
+    )
+    fig.subplots_adjust(
+        left=0.16,     # room for long y-axis tick labels on panel 1
+        right=0.98,    # extend almost to the right edge
+        top=0.88,      # room for the two-line titles
+        bottom=0.12,   # room for x-axis labels
+        wspace=0.55,   # ← BIG gap between panels
+    )
+
+    # =============================================================
+    # Panel 1 — Performance Drop
+    # =============================================================
     ax1 = axes[0]
-    colors = ['#2ECC71' if row['significant'] else '#E74C3C' for _, row in ablation_df.iterrows()]
-    
-    bars = ax1.barh(ablation_df['Removed_Component'], ablation_df['Difference'], color=colors, alpha=0.7)
-    
-    # Add value labels
-    for bar, val in zip(bars, ablation_df['Difference']):
-        ax1.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2, 
-                f'{val:.4f}', va='center', fontsize=9)
-    
-    ax1.axvline(x=0, color='black', linestyle='-', alpha=0.5)
-    ax1.set_xlabel(f'Performance Drop (Δ{metric_label})', fontsize=12)
-    ax1.set_ylabel('Removed Component', fontsize=12)
-    ax1.set_title(f'Ablation: Performance Drop When Removing Component\n(Compared to {best_method})', 
-                  fontsize=13, fontweight='bold')
+    colors = ['#2ECC71' if sig else '#E74C3C' for sig in plot_df['significant']]
+
+    bars = ax1.barh(
+        y_positions, plot_df['Difference'].values,
+        color=colors, alpha=0.85, height=0.25,
+        edgecolor='black', linewidth=0.6,
+    )
+
+    for bar, val in zip(bars, plot_df['Difference'].values):
+        if val >= 0:
+            ax1.text(bar.get_width() + 0.003,
+                     bar.get_y() + bar.get_height() / 2,
+                     f'{val:+.3f}', va='center', ha='left',
+                     fontsize=12, fontweight='bold')
+        else:
+            ax1.text(bar.get_width() - 0.003,
+                     bar.get_y() + bar.get_height() / 2,
+                     f'{val:+.3f}', va='center', ha='right',
+                     fontsize=12, fontweight='bold')
+
+    ax1.axvline(x=0, color='black', linestyle='-', alpha=0.6, linewidth=1.5)
+
+    ax1.set_yticks(y_positions)
+    ax1.set_yticklabels(plot_df['Removed_Component'].values, fontsize=12)
+    ax1.set_xlabel(f'Performance Drop (Δ{metric_label}) vs Reference', fontsize=13)
+    ax1.set_ylabel('Base Method', fontsize=13)
+    ax1.set_title(
+        f'Ablation vs Reference ({task_type.title()})\n'
+        f'Reference: {best_method} = {best_score:.3f}',
+        fontsize=14, fontweight='bold', pad=10,
+    )
     ax1.grid(True, alpha=0.3, axis='x')
-    
+    ax1.tick_params(axis='x', labelsize=11)
+    ax1.invert_yaxis()
+
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor='#2ECC71', alpha=0.7, label='Significant (p < 0.05)'),
-        Patch(facecolor='#E74C3C', alpha=0.7, label='Not Significant')
+        Patch(facecolor='#2ECC71', alpha=0.85, edgecolor='black',
+              linewidth=0.6, label='Significant (p < 0.05)'),
+        Patch(facecolor='#E74C3C', alpha=0.85, edgecolor='black',
+              linewidth=0.6, label='Not Significant'),
     ]
-    ax1.legend(handles=legend_elements, loc='best', fontsize=9)
-    
-    # ===== Plot 2: Statistical Significance =====
-    ax2 = axes[1]
-    
-    p_values = ablation_df['p_value_ttest'].values
-    significant = ablation_df['significant'].values
-    
-    # Log transform p-values for better visualization
-    log_p = -np.log10(p_values + 1e-10)
-    
-    colors2 = ['#2ECC71' if sig else '#E74C3C' for sig in significant]
-    bars2 = ax2.barh(ablation_df['Removed_Component'], log_p, color=colors2, alpha=0.7)
-    
-    # Add value labels
-    for bar, p_val in zip(bars2, p_values):
-        label = f'{p_val:.4f}' if p_val >= 0.001 else f'{p_val:.2e}'
-        ax2.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height()/2, 
-                label, va='center', fontsize=8)
-    
-    # Add significance threshold line
-    threshold = -np.log10(0.05)
-    ax2.axvline(x=threshold, color='red', linestyle='--', alpha=0.7, label='p = 0.05')
-    
-    ax2.set_xlabel('-log10(p-value)', fontsize=12)
-    ax2.set_ylabel('Removed Component', fontsize=12)
-    ax2.set_title('Statistical Significance of Ablation', fontsize=13, fontweight='bold')
-    ax2.legend(loc='best', fontsize=9)
-    ax2.grid(True, alpha=0.3, axis='x')
-    
-    plt.tight_layout()
-    task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'ablation_analysis_all_patients_{task_type}.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Ablation analysis (all patients) saved to: {output_dir / f'ablation_analysis_all_patients_{task_type}.png'}")
-    
-    # Save summary table
-    summary_cols = ['Removed_Component', 'Removed_Score', 'Difference', 
-                    'p_value_ttest', 'significant', 'effect_size', 'n_pairs']
-    summary_df = ablation_df[summary_cols].round(4)
-    summary_df.to_csv(output_dir / f'ablation_summary_all_patients_{task_type}.csv', index=False)
-    print(f"✓ Ablation summary (all patients) saved to: {output_dir / f'ablation_summary_all_patients_{task_type}.csv'}")
+    ax1.legend(handles=legend_elements, loc='lower right',
+               fontsize=10, framealpha=0.95)
 
+    # =============================================================
+    # Panel 2 — Statistical Significance
+    # =============================================================
+    ax2 = axes[1]
+
+    p_values = plot_df['p_value_ttest'].fillna(1.0).values
+    log_p = -np.log10(p_values + 1e-10)
+    colors2 = ['#2ECC71' if sig else '#E74C3C' for sig in plot_df['significant']]
+
+    bars2 = ax2.barh(
+        y_positions, log_p,
+        color=colors2, alpha=0.85, height=0.25,
+        edgecolor='black', linewidth=0.6,
+    )
+
+    for bar, p_val in zip(bars2, p_values):
+        label = f'{p_val:.3f}' if p_val >= 0.001 else f'{p_val:.1e}'
+        ax2.text(bar.get_width() + 0.05,
+                 bar.get_y() + bar.get_height() / 2,
+                 label, va='center', ha='left',
+                 fontsize=11, fontweight='bold')
+
+    threshold = -np.log10(0.05)
+    ax2.axvline(x=threshold, color='red', linestyle='--',
+                alpha=0.8, linewidth=2, label='p = 0.05')
+
+    ax2.set_yticks(y_positions)
+    ax2.set_yticklabels(plot_df['Removed_Component'].values, fontsize=12)
+    ax2.set_xlabel('−log10(p-value)  (paired t-test vs reference)', fontsize=13)
+    ax2.set_ylabel('Base Method', fontsize=13)
+    ax2.set_title(
+        f'Statistical Significance ({task_type.title()})',
+        fontsize=14, fontweight='bold', pad=10,
+    )
+    ax2.legend(loc='lower right', fontsize=10, framealpha=0.95)
+    ax2.grid(True, alpha=0.3, axis='x')
+    ax2.tick_params(axis='x', labelsize=11)
+    ax2.invert_yaxis()
+
+    # ------------------------------------------------------------------
+    # 3b. Diagnostic — print the actual gap between panels
+    # ------------------------------------------------------------------
+    fig.canvas.draw()
+    b1 = axes[0].get_position()
+    b2 = axes[1].get_position()
+    print(f"  [LAYOUT] Panel 1 x-extent: {b1.x0:.3f} → {b1.x1:.3f}")
+    print(f"  [LAYOUT] Panel 2 x-extent: {b2.x0:.3f} → {b2.x1:.3f}")
+    print(f"  [LAYOUT] Gap between panels (fig fraction): {b2.x0 - b1.x1:.3f}")
+
+    # ------------------------------------------------------------------
+    # 4. Save figure + CSVs
+    # ------------------------------------------------------------------
+    plt.savefig(
+        output_dir / f'ablation_analysis_all_patients_{task_type}.png',
+        dpi=300, bbox_inches='tight',
+    )
+    plt.close()
+    print(f"\n✓ Ablation figure saved: "
+          f"{output_dir / f'ablation_analysis_all_patients_{task_type}.png'}")
+
+    summary_cols = ['Removed_Component', 'Removed_Score', 'Difference',
+                    'p_value_ttest', 'significant', 'effect_size', 'n_pairs']
+    summary_cols = [c for c in summary_cols if c in plot_df.columns]
+    summary_df = plot_df[summary_cols].round(4)
+    summary_df.to_csv(
+        output_dir / f'ablation_summary_all_patients_{task_type}.csv',
+        index=False,
+    )
+    print(f"✓ Ablation summary CSV saved: "
+          f"{output_dir / f'ablation_summary_all_patients_{task_type}.csv'}")
+
+    with open(output_dir / f'ablation_reference_{task_type}.txt', 'w') as f:
+        f.write(f"Reference method: {best_method}\n")
+        f.write(f"Reference {metric_label}: {best_score:.3f}\n")
+        f.write(f"Direction: {'lower is better' if lower_is_better else 'higher is better'}\n")
+        f.write(f"Total rows in ablation_results: {len(ablation_df)}\n")
+        f.write(f"Rows excluded from bars (ensembles + reference): {excluded}\n")
+        f.write(f"Base methods plotted ({len(plot_df)}):\n")
+        for comp in plot_df['Removed_Component'].tolist():
+            f.write(f"  - {comp}\n")
+    print(f"✓ Ablation reference info saved: "
+          f"{output_dir / f'ablation_reference_{task_type}.txt'}")
 
 # =======================================================================
 #  VISUALIZATION FUNCTIONS
@@ -1808,7 +2029,7 @@ def plot_heatmap(df: pd.DataFrame, metric: str, output_dir: Path, config: Experi
 
 def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
                            subgroup_prefix: str = None, task_type: str = 'classification'):
-    """Create combined Sen/Spec plots with harmonic mean."""
+    """Create combined Sen/Spec plots - simplified with only 4 bars (2 Dys, 2 Typ)."""
     plot_df = df[df['Task'] == task_type].copy()
     if plot_df.empty:
         print(f"Warning: No data for task {task_type}")
@@ -1816,140 +2037,90 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
     
     plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_short_model_name(x, config))
     
-    if subgroup_prefix:
-        if subgroup_prefix == 'subgroup':
-            sen_col = 'subgroup_sensitivity'
-            spec_col = 'subgroup_specificity'
-            title_suffix = ' (Dys)'
-        elif subgroup_prefix == 'non_subgroup':
-            sen_col = 'non_subgroup_sensitivity'
-            spec_col = 'non_subgroup_specificity'
-            title_suffix = ' (Norm)'
-        else:
-            sen_col = 'sensitivity'
-            spec_col = 'specificity'
-            title_suffix = ''
-    else:
-        sen_col = 'sensitivity'
-        spec_col = 'specificity'
-        title_suffix = ' (Overall)'
+    sen_col_dys = 'subgroup_sensitivity'
+    spec_col_dys = 'subgroup_specificity'
+    sen_col_typ = 'non_subgroup_sensitivity'
+    spec_col_typ = 'non_subgroup_specificity'
     
-    if sen_col not in plot_df.columns or spec_col not in plot_df.columns:
-        print(f"Warning: {sen_col} or {spec_col} not found")
+    if sen_col_dys not in plot_df.columns or spec_col_dys not in plot_df.columns:
+        print(f"Warning: Subgroup Sen/Spec columns not found")
+        return
+    
+    if sen_col_typ not in plot_df.columns or spec_col_typ not in plot_df.columns:
+        print(f"Warning: Non-subgroup (Typ) Sen/Spec columns not found")
         return
     
     avg_data = plot_df.groupby('Model_Short').agg({
-        sen_col: 'mean',
-        spec_col: 'mean'
+        sen_col_dys: 'mean',
+        spec_col_dys: 'mean',
+        sen_col_typ: 'mean',
+        spec_col_typ: 'mean'
     }).reset_index()
     
-    avg_data = avg_data.dropna(subset=[sen_col, spec_col])
+    avg_data = avg_data.dropna(subset=[sen_col_dys, spec_col_dys, sen_col_typ, spec_col_typ])
     
     if avg_data.empty:
-        print(f"Warning: No valid data for {sen_col} and {spec_col}")
+        print(f"Warning: No valid data for Sen/Spec after dropping NaN")
         return
     
-    avg_data['sen_spec_harmonic'] = 2 * (avg_data[sen_col] * avg_data[spec_col]) / (avg_data[sen_col] + avg_data[spec_col] + 1e-10)
-    avg_data = avg_data.sort_values('sen_spec_harmonic', ascending=False)
+    avg_data = avg_data.sort_values(sen_col_dys, ascending=False)
     
-    fig, axes = plt.subplots(1, 3, figsize=(18, max(6, len(avg_data) * 0.3)))
+    fig, ax = plt.subplots(figsize=(16, max(8, len(avg_data) * 0.6)))
     
     models = avg_data['Model_Short'].values
     x = np.arange(len(models))
-    width = 0.35
+    width = 0.2
     
-    ax1 = axes[0]
-    bars1 = ax1.bar(x - width/2, avg_data[sen_col], width, 
-                   label='Sensitivity', color='#2E86AB', alpha=0.8)
-    bars2 = ax1.bar(x + width/2, avg_data[spec_col], width, 
-                   label='Specificity', color='#A23B72', alpha=0.8)
+    bars1 = ax.bar(x - 1.5*width, avg_data[sen_col_dys], width, 
+                   label='Dys - Sensitivity', color='#E74C3C', alpha=0.9)
+    bars2 = ax.bar(x - 0.5*width, avg_data[spec_col_dys], width, 
+                   label='Dys - Specificity', color='#E74C3C', alpha=0.5, hatch='//')
+    bars3 = ax.bar(x + 0.5*width, avg_data[sen_col_typ], width, 
+                   label='Typ - Sensitivity', color='#3498DB', alpha=0.9)
+    bars4 = ax.bar(x + 1.5*width, avg_data[spec_col_typ], width, 
+                   label='Typ - Specificity', color='#3498DB', alpha=0.5, hatch='//')
     
-    for bar in bars1:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax1.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
+    for bars in [bars1, bars2, bars3, bars4]:
+        for bar in bars:
+            height = bar.get_height()
+            if not np.isnan(height):
+                ax.annotate(f'{height:.2f}',
+                           xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3),
+                           textcoords="offset points",
+                           ha='center', va='bottom', fontsize=10, fontweight='bold')
     
-    for bar in bars2:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax1.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
+    ax.set_xlabel('Model', fontsize=16)
+    ax.set_ylabel('Score', fontsize=16)
+    # Move title higher using pad
+    ax.set_title(f'Sensitivity & Specificity: Dys vs Typ ({task_type.title()})', 
+                fontsize=18, fontweight='bold', pad=40)
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=45, ha='right', fontsize=14)
     
-    ax1.set_xlabel('Model')
-    ax1.set_ylabel('Score')
-    ax1.set_title(f'Sensitivity vs Specificity{title_suffix}', fontsize=12, fontweight='bold')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(models, rotation=45, ha='right')
-    ax1.legend(loc='best')
-    ax1.grid(True, alpha=0.3, axis='y')
-    ax1.set_ylim(0, 1.05)
+    # Legend ABOVE the title (higher than bbox_to_anchor)
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.08), fontsize=12, ncol=4,
+              frameon=True, framealpha=0.95)
     
-    ax2 = axes[1]
-    colors = ['#2ECC71' if val >= 0.7 else '#F1C40F' if val >= 0.5 else '#E74C3C' 
-              for val in avg_data['sen_spec_harmonic']]
-    bars3 = ax2.bar(x, avg_data['sen_spec_harmonic'], color=colors, alpha=0.8)
-    
-    for bar, val in zip(bars3, avg_data['sen_spec_harmonic']):
-        if not np.isnan(val):
-            ax2.annotate(f'{val:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, val),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=9)
-    
-    ax2.axhline(y=0.7, color='green', linestyle='--', alpha=0.5, label='Good (≥0.7)')
-    ax2.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='Moderate (≥0.5)')
-    ax2.set_xlabel('Model')
-    ax2.set_ylabel('Harmonic Mean (Sen/Spec)')
-    ax2.set_title(f'Sen/Spec Harmonic Mean{title_suffix}', fontsize=12, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(models, rotation=45, ha='right')
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3, axis='y')
-    ax2.set_ylim(0, 1.05)
-    
-    ax3 = axes[2]
-    heatmap_data = avg_data[[sen_col, spec_col]].T
-    heatmap_data.columns = models
-    
-    sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='RdYlGn_r',
-                cbar_kws={'label': 'Score'},
-                linewidths=0.5, linecolor='white',
-                ax=ax3, annot_kws={'fontsize': 9})
-    
-    row_labels = ['Sensitivity', 'Specificity']
-    if subgroup_prefix == 'subgroup':
-        row_labels = ['Dys-Sensitivity', 'Dys-Specificity']
-    elif subgroup_prefix == 'non_subgroup':
-        row_labels = ['Norm-Sensitivity', 'Norm-Specificity']
-    
-    ax3.set_yticklabels(row_labels, rotation=0)
-    ax3.set_title(f'Sen/Spec Heatmap{title_suffix}', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim(0, 1.05)
+    ax.tick_params(axis='y', labelsize=14)
     
     plt.tight_layout()
-    
-    suffix = f"_{subgroup_prefix}" if subgroup_prefix else ""
     task_suffix = f"_{task_type}"
-    plt.savefig(output_dir / f'sen_spec_combined{suffix}{task_suffix}.png', dpi=300, bbox_inches='tight')
+    plt.savefig(output_dir / f'sen_spec_combined{task_suffix}.png', dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✓ Combined Sen/Spec plot saved to: {output_dir / f'sen_spec_combined{suffix}{task_suffix}.png'}")
+    print(f"✓ Sen/Spec combined plot saved to: {output_dir / f'sen_spec_combined{task_suffix}.png'}")
     
-    avg_data.to_csv(output_dir / f'sen_spec_data{suffix}{task_suffix}.csv', index=False)
-    print(f"✓ Sen/Spec data saved to: {output_dir / f'sen_spec_data{suffix}{task_suffix}.csv'}")
+    avg_data.to_csv(output_dir / f'sen_spec_data{task_suffix}.csv', index=False)
+    print(f"✓ Sen/Spec data saved to: {output_dir / f'sen_spec_data{task_suffix}.csv'}")
     
     return avg_data
 
 
 def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
                                           task_type: str = 'classification'):
-    """Create comprehensive Sen/Spec plots comparing Dys vs Norm."""
+    """Create comprehensive Sen/Spec plots comparing Dys vs Typ - 4 bars with legend above title."""
     plot_df = df[df['Task'] == task_type].copy()
     if plot_df.empty:
         print(f"Warning: No data for task {task_type}")
@@ -1966,6 +2137,10 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         print(f"Warning: Subgroup Sen/Spec columns not found")
         return
     
+    if non_subgroup_sen not in plot_df.columns or non_subgroup_spec not in plot_df.columns:
+        print(f"Warning: Non-subgroup (Typ) Sen/Spec columns not found")
+        return
+    
     avg_data = plot_df.groupby('Model_Short').agg({
         subgroup_sen: 'mean',
         subgroup_spec: 'mean',
@@ -1979,152 +2154,52 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
         print(f"Warning: No valid data for subgroup Sen/Spec after dropping NaN")
         return
     
-    avg_data['dys_harmonic'] = 2 * (avg_data[subgroup_sen] * avg_data[subgroup_spec]) / (avg_data[subgroup_sen] + avg_data[subgroup_spec] + 1e-10)
-    avg_data['norm_harmonic'] = 2 * (avg_data[non_subgroup_sen] * avg_data[non_subgroup_spec]) / (avg_data[non_subgroup_sen] + avg_data[non_subgroup_spec] + 1e-10)
-    avg_data['harmonic_diff'] = avg_data['dys_harmonic'] - avg_data['norm_harmonic']
-    avg_data = avg_data.sort_values('dys_harmonic', ascending=False)
+    avg_data = avg_data.sort_values(subgroup_sen, ascending=False)
     
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig, ax = plt.subplots(figsize=(16, max(8, len(avg_data) * 0.6)))
     
     models = avg_data['Model_Short'].values
     x = np.arange(len(models))
-    width = 0.35
+    width = 0.2
     
-    ax1 = axes[0, 0]
-    bars1 = ax1.bar(x - width/2, avg_data[subgroup_sen], width, 
-                   label='Dys', color='#E74C3C', alpha=0.8)
-    bars2 = ax1.bar(x + width/2, avg_data[non_subgroup_sen], width, 
-                   label='Norm', color='#3498DB', alpha=0.8)
+    bars1 = ax.bar(x - 1.5*width, avg_data[subgroup_sen], width, 
+                   label='Dys - Sensitivity', color='#E74C3C', alpha=0.9)
+    bars2 = ax.bar(x - 0.5*width, avg_data[subgroup_spec], width, 
+                   label='Dys - Specificity', color='#E74C3C', alpha=0.5, hatch='//')
+    bars3 = ax.bar(x + 0.5*width, avg_data[non_subgroup_sen], width, 
+                   label='Typ - Sensitivity', color='#3498DB', alpha=0.9)
+    bars4 = ax.bar(x + 1.5*width, avg_data[non_subgroup_spec], width, 
+                   label='Typ - Specificity', color='#3498DB', alpha=0.5, hatch='//')
     
-    for bar in bars1:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax1.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
-    
-    for bar in bars2:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax1.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
-    
-    ax1.set_xlabel('Model')
-    ax1.set_ylabel('Sensitivity')
-    ax1.set_title('Sensitivity: Dys vs Norm', fontsize=13, fontweight='bold')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(models, rotation=45, ha='right')
-    ax1.legend(loc='best')
-    ax1.grid(True, alpha=0.3, axis='y')
-    ax1.set_ylim(0, 1.05)
-    
-    ax2 = axes[0, 1]
-    bars3 = ax2.bar(x - width/2, avg_data[subgroup_spec], width, 
-                   label='Dys', color='#E74C3C', alpha=0.8)
-    bars4 = ax2.bar(x + width/2, avg_data[non_subgroup_spec], width, 
-                   label='Norm', color='#3498DB', alpha=0.8)
-    
-    for bar in bars3:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax2.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
-    
-    for bar in bars4:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax2.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
-    
-    ax2.set_xlabel('Model')
-    ax2.set_ylabel('Specificity')
-    ax2.set_title('Specificity: Dys vs Norm', fontsize=13, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(models, rotation=45, ha='right')
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3, axis='y')
-    ax2.set_ylim(0, 1.05)
-    
-    ax3 = axes[1, 0]
-    bars5 = ax3.bar(x - width/2, avg_data['dys_harmonic'], width, 
-                   label='Dys', color='#E74C3C', alpha=0.8)
-    bars6 = ax3.bar(x + width/2, avg_data['norm_harmonic'], width, 
-                   label='Norm', color='#3498DB', alpha=0.8)
-    
-    for bar in bars5:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax3.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
-    
-    for bar in bars6:
-        height = bar.get_height()
-        if not np.isnan(height):
-            ax3.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom', fontsize=8)
-    
-    ax3.set_xlabel('Model')
-    ax3.set_ylabel('Harmonic Mean (Sen/Spec)')
-    ax3.set_title('Sen/Spec Harmonic Mean: Dys vs Norm', fontsize=13, fontweight='bold')
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(models, rotation=45, ha='right')
-    ax3.legend(loc='best')
-    ax3.grid(True, alpha=0.3, axis='y')
-    ax3.set_ylim(0, 1.05)
-    
-    ax4 = axes[1, 1]
-    
-    diff_data = avg_data['harmonic_diff'].dropna()
-    if diff_data.empty:
-        ax4.text(0.5, 0.5, 'No valid difference data', 
-                horizontalalignment='center', verticalalignment='center',
-                transform=ax4.transAxes, fontsize=14)
-        ax4.set_title('Dys vs Norm Difference in Harmonic Mean', fontsize=13, fontweight='bold')
-    else:
-        colors = ['#2ECC71' if val >= 0 else '#E74C3C' for val in avg_data['harmonic_diff']]
-        bars7 = ax4.bar(x, avg_data['harmonic_diff'], color=colors, alpha=0.8)
-        
-        for bar, val in zip(bars7, avg_data['harmonic_diff']):
-            if not np.isnan(val):
-                ax4.annotate(f'{val:.3f}',
-                           xy=(bar.get_x() + bar.get_width() / 2, val),
-                           xytext=(0, 3 if val >= 0 else -15),
+    for bars in [bars1, bars2, bars3, bars4]:
+        for bar in bars:
+            height = bar.get_height()
+            if not np.isnan(height):
+                ax.annotate(f'{height:.2f}',
+                           xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3),
                            textcoords="offset points",
-                           ha='center', va='bottom' if val >= 0 else 'top',
-                           fontsize=9)
-        
-        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-        ax4.set_xlabel('Model')
-        ax4.set_ylabel('Difference (Dys - Norm)')
-        ax4.set_title('Dys vs Norm Difference in Harmonic Mean', fontsize=13, fontweight='bold')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels(models, rotation=45, ha='right')
-        ax4.grid(True, alpha=0.3, axis='y')
-        
-        max_abs_diff = max(abs(avg_data['harmonic_diff'].min() or 0), abs(avg_data['harmonic_diff'].max() or 0))
-        if np.isnan(max_abs_diff) or max_abs_diff == 0:
-            max_abs_diff = 0.1
-        ax4.set_ylim(-max_abs_diff - 0.1, max_abs_diff + 0.1)
+                           ha='center', va='bottom', fontsize=10, fontweight='bold')
     
-    plt.tight_layout()
+    ax.set_xlabel('Model', fontsize=16)
+    ax.set_ylabel('Score', fontsize=16)
+    # Title with pad to make room for legend above
+    ax.set_title(f'Sensitivity & Specificity: Dys vs Typ ({task_type.title()})', 
+                fontsize=18, fontweight='bold', pad=60)
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=45, ha='right', fontsize=14)
+    
+    # Legend ABOVE the title
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.03), fontsize=12, ncol=4,
+              frameon=True, framealpha=0.95)
+    
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim(0, 1.05)
+    ax.tick_params(axis='y', labelsize=14)
+    
+    #plt.tight_layout()
     task_suffix = f"_{task_type}"
+    plt.subplots_adjust(top=0.78)
     plt.savefig(output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png', dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✓ Comprehensive subgroup Sen/Spec plot saved to: {output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png'}")
@@ -2295,59 +2370,65 @@ def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path, con
     """Create comprehensive robustness summary with CIs and ablation using ALL patients."""
     if df.empty:
         print(f"Warning: Empty dataframe for task {task_type}")
-        return
-    
+        return None, None
+
     task_df = df[df['Task'] == task_type]
     if task_df.empty:
         print(f"Warning: No data for task {task_type}")
-        return
-    
+        return None, None
+
+    # ---------------------------------------------------------------
+    # Initialize both variables so the final return is always safe
+    # ---------------------------------------------------------------
+    ci_df = None
+    ablation_data = None
+
     if task_type == 'classification':
         metric = config.ranking_metric_classification
     else:
         metric = config.ranking_metric_regression
-    
-    # Confidence intervals
-    ci_df = None
+
+    # Confidence intervals — bootstrap ACROSS models, per method
     try:
-        ci_df = compute_confidence_intervals(
-            task_df, metric, ['Model', 'Method_Label'], 
-            n_iterations=n_iterations, ci=0.95
-        )
-        
+        print(f"\n[CI] Computing cross-model CIs for {task_type}...")
+        ci_rows = []
+        for method_label, g in task_df.groupby('Method_Label'):
+            vals = g[metric].dropna().values
+            if len(vals) < 2:
+                print(f"  [CI] Skipping '{method_label}': only {len(vals)} model(s)")
+                continue
+            mean, lower, upper = bootstrap_ci(vals, n_iterations=n_iterations, ci=0.95)
+            ci_rows.append({
+                'Method_Label': method_label,
+                f'{metric}_mean': mean,
+                f'{metric}_lower_ci': lower,
+                f'{metric}_upper_ci': upper,
+                f'{metric}_std': np.nanstd(vals, ddof=1),
+                'n_models': len(vals),
+                'models': list(g['Model'].unique()),
+            })
+        ci_df = pd.DataFrame(ci_rows)
+
         if not ci_df.empty:
-            # Save full CI data
             ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv', index=False)
-            print(f"✓ Confidence intervals data saved to: {output_dir / f'confidence_intervals_{task_type}.csv'}")
-            
-            # Plot confidence intervals
-            plot_confidence_intervals(ci_df, metric, output_dir, config, task_type)
-            
-            # Print bootstrap summary
-            print_bootstrap_summary(ci_df, metric, config, task_type)
+            print(f"✓ Confidence intervals data saved to: "
+                  f"{output_dir / f'confidence_intervals_{task_type}.csv'}")
+
+            # Print a compact summary instead of the old plot
+            print(f"\n  Cross-model bootstrap CIs ({metric}, {n_iterations} iters):")
+            for _, row in ci_df.sort_values(f'{metric}_mean', ascending=False).iterrows():
+                print(f"    {row['Method_Label']:32s} "
+                      f"{row[f'{metric}_mean']:.3f} "
+                      f"[{row[f'{metric}_lower_ci']:.3f}, {row[f'{metric}_upper_ci']:.3f}] "
+                      f"n_models={row['n_models']}")
         else:
-            print(f"⚠ No confidence intervals could be computed for {task_type}")
+            print(f"⚠ No method had ≥2 models with non-NaN {metric} values")
     except Exception as e:
+        import traceback
         print(f"⚠ Error computing confidence intervals for {task_type}: {e}")
-    
-    # Ablation analysis using ALL patients
-    try:
-        ablation_data = perform_ablation_analysis_all_patients(task_df, config, task_type)
-        
-        if ablation_data and not ablation_data['ablation_results'].empty:
-            plot_ablation_results_all_patients(ablation_data, output_dir, config, task_type)
-            
-            ablation_df = ablation_data['ablation_results']
-            print(f"\n  Ablation Summary for {task_type.upper()} (ALL Patients):")
-            print(f"    Best method: {ablation_data['best_method']} ({ablation_data['best_score']:.4f})")
-            if not ablation_df.empty:
-                print(f"    Most impactful removal: {ablation_df.iloc[0]['Removed_Component']} "
-                      f"(Δ = {ablation_df.iloc[0]['Difference']:.4f}, p = {ablation_df.iloc[0]['p_value_ttest']:.4f})")
-        else:
-            print(f"⚠ No ablation results could be computed for {task_type}")
-    except Exception as e:
-        print(f"⚠ Error computing ablation analysis for {task_type}: {e}")
-    
+        traceback.print_exc()
+        ci_df = None
+
     return ci_df, ablation_data
 
 
