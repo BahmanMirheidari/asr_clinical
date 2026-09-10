@@ -1684,46 +1684,64 @@ def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
 
 def get_ultra_short_model_name(model_name: str, config: ExperimentConfig) -> str:
     """
-    Very compact model name for x-axis tick labels.
-    'microsoft.deberta-v3-base'  -> 'DeBERTa-B'
-    'distilroberta-base'         -> 'DistilR'
-    'roberta-large'              -> 'RoBERTa-L'
-    'bert-base-uncased'          -> 'BERT-B'
-    'bioclinicalbert'            -> 'BioClin'
+    Compact model name for axis tick labels.
+    Handles arbitrary patterns such as:
+      'microsoft.deberta-v3-base'        -> 'DeBERTa-B'
+      'distilroberta-base'               -> 'DistilR-B'
+      'roberta-large'                    -> 'RoBERTa-L'
+      'biomednlp-pubmedbert-base'        -> 'PubMed-B'
+      'biomednlp-pubmedbert-large'       -> 'PubMed-L'
+      'emilyalsentzer-bio_clinicalbert'  -> 'BioClin'
+      'allenai-scibert_scivocab_uncased' -> 'SciBERT'
     """
+    import re
+
     name = get_short_model_name(model_name, config)
+    ll = name.lower()
 
-    # Replace size words with single letters
-    replacements = [
-        ('-Base',       '-B'),
-        ('-Large',      '-L'),
-        ('-Small',      '-S'),
-        ('-base',       '-B'),
-        ('-large',      '-L'),
-        ('-small',      '-S'),
+    # 1) Identify the family by substring search (order matters — most specific first)
+    family_rules = [
+        ('bioclinicalbert',       'BioClin'),
+        ('bio_clinicalbert',      'BioClin'),
+        ('clinicalbert',          'ClinBERT'),
+        ('pubmedbert',            'PubMed'),
+        ('pubmed',                'PubMed'),
+        ('biomed-roberta',        'BioMedR'),
+        ('biomednlp-roberta',     'BioMedR'),
+        ('biomed',                'BioMed'),
+        ('scibert',               'SciBERT'),
+        ('legalbert',             'LegalB'),
+        ('distilroberta',         'DistilR'),
+        ('distilbert',            'Distil'),
+        ('deberta',               'DeBERTa'),
+        ('roberta',               'RoBERTa'),
+        ('albert',                'ALBERT'),
+        ('bert',                  'BERT'),
     ]
-    for full, short in replacements:
-        name = name.replace(full, short)
 
-    # Shorten common family prefixes
-    family_map = {
-        'DistilRoBERTa': 'DistilR',
-        'BioClinicalBERT': 'BioClin',
-        'ClinicalBERT':  'ClinBERT',
-        'BioMed': 'BioMedPMed', 
-        'PubMedBERT':    'PubMed',
-        'RoBERTa':       'RoBERTa',
-        'DeBERTa':       'DeBERTa',
-        'SciBERT':       'SciBERT',
-        'LegalBERT':     'LegalB',
-        'ALBERT':        'ALBERT',
-    }
-    for full, short in family_map.items():
-        if name.startswith(full):
-            name = short + name[len(full):]
+    family = None
+    for needle, label in family_rules:
+        if needle in ll:
+            family = label
             break
 
-    return name
+    # 2) Identify the size / variant
+    size = ''
+    if 'large' in ll:
+        size = '-L'
+    elif 'base' in ll:
+        size = '-B'
+    elif 'small' in ll:
+        size = '-S'
+
+    # 3) If we identified a family, use it; otherwise fall back to the first token
+    if family:
+        return f"{family}{size}"
+
+    # Fallback: first whitespace/hyphen token, truncated
+    token = re.split(r'[ _\-]', name)[0]
+    token = token[:10]
+    return token + size
 
 
 # =======================================================================
