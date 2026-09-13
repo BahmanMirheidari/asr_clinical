@@ -8,7 +8,7 @@ Key Metrics:
 - Subgroup analysis: Dys vs Norm for all metrics with Sen/Spec pairs
 - Robustness: Confidence Intervals (95%), Bootstrap resampling (1000 iterations)
 - Ablation: Component removal analysis using ALL patients data (not subgroups)
-- Scatter plots: Audio-Only vs Best Text vs Best Fusion for Dys subgroup
+- Scatter plots: Audio-Only vs Best Text vs Best Fusion for BOTH Dys and Norm subgroups
 
 Folder Structure:
 <main_dir>/
@@ -216,7 +216,7 @@ class ExperimentConfig:
     # Bootstrap iterations
     bootstrap_iterations: int = 1000
 
-    # Add this to ExperimentConfig:
+    # Fusion method groups
     fusion_method_groups: Dict[str, List[str]] = field(default_factory=lambda: {
         'Base Methods': ['audio_only', 'text_only', 'early', 'late'],
         'Advanced Methods': ['confidence', 'interaction', 'moe', 'mlp', 'stacking', 'cca', 'dynamic'],
@@ -552,6 +552,40 @@ def load_subgroup_predictions(experiments: Dict, model_name: str, method_key: st
     return None
 
 
+def load_predictions_unfiltered(experiments: Dict, model_name: str,
+                                method_key: str) -> Optional[pd.DataFrame]:
+    """
+    Load predictions for a model/method WITHOUT applying subgroup filter.
+    Used by the Dys/Norm scatter plot so we can split by speaker ID ourselves.
+    """
+    if model_name not in experiments:
+        return None
+    model_data = experiments[model_name]
+
+    # Direct hit (predictions stored under key 'predictions_<method>')
+    pred_key = f'predictions_{method_key}'
+    if pred_key in model_data:
+        pred_file = model_data[pred_key].get('predictions_file')
+        if pred_file and pred_file.exists():
+            return load_predictions_file(pred_file)
+
+    # Search the two standard sub-dirs
+    for source_key, subdir in [('meta_fusion', 'meta_fusion'),
+                               ('audio_only', 'leakage_safe_5fold')]:
+        base = model_data.get(source_key, {}).get('dir', '')
+        if not base:
+            continue
+        d = Path(base) / 'fusion_results' / subdir
+        if d.exists():
+            for pattern in (f"*{method_key}*_predictions.csv",
+                            f"*{method_key}*_predictions.txt"):
+                for f in d.glob(pattern):
+                    df = load_predictions_file(f)
+                    if df is not None:
+                        return df
+    return None
+
+
 # =======================================================================
 #  EXPERIMENT DISCOVERY
 # =======================================================================
@@ -759,6 +793,7 @@ def discover_experiments(base_dir: Path, task_type: str = 'all', config: Experim
     
     return dict(experiments)
 
+
 def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
                                  task_type: str = 'classification'):
     """Create visualization comparing meta-fusion methods."""
@@ -779,7 +814,7 @@ def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: Expe
         lambda x: get_method_display_name(x, config)
     )
     
-    # Add Model_Short column - THIS WAS MISSING!
+    # Add Model_Short column
     meta_df['Model_Short'] = meta_df['Model'].apply(
         lambda x: get_ultra_short_model_name(x, config)
     )
@@ -854,6 +889,7 @@ def plot_meta_fusion_comparison(df: pd.DataFrame, output_dir: Path, config: Expe
         plt.savefig(output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png', dpi=300, bbox_inches='tight')
         plt.close()
         print(f"✓ Meta-fusion comparison saved to: {output_dir / f'meta_fusion_comparison_{metric}{task_suffix}.png'}")
+
 
 # =======================================================================
 #  DATA AGGREGATION FUNCTIONS
@@ -991,17 +1027,21 @@ def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None, config:
 
 
 # =======================================================================
-#  SCATTER PLOT FUNCTIONS
+#  SCATTER PLOT FUNCTIONS (DYS + NORM SUBGROUPS)
 # =======================================================================
 
 def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dict, output_dir: Path, 
                                                 config: ExperimentConfig, task_type: str = 'regression',
                                                 dys_ids: List[str] = None):
     """
-    Create a single figure with three scatter plots for Dys subgroup showing:
-    - Audio-Only: ECAS Observed vs ECAS Predicted (using the only audio model)
-    - Best Text-Only: ECAS Observed vs ECAS Predicted (using the best text model by RMSE)
-    - Best Fusion: ECAS Observed vs ECAS Predicted (using the best fusion model by RMSE)
+    Create a single figure with three scatter plots showing BOTH Dys (red circles)
+    and Norm (blue triangles) subgroups on the same axes:
+      - Audio-Only: ECAS Observed vs ECAS Predicted (using the only audio model)
+      - Best Text-Only: ECAS Observed vs ECAS Predicted (best text model by Dys RMSE)
+      - Best Fusion: ECAS Observed vs ECAS Predicted (best fusion model by Dys RMSE)
+    
+    Per-subgroup RMSE / R² / n are reported in the legend, enabling direct
+    within-panel comparisons of Dys vs Norm performance.
     """
     if task_type != 'regression':
         print("Scatter plots only available for regression tasks")
@@ -1013,9 +1053,10 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         return
     
     if dys_ids:
-        print(f"\nUsing Dys subgroup with {len(dys_ids)} speaker IDs")
+        print(f"\nUsing Dys/Norm split with {len(dys_ids)} Dys speaker IDs")
     else:
-        print("\n⚠ No Dys speaker IDs provided. Using all data (not filtering).")
+        print("\n⚠ No Dys speaker IDs provided. Norm subgroup will be empty; "
+              "all points will be shown as Dys.")
     
     models = plot_df['Model'].unique()
     print(f"\nFound {len(models)} models for regression")
@@ -1024,13 +1065,11 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
     best_text_model = None
     best_text_method = None
     best_text_rmse = float('inf')
-    best_text_r2 = -float('inf')
     
     # ===== Find the BEST fusion model (by Dys RMSE) =====
     best_fusion_model = None
     best_fusion_method = None
     best_fusion_rmse = float('inf')
-    best_fusion_r2 = -float('inf')
     
     for model in models:
         model_df = plot_df[plot_df['Model'] == model]
@@ -1041,10 +1080,8 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
             method_df = model_df[model_df['Method'] == method]
             if 'subgroup_rmse' in method_df.columns and method_df['subgroup_rmse'].notna().any():
                 rmse_val = method_df['subgroup_rmse'].mean()
-                r2_val = method_df['subgroup_r2'].mean() if 'subgroup_r2' in method_df.columns else -float('inf')
                 if rmse_val < best_text_rmse:
                     best_text_rmse = rmse_val
-                    best_text_r2 = r2_val
                     best_text_model = model
                     best_text_method = method
         
@@ -1056,15 +1093,13 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
             method_df = model_df[model_df['Method'] == method]
             if 'subgroup_rmse' in method_df.columns and method_df['subgroup_rmse'].notna().any():
                 rmse_val = method_df['subgroup_rmse'].mean()
-                r2_val = method_df['subgroup_r2'].mean() if 'subgroup_r2' in method_df.columns else -float('inf')
                 if rmse_val < best_fusion_rmse:
                     best_fusion_rmse = rmse_val
-                    best_fusion_r2 = r2_val
                     best_fusion_model = model
                     best_fusion_method = method
     
-    print(f"\nBest Text-Only: {best_text_model} - {best_text_method} (RMSE={best_text_rmse:.3f}, R²={best_text_r2:.3f})")
-    print(f"Best Fusion: {best_fusion_model} - {best_fusion_method} (RMSE={best_fusion_rmse:.3f}, R²={best_fusion_r2:.3f})")
+    print(f"\nBest Text-Only: {best_text_model} - {best_text_method} (Dys RMSE={best_text_rmse:.3f})")
+    print(f"Best Fusion:    {best_fusion_model} - {best_fusion_method} (Dys RMSE={best_fusion_rmse:.3f})")
     
     # Audio-Only: just use 'audio_only'
     audio_method = 'audio_only'
@@ -1085,18 +1120,18 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         'axes.labelsize': 18,
         'xtick.labelsize': 15,
         'ytick.labelsize': 15,
-        'legend.fontsize': 15,   # Bigger legend font
+        'legend.fontsize': 14,
     })
     
     method_types = [
-        ('audio_only', 'Audio-Only', axes[0], '#E74C3C', 'o', audio_model, audio_method),
-        ('text_only', 'Best Text-Only', axes[1], '#3498DB', 's', best_text_model, best_text_method),
-        ('fusion', 'Best Fusion', axes[2], '#2ECC71', '^', best_fusion_model, best_fusion_method)
+        ('audio_only', 'Audio-Only', axes[0], audio_model, audio_method),
+        ('text_only', 'Best Text-Only', axes[1], best_text_model, best_text_method),
+        ('fusion', 'Best Fusion', axes[2], best_fusion_model, best_fusion_method)
     ]
     
     all_predictions = {}
     
-    for method_type, display_name, ax, color, marker, model, method in method_types:
+    for method_type, display_name, ax, model, method in method_types:
         if model is None or method is None:
             print(f"\n⚠ No model found for {display_name}")
             ax.text(0.5, 0.5, f'No model found\nfor {display_name}', 
@@ -1104,7 +1139,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
                    transform=ax.transAxes, fontsize=18)
             ax.set_xlabel('ECAS Observed', fontsize=18)
             ax.set_ylabel('ECAS Predicted', fontsize=18)
-            ax.set_title(f'{display_name}\nDys Subgroup', fontsize=20, fontweight='bold')
+            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20, fontweight='bold')
             ax.grid(True, alpha=0.3)
             continue
         
@@ -1114,126 +1149,146 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         print(f"  Method: {method}")
         print(f"{'='*50}")
         
-        # Try to load predictions for this specific model and method
-        pred_df = load_subgroup_predictions(experiments, model, method, dys_ids)
+        # Load UNFILTERED predictions so we can split Dys / Norm ourselves
+        pred_df = load_predictions_unfiltered(experiments, model, method)
         
-        if pred_df is not None:
-            print(f"  Found predictions with {len(pred_df)} Dys samples")
-            
-            # Find observed, predicted, and speaker ID columns
-            obs_col = None
-            pred_col = None
-            id_col = None
-            
-            for col in pred_df.columns:
-                col_lower = col.lower()
-                if any(x in col_lower for x in ['observed', 'true', 'actual', 'target', 'y_true']):
-                    obs_col = col
-                if any(x in col_lower for x in ['predicted', 'pred', 'y_pred', 'output']):
-                    pred_col = col
-                if any(x in col_lower for x in ['speaker', 'participant', 'subject', 'patient', 'id']):
-                    id_col = col
-            
-            if obs_col is not None and pred_col is not None:
-                # Get data
-                if id_col is not None:
-                    # Use speaker ID to deduplicate (in case of multiple folds)
-                    pred_df = pred_df.drop_duplicates(subset=[id_col], keep='first')
-                    obs_vals = pred_df[obs_col].values
-                    pred_vals = pred_df[pred_col].values
-                else:
-                    obs_vals = pred_df[obs_col].values
-                    pred_vals = pred_df[pred_col].values
-                
-                # Remove NaN values
-                mask = ~(np.isnan(obs_vals) | np.isnan(pred_vals))
-                obs_vals = obs_vals[mask]
-                pred_vals = pred_vals[mask]
-                
-                if len(obs_vals) > 0:
-                    print(f"  ✅ Extracted {len(obs_vals)} Dys samples")
-                    
-                    # Calculate metrics
-                    rmse = np.sqrt(np.mean((obs_vals - pred_vals) ** 2))
-                    r2 = pearsonr(obs_vals, pred_vals)[0] ** 2 if len(obs_vals) > 2 else np.nan
-                    n = len(obs_vals)
-                    
-                    # Scatter plot - BIGGER markers with THICKER edges
-                    ax.scatter(obs_vals, pred_vals, alpha=0.75, s=150, color=color, marker=marker, 
-                              edgecolors='black', linewidths=1.5,
-                              label=f'n={n}, RMSE={rmse:.3f}, R²={r2:.3f}')
-                    
-                    # Get data range for auto-scaling
-                    data_min = min(obs_vals.min(), pred_vals.min())
-                    data_max = max(obs_vals.max(), pred_vals.max())
-                    data_range = data_max - data_min
-                    
-                    # Add some padding (5% of range)
-                    padding = data_range * 0.05 if data_range > 0 else 1.0
-                    plot_min = data_min - padding
-                    plot_max = data_max + padding
-                    
-                    # Add identity line (y=x) - THICKER
-                    ax.plot([plot_min, plot_max], [plot_min, plot_max], 
-                           'k--', alpha=0.6, linewidth=3, label='y = x (perfect)')
-                    
-                    # Add regression line - THICKER
-                    if len(obs_vals) > 2:
-                        slope, intercept, r_value, p_value, std_err = linregress(obs_vals, pred_vals)
-                        x_line = np.linspace(plot_min, plot_max, 100)
-                        y_line = slope * x_line + intercept
-                        ax.plot(x_line, y_line, color='red', alpha=0.8, linewidth=3, 
-                               label=f'y={slope:.2f}x+{intercept:.2f}')
-                    
-                    ax.set_xlabel('ECAS Observed', fontsize=18)
-                    ax.set_ylabel('ECAS Predicted', fontsize=18)
-                    ax.set_title(f'{display_name}\nDys Subgroup', fontsize=20, fontweight='bold')
-                    # BIGGER legend font
-                    ax.legend(loc='best', fontsize=15, framealpha=0.95, 
-                              handletextpad=0.5, borderpad=0.6, labelspacing=0.6)
-                    ax.grid(True, alpha=0.3)
-                    ax.set_aspect('equal', adjustable='box')
-                    
-                    # Set limits from min to max with padding (NOT 0 to 136)
-                    ax.set_xlim(plot_min, plot_max)
-                    ax.set_ylim(plot_min, plot_max)
-                    
-                    # Store predictions
-                    all_predictions[method_type] = {
-                        'model': model,
-                        'method': method,
-                        'obs': obs_vals,
-                        'pred': pred_vals,
-                        'rmse': rmse,
-                        'r2': r2,
-                        'n': n
-                    }
-                else:
-                    print(f"  ⚠ No valid samples found")
-                    ax.text(0.5, 0.5, f'No valid samples', 
-                           horizontalalignment='center', verticalalignment='center',
-                           transform=ax.transAxes, fontsize=18)
-            else:
-                print(f"  ⚠ Could not find obs/pred columns")
-                print(f"  Available columns: {pred_df.columns.tolist()}")
-                ax.text(0.5, 0.5, f'No obs/pred columns', 
-                       horizontalalignment='center', verticalalignment='center',
-                       transform=ax.transAxes, fontsize=18)
-        else:
+        if pred_df is None:
             print(f"  ⚠ No predictions file found")
             ax.text(0.5, 0.5, f'No predictions file', 
                    horizontalalignment='center', verticalalignment='center',
                    transform=ax.transAxes, fontsize=18)
+            ax.set_xlabel('ECAS Observed', fontsize=18)
+            ax.set_ylabel('ECAS Predicted', fontsize=18)
+            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            continue
+        
+        print(f"  Loaded predictions with {len(pred_df)} rows (unfiltered)")
+        
+        # Locate obs, pred, and ID columns
+        obs_col = None
+        pred_col = None
+        id_col = None
+        
+        for col in pred_df.columns:
+            col_lower = col.lower()
+            if obs_col is None and any(x in col_lower for x in ['observed', 'true', 'actual', 'target', 'y_true']):
+                obs_col = col
+            if pred_col is None and any(x in col_lower for x in ['predicted', 'pred', 'y_pred', 'output']):
+                pred_col = col
+            if id_col is None and any(x in col_lower for x in ['speaker', 'participant', 'subject', 'patient', 'id']):
+                id_col = col
+        
+        if obs_col is None or pred_col is None:
+            print(f"  ⚠ Could not find obs/pred columns")
+            print(f"  Available columns: {pred_df.columns.tolist()}")
+            ax.text(0.5, 0.5, f'No obs/pred columns', 
+                   horizontalalignment='center', verticalalignment='center',
+                   transform=ax.transAxes, fontsize=18)
+            ax.set_xlabel('ECAS Observed', fontsize=18)
+            ax.set_ylabel('ECAS Predicted', fontsize=18)
+            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            continue
+        
+        # ------- Split into Dys / Norm using speaker IDs -------
+        if dys_ids and id_col is not None:
+            ids_str = pred_df[id_col].astype(str)
+            dys_id_strs = [str(x) for x in dys_ids]
+            dys_mask = ids_str.isin(dys_id_strs)
+            
+            dys_df = pred_df[dys_mask].drop_duplicates(subset=[id_col], keep='first')
+            norm_df = pred_df[~dys_mask].drop_duplicates(subset=[id_col], keep='first')
+        else:
+            # No split information — treat everything as one bucket
+            if id_col is not None:
+                dys_df = pred_df.drop_duplicates(subset=[id_col], keep='first')
+            else:
+                dys_df = pred_df
+            norm_df = pred_df.iloc[0:0]  # empty
+        
+        def _extract(df_sub):
+            if df_sub is None or df_sub.empty:
+                return np.array([]), np.array([])
+            o = pd.to_numeric(df_sub[obs_col], errors='coerce').values.astype(float)
+            p = pd.to_numeric(df_sub[pred_col], errors='coerce').values.astype(float)
+            m = ~(np.isnan(o) | np.isnan(p))
+            return o[m], p[m]
+        
+        dys_o, dys_p = _extract(dys_df)
+        norm_o, norm_p = _extract(norm_df)
+        
+        print(f"  Dys samples: {len(dys_o)} | Norm samples: {len(norm_o)}")
+        
+        if len(dys_o) == 0 and len(norm_o) == 0:
+            print(f"  ⚠ No valid samples found")
+            ax.text(0.5, 0.5, 'No valid samples', 
+                   horizontalalignment='center', verticalalignment='center',
+                   transform=ax.transAxes, fontsize=18)
+            ax.set_xlabel('ECAS Observed', fontsize=18)
+            ax.set_ylabel('ECAS Predicted', fontsize=18)
+            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            continue
+        
+        # ------- Per-subgroup metrics -------
+        def _metrics(o, p):
+            if len(o) < 2:
+                return (np.nan, np.nan, len(o))
+            rmse = float(np.sqrt(np.mean((o - p) ** 2)))
+            r2 = float(pearsonr(o, p)[0] ** 2) if len(o) > 2 else np.nan
+            return rmse, r2, len(o)
+        
+        dys_rmse, dys_r2, n_dys = _metrics(dys_o, dys_p)
+        norm_rmse, norm_r2, n_norm = _metrics(norm_o, norm_p)
+        
+        # ------- Scatter -------
+        if n_dys > 0:
+            ax.scatter(dys_o, dys_p, alpha=0.75, s=170, color='#E74C3C', marker='o',
+                       edgecolors='black', linewidths=1.4,
+                       label=f'Dys  (n={n_dys}, RMSE={dys_rmse:.3f}, R²={dys_r2:.3f})')
+        if n_norm > 0:
+            ax.scatter(norm_o, norm_p, alpha=0.60, s=150, color='#3498DB', marker='^',
+                       edgecolors='black', linewidths=1.2,
+                       label=f'Norm (n={n_norm}, RMSE={norm_rmse:.3f}, R²={norm_r2:.3f})')
+        
+        # ------- Axis limits from combined data -------
+        all_obs = np.concatenate([dys_o, norm_o]) if (len(dys_o) + len(norm_o)) > 0 else np.array([0.0, 1.0])
+        all_pred = np.concatenate([dys_p, norm_p]) if (len(dys_o) + len(norm_o)) > 0 else np.array([0.0, 1.0])
+        
+        dmin = float(np.nanmin([all_obs.min(), all_pred.min()]))
+        dmax = float(np.nanmax([all_obs.max(), all_pred.max()]))
+        rng = dmax - dmin if dmax > dmin else 1.0
+        pad = 0.05 * rng
+        lo, hi = dmin - pad, dmax + pad
+        
+        # Identity line
+        ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.6, linewidth=3, label='y = x (perfect)')
+        
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect('equal', adjustable='box')
         
         ax.set_xlabel('ECAS Observed', fontsize=18)
         ax.set_ylabel('ECAS Predicted', fontsize=18)
-        ax.set_title(f'{display_name}\nDys Subgroup', fontsize=20, fontweight='bold')
+        ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20, fontweight='bold')
+        ax.legend(loc='upper left', fontsize=13, framealpha=0.95,
+                  handletextpad=0.5, borderpad=0.6, labelspacing=0.6)
         ax.grid(True, alpha=0.3)
+        
+        # Store predictions for summary
+        all_predictions[method_type] = {
+            'model': model,
+            'method': method,
+            'dys':  {'obs': dys_o,  'pred': dys_p,  'rmse': dys_rmse,  'r2': dys_r2,  'n': n_dys},
+            'norm': {'obs': norm_o, 'pred': norm_p, 'rmse': norm_rmse, 'r2': norm_r2, 'n': n_norm},
+        }
     
     plt.tight_layout()
-    plt.savefig(output_dir / 'dys_scatter_audio_text_fusion_single.png', dpi=300, bbox_inches='tight')
+    out_png = output_dir / 'dys_scatter_audio_text_fusion_single.png'
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\n✓ Dys scatter plot saved to: {output_dir / 'dys_scatter_audio_text_fusion_single.png'}")
+    print(f"\n✓ Dys/Norm scatter plot saved to: {out_png}")
     
     # Reset font sizes to defaults
     plt.rcParams.update({
@@ -1245,32 +1300,40 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         'legend.fontsize': 10,
     })
     
-    # Create summary table
+    # ------- Summary CSV -------
     if all_predictions:
-        summary_data = []
-        for method_type, data in all_predictions.items():
-            display_name = {'audio_only': 'Audio-Only', 'text_only': 'Best Text-Only', 'fusion': 'Best Fusion'}[method_type]
-            summary_data.append({
-                'Method': display_name,
-                'Model': get_ultra_short_model_name(data['model'], config),
-                'Model_Full': data['model'],
-                'Method_Used': get_method_display_name(data['method'], config),
-                'Method_Key': data['method'],
-                'RMSE': data['rmse'],
-                'R²': data['r2'],
-                'N': data['n']
-            })
+        rows = []
+        panel_display = {
+            'audio_only': 'Audio-Only',
+            'text_only': 'Best Text-Only',
+            'fusion': 'Best Fusion',
+        }
+        for method_type, d in all_predictions.items():
+            panel_name = panel_display.get(method_type, method_type)
+            for grp_key, grp_label in [('dys', 'Dys'), ('norm', 'Norm')]:
+                g = d[grp_key]
+                rows.append({
+                    'Panel': panel_name,
+                    'Subgroup': grp_label,
+                    'Model': get_ultra_short_model_name(d['model'], config),
+                    'Model_Full': d['model'],
+                    'Method_Used': get_method_display_name(d['method'], config),
+                    'Method_Key': d['method'],
+                    'RMSE': g['rmse'],
+                    'R²': g['r2'],
+                    'N': g['n'],
+                })
         
-        summary_df = pd.DataFrame(summary_data)
+        summary_df = pd.DataFrame(rows)
         summary_df.to_csv(output_dir / 'dys_scatter_summary.csv', index=False)
-        print(f"✓ Dys scatter summary saved to: {output_dir / 'dys_scatter_summary.csv'}")
+        print(f"✓ Dys/Norm scatter summary saved to: {output_dir / 'dys_scatter_summary.csv'}")
         
-        print("\n  Dys Scatter Plot Summary:")
+        print("\n  Dys/Norm Scatter Plot Summary:")
         for _, row in summary_df.iterrows():
-            print(f"    {row['Method']}:")
-            print(f"      Model: {row['Model']} ({row['Model_Full']})")
-            print(f"      Method: {row['Method_Used']} ({row['Method_Key']})")
-            print(f"      RMSE: {row['RMSE']:.3f}, R²: {row['R²']:.3f}, n: {row['N']}")
+            print(f"    [{row['Panel']}] {row['Subgroup']:4s} | "
+                  f"{row['Model']} ({row['Model_Full']}) | "
+                  f"{row['Method_Used']} ({row['Method_Key']}) | "
+                  f"RMSE={row['RMSE']:.3f}, R²={row['R²']:.3f}, n={row['N']}")
     
     return all_predictions
 
@@ -1659,6 +1722,7 @@ def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path, con
 
     return ci_df, ablation_data
 
+
 def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
     """Get shortened display name for a model."""
     if model_name in config.model_name_mapping:
@@ -1681,6 +1745,7 @@ def get_short_model_name(model_name: str, config: ExperimentConfig) -> str:
             cleaned = cleaned[:-len(suffix)]
     
     return cleaned.title()
+
 
 def get_ultra_short_model_name(model_name: str, config: ExperimentConfig) -> str:
     """
@@ -2006,6 +2071,7 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
     print(f"✓ Ablation reference info saved: "
           f"{output_dir / f'ablation_reference_{task_type}.txt'}")
 
+
 # =======================================================================
 #  VISUALIZATION FUNCTIONS
 # =======================================================================
@@ -2297,94 +2363,144 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
 
 def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig,
                                           task_type: str = 'classification'):
-    """Create comprehensive Sen/Spec plots comparing Dys vs Typ - 4 bars with legend above title."""
+    """
+    Single-column Sen/Spec figure — vertical bars, two stacked panels.
+
+      Top panel:    Sensitivity (Dys vs Typ) for every fusion method
+      Bottom panel: Specificity (Dys vs Typ) for every fusion method
+
+    Splitting into two panels halves the number of bars per panel, so:
+      - bar width can be ~2× larger
+      - value labels fit at readable size
+      - method names get abbreviated → no rotated tick labels
+      - whole figure stays within a 3.5-inch column
+    """
     plot_df = df[df['Task'] == task_type].copy()
     if plot_df.empty:
         print(f"Warning: No data for task {task_type}")
-        return
-    
-    plot_df['Model_Short'] = plot_df['Model'].apply(lambda x: get_ultra_short_model_name(x, config))
-    
-    subgroup_sen = 'subgroup_sensitivity'
-    subgroup_spec = 'subgroup_specificity'
-    non_subgroup_sen = 'non_subgroup_sensitivity'
-    non_subgroup_spec = 'non_subgroup_specificity'
-    
-    if subgroup_sen not in plot_df.columns or subgroup_spec not in plot_df.columns:
-        print(f"Warning: Subgroup Sen/Spec columns not found")
-        return
-    
-    if non_subgroup_sen not in plot_df.columns or non_subgroup_spec not in plot_df.columns:
-        print(f"Warning: Non-subgroup (Typ) Sen/Spec columns not found")
-        return
-    
-    avg_data = plot_df.groupby('Model_Short').agg({
-        subgroup_sen: 'mean',
-        subgroup_spec: 'mean',
-        non_subgroup_sen: 'mean',
-        non_subgroup_spec: 'mean'
+        return None
+
+    cols = ['subgroup_sensitivity', 'subgroup_specificity',
+            'non_subgroup_sensitivity', 'non_subgroup_specificity']
+    missing = [c for c in cols if c not in plot_df.columns]
+    if missing:
+        print(f"Warning: missing subgroup columns {missing}")
+        return None
+
+    # ---- Aggregate by fusion METHOD (pooled over models) ----
+    grouped = plot_df.groupby('Method_Label').agg({
+        'subgroup_sensitivity':     'mean',
+        'subgroup_specificity':     'mean',
+        'non_subgroup_sensitivity': 'mean',
+        'non_subgroup_specificity': 'mean',
     }).reset_index()
-    
-    avg_data = avg_data.dropna(subset=[subgroup_sen, subgroup_spec, non_subgroup_sen, non_subgroup_spec])
-    
-    if avg_data.empty:
-        print(f"Warning: No valid data for subgroup Sen/Spec after dropping NaN")
-        return
-    
-    avg_data = avg_data.sort_values(subgroup_sen, ascending=False)
-    
-    fig, ax = plt.subplots(figsize=(16, max(8, len(avg_data) * 0.6)))
-    
-    models = avg_data['Model_Short'].values
-    x = np.arange(len(models))
-    width = 0.2
-    
-    bars1 = ax.bar(x - 1.5*width, avg_data[subgroup_sen], width, 
-                   label='Dys - Sensitivity', color='#E74C3C', alpha=0.9)
-    bars2 = ax.bar(x - 0.5*width, avg_data[subgroup_spec], width, 
-                   label='Dys - Specificity', color='#E74C3C', alpha=0.5, hatch='//')
-    bars3 = ax.bar(x + 0.5*width, avg_data[non_subgroup_sen], width, 
-                   label='Typ - Sensitivity', color='#3498DB', alpha=0.9)
-    bars4 = ax.bar(x + 1.5*width, avg_data[non_subgroup_spec], width, 
-                   label='Typ - Specificity', color='#3498DB', alpha=0.5, hatch='//')
-    
-    for bars in [bars1, bars2, bars3, bars4]:
-        for bar in bars:
-            height = bar.get_height()
-            if not np.isnan(height):
-                ax.annotate(f'{height:.2f}',
-                           xy=(bar.get_x() + bar.get_width() / 2, height),
-                           xytext=(0, 3),
-                           textcoords="offset points",
-                           ha='center', va='bottom', fontsize=10, fontweight='bold')
-    
-    ax.set_xlabel('Model', fontsize=16)
-    ax.set_ylabel('Score', fontsize=16)
-    # Title with pad to make room for legend above
-    ax.set_title(f'Sensitivity & Specificity: Dys vs Typ ({task_type.title()})', 
-                fontsize=18, fontweight='bold', pad=60)
-    ax.set_xticks(x)
-    ax.set_xticklabels(models, rotation=45, ha='right', fontsize=14)
-    
-    # Legend ABOVE the title
-    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.03), fontsize=12, ncol=4,
-              frameon=True, framealpha=0.95)
-    
-    ax.grid(True, alpha=0.3, axis='y')
-    ax.set_ylim(0, 1.05)
-    ax.tick_params(axis='y', labelsize=14)
-    
-    #plt.tight_layout()
-    task_suffix = f"_{task_type}"
-    plt.subplots_adjust(top=0.78)
-    plt.savefig(output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png', dpi=300, bbox_inches='tight')
+
+    grouped = grouped.dropna()
+    if grouped.empty:
+        print("Warning: no valid Sen/Spec rows for any method")
+        return None
+
+    # Sort by Dys sensitivity so the story reads left-to-right
+    grouped = grouped.sort_values('subgroup_sensitivity', ascending=False).reset_index(drop=True)
+
+    # ---- Shorten method names so they fit without heavy rotation ----
+    def shorten(name: str) -> str:
+        s = (name.replace(' Fusion', '')
+                 .replace('-Weighted', '')
+                 .replace('Model-Based ', '')
+                 .replace('Mixture of Experts', 'MoE')
+                 .replace('Cross-Attention', 'CrossAtt')
+                 .replace('Interaction Stacking', 'InterStack')
+                 .replace('Adaptive Weighted', 'AdaptW'))
+        return s.strip()
+
+    short_labels = [shorten(m) for m in grouped['Method_Label']]
+
+    n_methods = len(grouped)
+
+    # ==================================================================
+    #  FIGURE — 2 stacked panels, single-column width
+    # ==================================================================
+    fig, (ax_sen, ax_spec) = plt.subplots(
+        2, 1,
+        figsize=(3.5, 5.6),
+        sharex=True,
+        constrained_layout=True,
+    )
+
+    x = np.arange(n_methods)
+    bar_w = 0.38           # 2 bars per method → can be this wide
+
+    # ============ Top panel — Sensitivity ============
+    ax_sen.bar(x - bar_w/2, grouped['subgroup_sensitivity'], bar_w,
+               label='Dys', color='#E74C3C', alpha=0.92,
+               edgecolor='black', linewidth=0.5)
+    ax_sen.bar(x + bar_w/2, grouped['non_subgroup_sensitivity'], bar_w,
+               label='Typ', color='#3498DB', alpha=0.92,
+               edgecolor='black', linewidth=0.5)
+
+    for xi, (d, n) in enumerate(zip(grouped['subgroup_sensitivity'],
+                                     grouped['non_subgroup_sensitivity'])):
+        ax_sen.text(xi - bar_w/2, d + 0.02, f'{d:.2f}',
+                    ha='center', va='bottom', fontsize=5.5, fontweight='bold')
+        ax_sen.text(xi + bar_w/2, n + 0.02, f'{n:.2f}',
+                    ha='center', va='bottom', fontsize=5.5, fontweight='bold')
+
+    ax_sen.set_ylabel('Sensitivity', fontsize=7.5, labelpad=2)
+    ax_sen.set_ylim(0, 1.15)
+    ax_sen.tick_params(axis='y', labelsize=6.5, pad=2, length=2.5)
+    ax_sen.grid(True, alpha=0.30, axis='y', linewidth=0.5)
+    ax_sen.legend(loc='lower right', fontsize=6.2, framealpha=0.95,
+                  handletextpad=0.4, borderpad=0.35, labelspacing=0.25,
+                  ncol=2)
+    ax_sen.set_title(f'Dys vs Typ Sensitivity & Specificity ({task_type.title()})',
+                     fontsize=7.8, fontweight='bold', pad=4)
+
+    # ============ Bottom panel — Specificity ============
+    ax_spec.bar(x - bar_w/2, grouped['subgroup_specificity'], bar_w,
+                label='Dys', color='#E74C3C', alpha=0.55,
+                edgecolor='black', linewidth=0.5, hatch='//')
+    ax_spec.bar(x + bar_w/2, grouped['non_subgroup_specificity'], bar_w,
+                label='Typ', color='#3498DB', alpha=0.55,
+                edgecolor='black', linewidth=0.5, hatch='\\\\')
+
+    for xi, (d, n) in enumerate(zip(grouped['subgroup_specificity'],
+                                     grouped['non_subgroup_specificity'])):
+        ax_spec.text(xi - bar_w/2, d + 0.02, f'{d:.2f}',
+                     ha='center', va='bottom', fontsize=5.5, fontweight='bold')
+        ax_spec.text(xi + bar_w/2, n + 0.02, f'{n:.2f}',
+                     ha='center', va='bottom', fontsize=5.5, fontweight='bold')
+
+    ax_spec.set_ylabel('Specificity', fontsize=7.5, labelpad=2)
+    ax_spec.set_ylim(0, 1.15)
+    ax_spec.tick_params(axis='y', labelsize=6.5, pad=2, length=2.5)
+    ax_spec.grid(True, alpha=0.30, axis='y', linewidth=0.5)
+    ax_spec.legend(loc='lower right', fontsize=6.2, framealpha=0.95,
+                   handletextpad=0.4, borderpad=0.35, labelspacing=0.25,
+                   ncol=2)
+
+    # ---- Shared x-axis (only bottom panel carries the labels) ----
+    ax_spec.set_xticks(x)
+    ax_spec.set_xticklabels(short_labels,
+                            rotation=40, ha='right',
+                            fontsize=6.2)
+    ax_spec.tick_params(axis='x', length=2.5, width=0.6, pad=1.5)
+    ax_spec.set_xlabel('Fusion Method', fontsize=7.5, labelpad=2)
+
+    # ---- Save PNG + vector PDF ----
+    out_png = output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png'
+    out_pdf = output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.pdf'
+    plt.savefig(out_png, dpi=300, bbox_inches='tight', pad_inches=0.03)
+    plt.savefig(out_pdf, bbox_inches='tight', pad_inches=0.03)
     plt.close()
-    print(f"✓ Comprehensive subgroup Sen/Spec plot saved to: {output_dir / f'subgroup_sen_spec_comprehensive_{task_type}.png'}")
-    
-    avg_data.to_csv(output_dir / f'subgroup_sen_spec_data_{task_type}.csv', index=False)
-    print(f"✓ Subgroup Sen/Spec data saved to: {output_dir / f'subgroup_sen_spec_data_{task_type}.csv'}")
-    
-    return avg_data
+    print(f"✓ Comprehensive subgroup Sen/Spec plot saved to: {out_png}")
+    print(f"✓ Vector PDF saved to: {out_pdf}")
+
+    grouped.to_csv(output_dir / f'subgroup_sen_spec_data_{task_type}.csv', index=False)
+    print(f"✓ Subgroup Sen/Spec data saved to: "
+          f"{output_dir / f'subgroup_sen_spec_data_{task_type}.csv'}")
+
+    return grouped
 
 
 def plot_subgroup_comparison(df: pd.DataFrame, output_dir: Path, config: ExperimentConfig, 
@@ -2538,7 +2654,6 @@ def create_summary_table(df: pd.DataFrame, output_dir: Path, config: ExperimentC
         flat_summary.reset_index().to_csv(output_dir / flat_filename, index=False)
 
 
-
 # =======================================================================
 #  MAIN FUNCTION
 # =======================================================================
@@ -2570,7 +2685,7 @@ def main():
     parser.add_argument('--no-robustness', action='store_true',
                         help='Skip robustness analysis (CI and ablation)')
     parser.add_argument('--no-scatter', action='store_true',
-                        help='Skip scatter plots for Dys subgroup')
+                        help='Skip scatter plots for Dys/Norm subgroups')
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed progress information')
     parser.add_argument('--no-plots', action='store_true',
@@ -2600,8 +2715,8 @@ def main():
         if not dys_ids:
             print("Warning: No Dys speaker IDs loaded. Scatter plots will use all data.")
     else:
-        print("\nNo Dys speaker ID file provided. Scatter plots will use all data.")
-        print("To filter for Dys subgroup, provide --dys-ids with a file containing speaker IDs.")
+        print("\nNo Dys speaker ID file provided. Scatter plots will show all points as Dys.")
+        print("To filter for Dys/Norm split, provide --dys-ids with a file containing speaker IDs.")
     
     base_dir = Path(args.input_dir)
     experiments = discover_experiments(base_dir, args.task, config)
@@ -2705,15 +2820,14 @@ def main():
             print(f"\nProcessing {task} task...")
             plot_robustness_summary_all_patients(df, output_dir, config, task, args.bootstrap_iterations)
     
-    # ===== SCATTER PLOTS FOR DYS SUBGROUP =====
+    # ===== SCATTER PLOTS FOR DYS + NORM SUBGROUPS =====
     if not args.no_scatter and 'regression' in df['Task'].unique():
         print(f"\n{'='*60}")
-        print(f"GENERATING DYS SCATTER PLOTS")
+        print(f"GENERATING DYS + NORM SCATTER PLOTS")
         print(f"{'='*60}")
         plot_dys_scatter_audio_text_fusion_single(df, experiments, output_dir, config, 'regression', dys_ids)
     
     # ===== PLOTS =====
-        # ===== PLOTS =====
     if not args.no_plots:
         print(f"\n{'='*60}")
         print(f"GENERATING FIGURES")
@@ -2821,14 +2935,14 @@ def main():
     print(f"  - Confidence intervals: confidence_intervals_*.csv and plots")
     print(f"  - Bootstrap summary printed above")
     print(f"  - Ablation analysis (ALL patients): ablation_*_all_patients_*.csv and plots")
-    print(f"  - Dys scatter plots: dys_scatter_*.png")
-    print(f"  - Dys scatter summary: dys_scatter_summary.csv (includes which models were used)")
+    print(f"  - Dys/Norm scatter plots: dys_scatter_audio_text_fusion_single.png")
+    print(f"  - Dys/Norm scatter summary: dys_scatter_summary.csv (includes per-subgroup metrics)")
+    print(f"  - Subgroup Sen/Spec by fusion method: subgroup_sen_spec_comprehensive_*.png")
     print(f"  - Bootstrap iterations: {args.bootstrap_iterations}")
 
 
 if __name__ == "__main__":
     main()
-
 '''
 python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate --subgroup --top-k 5 --bootstrap-iterations 10000 --ignore-methods mlp --verbose --dys-ids dysarthria-list.txt| tee outputs-ensemble-aggregate/log.txt
 '''
