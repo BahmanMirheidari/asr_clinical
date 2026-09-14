@@ -3,9 +3,10 @@ Standalone heatmap generator — grouped by method family.
 
 Reads all_results.csv from the aggregator and produces a heatmap with:
 
-  Top:            Clinical-Only reference bar (LLM-independent), label on the left
-  Middle blocks:  Baseline / Fusion / Ensemble, separated by thin gaps
-  Within a block: sorted by mean macro-F1 descending
+  Top:            Clinical-Feature-Only reference bar (LLM-independent),
+                  label on the left.
+  Middle blocks:  Baseline / Fusion / Ensemble, separated by thin gaps.
+  Within a block: sorted by mean macro-F1 descending.
 
 Palette: Blues (sequential, light = low, dark = high).
 
@@ -23,14 +24,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.colors import Normalize
+from matplotlib.patches import Rectangle
 
 
 # =======================================================================
 #  CONFIG
 # =======================================================================
 
-INPUT_CSV  = Path('/mnt/parscratch/users/ac1bm/MND-expr/outputs-ensemble-aggregate-classification/all_results.csv')
-OUTPUT_DIR = Path('/mnt/parscratch/users/ac1bm/MND-expr/outputs-ensemble-aggregate-classification') 
+INPUT_CSV  = Path('/mnt/parscratch/users/ac1bm/MND-expr/'
+                  'outputs-ensemble-aggregate-classification/all_results.csv')
+OUTPUT_DIR = Path('/mnt/parscratch/users/ac1bm/MND-expr/'
+                  'outputs-ensemble-aggregate-classification')
 
 METRIC    = 'macro_f1'
 TASK_TYPE = 'classification'
@@ -45,11 +49,14 @@ VMIN, VMAX = 0.68, 0.90
 #  NAME HELPERS
 # =======================================================================
 
-SHORT_LABELS = {
-    'Clinical-Feature-Only': 'Clinical-Only',
-    'Text-Embedding-Only':   'Text-Only',
+# Force these display names regardless of what the CSV contains. This keeps
+# the heatmap terminology consistent with the three-marker plot, the
+# ablation figure, and the results text.
+BASELINE_RENAME = {
     'Audio-Only':            'Clinical-Feature-Only',
+    'Clinical-Only':         'Clinical-Feature-Only',
     'Text-Only':             'Text-Embedding-Only',
+    'Text-Embedding':        'Text-Embedding-Only',
 }
 
 
@@ -57,18 +64,18 @@ def shorten_model(name: str) -> str:
     """Compact LLM names for axis ticks."""
     ll = name.lower()
     rules = [
-        ('biomednlp', 'BioMedNLP'),
-        ('biomed',    'BioMed'),
-        ('clinical',  'ClinicalBERT'),
-        ('distil',    'DistilRoBERTa'),
+        ('biomednlp',     'BioMedNLP'),
+        ('biomed',        'BioMed'),
+        ('clinical',      'ClinicalBERT'),
+        ('distil',        'DistilRoBERTa'),
         ('roberta-large', 'RoBERTa-L'),
-        ('roberta-l', 'RoBERTa-L'),
+        ('roberta-l',     'RoBERTa-L'),
         ('roberta-base',  'RoBERTa-B'),
-        ('roberta-b', 'RoBERTa-B'),
-        ('roberta',   'RoBERTa'),
-        ('deberta',   'DeBERTa'),
-        ('albert',    'ALBERT'),
-        ('bert',      'BERT'),
+        ('roberta-b',     'RoBERTa-B'),
+        ('roberta',       'RoBERTa'),
+        ('deberta',       'DeBERTa'),
+        ('albert',        'ALBERT'),
+        ('bert',          'BERT'),
     ]
     for needle, label in rules:
         if needle in ll:
@@ -112,6 +119,9 @@ df['Model_Short'] = df['Model'].apply(shorten_model)
 
 method_col = 'Method_Label' if 'Method_Label' in df.columns else 'Method'
 
+# Force the paper's baseline terminology
+df[method_col] = df[method_col].replace(BASELINE_RENAME)
+
 pivot = df.pivot_table(
     index=method_col, columns='Model_Short',
     values=METRIC, aggfunc='mean',
@@ -137,10 +147,15 @@ if main_rows.empty:
     print("ERROR: no LLM-dependent rows to plot")
     sys.exit(0)
 
-# Shorten labels for display
-main_rows.index = [SHORT_LABELS.get(str(m), str(m)) for m in main_rows.index]
-baseline_rows.index = [SHORT_LABELS.get(str(m), str(m))
-                       for m in baseline_rows.index]
+print("LLM-dependent methods:")
+for m in main_rows.index:
+    print(f"  {m}")
+
+if not baseline_rows.empty:
+    print("\nLLM-independent baselines:")
+    for m in baseline_rows.index:
+        v = baseline_rows.loc[m].dropna().iloc[0]
+        print(f"  {m} = {v:.4f}")
 
 
 # =======================================================================
@@ -162,7 +177,7 @@ for block in block_order:
     ordered_rows.extend(means.index.tolist())
     block_sizes[block] = len(means)
 
-# Fallback for any method that didn't match a block
+# Fallback for anything that didn't match a known block
 unknown = [m for m in main_rows.index if m not in ordered_rows]
 if unknown:
     sub = main_rows.loc[unknown]
@@ -172,7 +187,7 @@ if unknown:
 
 main_rows = main_rows.loc[ordered_rows]
 
-print("Row ordering:")
+print("\nRow ordering:")
 for block in block_order + ['Other']:
     n = block_sizes.get(block, 0)
     if n == 0:
@@ -190,8 +205,11 @@ for block in block_order + ['Other']:
 n_rows = len(main_rows)
 n_cols = len(main_rows.columns)
 
-TOP_PAD    = 0.9    # extra vertical space above the matrix for the reference bar
-BOTTOM_PAD = 0.2
+# Reserve vertical room inside the axes for the reference bar. We draw
+# the bar in data coordinates above the matrix, so TOP_PAD must cover the
+# bar plus its label.
+TOP_PAD    = 1.4
+BOTTOM_PAD = 0.3
 
 fig, ax = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
 
@@ -224,7 +242,7 @@ for y in block_boundaries:
     ax.axhline(y, color='white', linewidth=3.0, zorder=4)
     ax.axhline(y, color='#888888', linewidth=0.6, zorder=5)
 
-# ---- Baseline reference bar(s) at the top, label on the LEFT ----
+# ---- Baseline reference bar(s) above the matrix ----
 cmap_obj = plt.get_cmap(CMAP)
 norm = Normalize(vmin=VMIN, vmax=VMAX)
 
@@ -235,26 +253,35 @@ for i, (name, row) in enumerate(baseline_rows.iterrows()):
     value = float(vals.iloc[0])
     colour = cmap_obj(norm(value))
 
-    y_line = -0.55 - i * 0.55      # above the matrix (negative y in heatmap)
+    # Slightly above the top row of the matrix (negative y in heatmap space)
+    y_line = -0.55 - i * 0.65
 
-    # Coloured bar spanning the full matrix width
-    ax.plot([0, n_cols], [y_line, y_line],
-            color=colour, linewidth=8.0, solid_capstyle='butt',
-            clip_on=False, zorder=5)
+    # Coloured bar drawn as a Rectangle in data coordinates. Using
+    # add_patch (rather than ax.plot) ensures the artist is included in
+    # the tight bounding box, which is what prevents clipping in LaTeX.
+    bar = Rectangle(
+        (0, y_line - 0.12),
+        n_cols, 0.24,
+        facecolor=colour,
+        edgecolor='black',
+        linewidth=0.4,
+        clip_on=False,
+        zorder=10,
+    )
+    ax.add_patch(bar)
 
-    # Thin black outlines for readability
-    ax.plot([0, n_cols], [y_line + 0.13, y_line + 0.13],
-            color='black', linewidth=0.4, clip_on=False, zorder=4)
-    ax.plot([0, n_cols], [y_line - 0.13, y_line - 0.13],
-            color='black', linewidth=0.4, clip_on=False, zorder=4)
-
-    # Label on the LEFT side of the bar
+    # Label on the LEFT of the bar
     ax.text(-0.15, y_line,
             f'{name} = {value:.3f}',
-            va='center', ha='right', fontsize=7.5, clip_on=False)
+            va='center', ha='right',
+            fontsize=7.5, clip_on=False, zorder=11)
 
-# Extend y-limits to include the top reference bar
+# Extend y-limits to include the reference bar; also draw an invisible
+# artist at the outer edge of the reserved area to force bbox_inches
+# 'tight' to include the whole reference-bar region.
 ax.set_ylim(n_rows + BOTTOM_PAD, -TOP_PAD)
+ax.plot([0, n_cols], [-TOP_PAD + 0.05, -TOP_PAD + 0.05],
+        color='none', clip_on=False)
 
 # ---- Cosmetics ----
 ax.set_title('Macro-F1 by Method and LLM',
@@ -277,8 +304,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 out_pdf = OUTPUT_DIR / f'heatmap_{METRIC}_{TASK_TYPE}.pdf'
 out_png = OUTPUT_DIR / f'heatmap_{METRIC}_{TASK_TYPE}.png'
-plt.savefig(out_pdf, dpi=300, bbox_inches='tight')
-plt.savefig(out_png, dpi=300, bbox_inches='tight')
+
+# pad_inches=0.15 keeps a small margin around the tight bounding box,
+# which guarantees the reference bar is not clipped in the PDF.
+plt.savefig(out_pdf, dpi=300, bbox_inches='tight', pad_inches=0.15)
+plt.savefig(out_png, dpi=300, bbox_inches='tight', pad_inches=0.15)
 plt.close()
 
 print(f"\n✓ Saved: {out_pdf.name}")

@@ -2473,10 +2473,10 @@ def plot_sens_spec_three_marker(df, output_dir, config,
                  'subgroup data unavailable for this method.',
                  fontsize=5, color='#2C3E50', ha='center', va='top')
 
-    plt.suptitle(
+    ax_sen.set_title(
         f'Dys, Combined, and Typ Performance across Fusion Methods '
         f'({task_type.title()})',
-        fontsize=7, fontweight='bold', y=1.02,
+        fontsize=7, fontweight='bold', pad=4,
     )
     plt.tight_layout()
     plt.savefig(output_dir / f'sens_spec_three_marker_{task_type}.png',
