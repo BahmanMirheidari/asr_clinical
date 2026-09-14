@@ -64,6 +64,72 @@ plt.rcParams['savefig.bbox'] = 'tight'
 
 
 # =======================================================================
+#  GLOBAL ENSEMBLE / META-FUSION IDENTIFICATION HELPERS
+# =======================================================================
+
+# Master blocklist of ensemble / meta-fusion identifiers.
+# Covers both raw keys (e.g. 'ensemble_weighted', 'meta_fusion') and
+# display-label variants (e.g. 'Weighted Ensemble', 'Meta-Fusion').
+ENSEMBLE_IDENTIFIERS: Set[str] = {
+    # Raw key style
+    'ensemble_average', 'ensemble_voting', 'ensemble_stacking',
+    'ensemble_weighted', 'ensemble_confidence_selection', 'ensemble_best',
+    'meta_fusion', 'meta_fusion_summary',
+    # Display-label style
+    'Average Ensemble', 'Voting Ensemble', 'Stacking Ensemble',
+    'Weighted Ensemble', 'Confidence Selection', 'Best Method',
+    'Meta-Fusion', 'Meta Fusion', 'Meta-Fusion Ensemble',
+}
+
+
+def is_ensemble_method(method_key: Any) -> bool:
+    """
+    Return True if *method_key* refers to any ensemble / meta-fusion method.
+
+    Detects:
+      - Exact matches against ENSEMBLE_IDENTIFIERS (keys or labels).
+      - Any string starting with 'ensemble_'.
+      - Any string containing the word 'ensemble' (case-insensitive).
+      - Any string whose lower-cased, space/hyphen/underscore-stripped form
+        equals 'metafusion'.
+    """
+    if method_key is None:
+        return False
+    if not isinstance(method_key, str):
+        return False
+    if method_key in ENSEMBLE_IDENTIFIERS:
+        return True
+    ml = method_key.lower().strip()
+    if ml.startswith('ensemble_'):
+        return True
+    if 'ensemble' in ml:
+        return True
+    stripped = ml.replace('-', '').replace('_', '').replace(' ', '')
+    if stripped in ('metafusion', 'metafusionsummary'):
+        return True
+    return False
+
+
+def filter_out_ensembles(
+    df: pd.DataFrame,
+    method_col: str = 'Method',
+    label_col: str = 'Method_Label',
+) -> pd.DataFrame:
+    """
+    Return a copy of *df* with all ensemble / meta-fusion rows removed.
+    Checks both the raw Method key column and the Method_Label column.
+    """
+    if df.empty:
+        return df.copy()
+    mask = pd.Series(False, index=df.index)
+    if method_col in df.columns:
+        mask = mask | df[method_col].apply(is_ensemble_method)
+    if label_col in df.columns:
+        mask = mask | df[label_col].apply(is_ensemble_method)
+    return df[~mask].copy()
+
+
+# =======================================================================
 #  CONFIGURATION
 # =======================================================================
 
@@ -1039,7 +1105,11 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
       - Audio-Only: ECAS Observed vs ECAS Predicted (using the only audio model)
       - Best Text-Only: ECAS Observed vs ECAS Predicted (best text model by Dys RMSE)
       - Best Fusion: ECAS Observed vs ECAS Predicted (best fusion model by Dys RMSE)
-    
+
+    Ensemble / meta-fusion methods are STRICTLY EXCLUDED from the Best-Fusion
+    panel. Both raw keys (ensemble_weighted, meta_fusion, ...) and display
+    labels (Weighted Ensemble, ...) are recognised and filtered out.
+
     Per-subgroup RMSE / R² / n are reported in the legend, enabling direct
     within-panel comparisons of Dys vs Norm performance.
     """
@@ -1067,6 +1137,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
     best_text_rmse = float('inf')
     
     # ===== Find the BEST fusion model (by Dys RMSE) =====
+    # Explicitly EXCLUDES all ensemble / meta-fusion methods.
     best_fusion_model = None
     best_fusion_method = None
     best_fusion_rmse = float('inf')
@@ -1074,7 +1145,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
     for model in models:
         model_df = plot_df[plot_df['Model'] == model]
         
-        # Find best text-only method for this model
+        # ----- Best text-only method for this model -----
         text_methods = [m for m in model_df['Method'].unique() if 'text' in m.lower()]
         for method in text_methods:
             method_df = model_df[model_df['Method'] == method]
@@ -1085,10 +1156,17 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
                     best_text_model = model
                     best_text_method = method
         
-        # Find best fusion method for this model (not audio_only, not text_only)
-        fusion_methods = [m for m in model_df['Method'].unique() 
-                         if m not in ['audio_only'] and not m.startswith('ensemble_') 
-                         and 'text' not in m.lower()]
+        # ----- Best fusion method for this model -----
+        # Exclusion rules:
+        #   (1) not audio-only
+        #   (2) not text-only
+        #   (3) not an ensemble / meta-fusion method (via is_ensemble_method)
+        fusion_methods = [
+            m for m in model_df['Method'].unique()
+            if m != 'audio_only'
+            and 'text' not in m.lower()
+            and not is_ensemble_method(m)
+        ]
         for method in fusion_methods:
             method_df = model_df[model_df['Method'] == method]
             if 'subgroup_rmse' in method_df.columns and method_df['subgroup_rmse'].notna().any():
@@ -1098,9 +1176,6 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
                     best_fusion_model = model
                     best_fusion_method = method
     
-    print(f"\nBest Text-Only: {best_text_model} - {best_text_method} (Dys RMSE={best_text_rmse:.3f})")
-    print(f"Best Fusion:    {best_fusion_model} - {best_fusion_method} (Dys RMSE={best_fusion_rmse:.3f})")
-    
     # Audio-Only: just use 'audio_only'
     audio_method = 'audio_only'
     audio_model = None
@@ -1109,6 +1184,37 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         if audio_method in model_df['Method'].unique():
             audio_model = model
             break
+    
+    # ------------------------------------------------------------------
+    #  DIAGNOSTIC: print the exact selection for both Best Text and Best Fusion
+    # ------------------------------------------------------------------
+    print(f"\n{'='*70}")
+    print("SCATTER PLOT — METHOD SELECTION (Regression, ranked by Dys RMSE)")
+    print(f"{'='*70}")
+    print(f"  Audio-Only  panel: model  = {audio_model}")
+    print(f"                     method = {audio_method}")
+    print(f"  Best Text   panel: model  = {best_text_model}")
+    print(f"                     method = {best_text_method}  (Dys RMSE = {best_text_rmse:.4f})")
+    print(f"                     label  = {get_method_display_name(best_text_method, config) if best_text_method else 'N/A'}")
+    print(f"  Best Fusion panel: model  = {best_fusion_model}")
+    print(f"                     method = {best_fusion_method}  (Dys RMSE = {best_fusion_rmse:.4f})")
+    print(f"                     label  = {get_method_display_name(best_fusion_method, config) if best_fusion_method else 'N/A'}")
+
+    # Show what was EXCLUDED from the fusion search
+    all_non_text_non_audio = set()
+    for model in models:
+        model_df = plot_df[plot_df['Model'] == model]
+        for m in model_df['Method'].unique():
+            if m != 'audio_only' and 'text' not in m.lower():
+                all_non_text_non_audio.add(m)
+    excluded_ensembles = sorted([m for m in all_non_text_non_audio if is_ensemble_method(m)])
+    print(f"\n  Ensemble / meta-fusion methods EXCLUDED from Best-Fusion search ({len(excluded_ensembles)}):")
+    if excluded_ensembles:
+        for m in excluded_ensembles:
+            print(f"    ✗ {m}  ({get_method_display_name(m, config)})")
+    else:
+        print(f"    (none found)")
+    print(f"{'='*70}\n")
     
     # Create a single figure with 3 subplots - larger figure for better readability
     fig, axes = plt.subplots(1, 3, figsize=(24, 8))
@@ -1146,7 +1252,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
         print(f"\n{'='*50}")
         print(f"Collecting {display_name} predictions...")
         print(f"  Model: {get_ultra_short_model_name(model, config)} ({model})")
-        print(f"  Method: {method}")
+        print(f"  Method: {method}  ({get_method_display_name(method, config)})")
         print(f"{'='*50}")
         
         # Load UNFILTERED predictions so we can split Dys / Norm ourselves
@@ -1319,6 +1425,7 @@ def plot_dys_scatter_audio_text_fusion_single(df: pd.DataFrame, experiments: Dic
                     'Model_Full': d['model'],
                     'Method_Used': get_method_display_name(d['method'], config),
                     'Method_Key': d['method'],
+                    'Is_Ensemble': is_ensemble_method(d['method']),
                     'RMSE': g['rmse'],
                     'R²': g['r2'],
                     'N': g['n'],
@@ -1486,22 +1593,16 @@ def perform_ablation_analysis_all_patients(df, config, task_type='classification
     if task_df.empty:
         return {}
 
-    # ---- Ensemble labels defined HERE, unconditionally ----
-    ensemble_labels = {
-        'average ensemble',
-        'voting ensemble',
-        'stacking ensemble',
-        'weighted ensemble',
-        'confidence selection',
-        'best method',
-    }
-    is_ensemble = task_df['Method_Label'].str.lower().str.strip().isin(ensemble_labels)
+    # ---- Ensemble detection using the shared helper ----
+    is_ensemble = task_df.apply(
+        lambda row: is_ensemble_method(row.get('Method')) or is_ensemble_method(row.get('Method_Label')),
+        axis=1,
+    )
     base_df = task_df.copy()      # keep everything for ranking
 
     if verbose:
-        print(f"\n  Ensemble labels recognised: {sorted(ensemble_labels)}")
         ens_in = task_df[is_ensemble]['Method_Label'].unique().tolist()
-        print(f"  Ensemble rows present (kept for ranking): {sorted(ens_in)}")
+        print(f"  Ensemble/meta-fusion rows present (kept for ranking): {sorted(ens_in)}")
     # ---- end ----
 
     # Filter to methods that have the overall metric
@@ -1820,22 +1921,12 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
 
     Contract with the caller (perform_ablation_analysis_all_patients):
       - ablation_data['best_method']    : reference method's DISPLAY label
-                                          (may be an ensemble, e.g. "Voting Ensemble")
       - ablation_data['best_score']     : reference's mean score
       - ablation_data['metric_name']    : 'macro_f1' or 'r2'
       - ablation_data['lower_is_better']: bool
       - ablation_data['ablation_results']: DataFrame with columns
             Removed_Component, Removed_Score, Difference,
             p_value_ttest, significant, effect_size, n_pairs
-
-    Layout notes:
-      - sharey=True: panel 2 inherits panel 1's y-axis.
-      - The y-tick system is bypassed entirely: labels are drawn with
-        ax1.text(...) using get_yaxis_transform(). This avoids the
-        sharey+invert_yaxis label-loss bug on all Matplotlib versions.
-      - subplots_adjust is the sole spacing mechanism (no tight_layout,
-        no constrained_layout) so wspace takes effect exactly as written.
-      - Reference is named only in the panel-1 title; no annotation box.
     """
     ablation_df = ablation_data.get('ablation_results')
     if ablation_df is None or ablation_df.empty:
@@ -1865,25 +1956,10 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
     # ------------------------------------------------------------------
     # 1. Filter ensembles + reference from the bars
     # ------------------------------------------------------------------
-    ENSEMBLE_LABELS = {
-        'average ensemble', 'voting ensemble', 'stacking ensemble',
-        'weighted ensemble', 'confidence selection', 'best method',
-        'meta-fusion', 'meta fusion',
-    }
+    def _is_ensemble_label(label: str) -> bool:
+        return is_ensemble_method(label)
 
-    def _is_ensemble(label: str) -> bool:
-        if not isinstance(label, str):
-            return False
-        ll = label.lower().strip()
-        if ll in ENSEMBLE_LABELS:
-            return True
-        if 'ensemble' in ll:
-            return True
-        if 'meta-fusion' in ll or ll == 'meta fusion':
-            return True
-        return False
-
-    is_ens = ablation_df['Removed_Component'].apply(_is_ensemble)
+    is_ens = ablation_df['Removed_Component'].apply(_is_ensemble_label)
     is_ref = ablation_df['Removed_Component'].str.lower() == str(best_method).lower()
 
     base_only = ablation_df[~is_ens & ~is_ref].copy()
@@ -1989,7 +2065,6 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path, co
 
     # =============================================================
     # Panel 2 — Statistical Significance
-    #   sharey=True + set_yticks([]) → no duplicate labels, no second invert
     # =============================================================
     ax2 = axes[1]
 
@@ -2335,13 +2410,11 @@ def plot_sen_spec_combined(df: pd.DataFrame, output_dir: Path, config: Experimen
     
     ax.set_xlabel('Model', fontsize=16)
     ax.set_ylabel('Score', fontsize=16)
-    # Move title higher using pad
     ax.set_title(f'Sensitivity & Specificity: Dys vs Typ ({task_type.title()})', 
                 fontsize=18, fontweight='bold', pad=40)
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=45, ha='right', fontsize=14)
     
-    # Legend ABOVE the title (higher than bbox_to_anchor)
     ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.08), fontsize=12, ncol=4,
               frameon=True, framealpha=0.95)
     
@@ -2368,12 +2441,6 @@ def plot_subgroup_sen_spec_comprehensive(df: pd.DataFrame, output_dir: Path, con
 
       Top panel:    Sensitivity (Dys vs Typ) for every fusion method
       Bottom panel: Specificity (Dys vs Typ) for every fusion method
-
-    Splitting into two panels halves the number of bars per panel, so:
-      - bar width can be ~2× larger
-      - value labels fit at readable size
-      - method names get abbreviated → no rotated tick labels
-      - whole figure stays within a 3.5-inch column
     """
     plot_df = df[df['Task'] == task_type].copy()
     if plot_df.empty:
@@ -2692,6 +2759,9 @@ def main():
                         help='Skip generating plots')
     parser.add_argument('--subgroup', action='store_true',
                         help='Generate subgroup (Dys/Norm) analysis')
+    parser.add_argument('--include-ensembles-in-scatter', action='store_true',
+                        help='Allow ensemble/meta-fusion methods to be chosen for the Best-Fusion scatter panel '
+                             '(default: they are excluded)')
 
     # In argparse, add option to filter by method group
     parser.add_argument('--method-group', type=str, 
@@ -2825,7 +2895,21 @@ def main():
         print(f"\n{'='*60}")
         print(f"GENERATING DYS + NORM SCATTER PLOTS")
         print(f"{'='*60}")
-        plot_dys_scatter_audio_text_fusion_single(df, experiments, output_dir, config, 'regression', dys_ids)
+
+        # Build a scatter-specific view of the data. By default, ensemble /
+        # meta-fusion methods are removed so the Best-Fusion panel cannot
+        # pick something like Weighted Ensemble or Meta-Fusion.
+        if args.include_ensembles_in_scatter:
+            scatter_df = df
+            print("  NOTE: Ensembles ALLOWED in Best-Fusion panel (--include-ensembles-in-scatter)")
+        else:
+            scatter_df = filter_out_ensembles(df, method_col='Method', label_col='Method_Label')
+            removed = sorted(set(df['Method'].unique()) - set(scatter_df['Method'].unique()))
+            print(f"  Ensembles EXCLUDED from Best-Fusion panel ({len(removed)} removed):")
+            for m in removed:
+                print(f"    ✗ {m}  ({get_method_display_name(m, config)})")
+
+        plot_dys_scatter_audio_text_fusion_single(scatter_df, experiments, output_dir, config, 'regression', dys_ids)
     
     # ===== PLOTS =====
     if not args.no_plots:
@@ -2943,6 +3027,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 '''
-python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate --subgroup --top-k 5 --bootstrap-iterations 10000 --ignore-methods mlp --verbose --dys-ids dysarthria-list.txt| tee outputs-ensemble-aggregate/log.txt
+
+for t in classification regression;do rm -rf outputs-ensemble-aggregate-$t;mkdir outputs-ensemble-aggregate-$t;python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate-$t --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic | tee outputs-ensemble-aggregate-$t/log.txt;done
+
 '''
