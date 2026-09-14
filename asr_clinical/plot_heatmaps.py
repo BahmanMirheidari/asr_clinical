@@ -48,8 +48,8 @@ VMIN, VMAX = 0.68, 0.90
 SHORT_LABELS = {
     'Clinical-Feature-Only': 'Clinical-Only',
     'Text-Embedding-Only':   'Text-Only',
-    'Audio-Only':            'Clinical-Only',
-    'Text-Only':             'Text-Only',
+    'Audio-Only':            'Clinical-Feature-Only',
+    'Text-Only':             'Text-Embedding-Only',
 }
 
 
