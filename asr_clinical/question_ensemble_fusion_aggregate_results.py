@@ -2685,24 +2685,23 @@ def plot_sens_spec_three_marker(df, output_dir, config,
 
 def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
     """
-    Compact one-row-per-method Sens/Spec plot.
+    Single-panel compact Sens/Spec figure for a single paper column.
 
-    Per method:
-      ● / ■ / ▲  = marker shape encodes metric
-                    (circle = Sensitivity, square = Specificity)
-      Red        = Dys subgroup
-      Gray       = Pooled (combined)
-      Blue       = Typ subgroup
+    Per method (one row):
+      Sensitivity markers (circles) on the top sub-row
+      Specificity markers (squares) on the bottom sub-row
 
-    Sensitivity markers sit slightly above the row centre, Specificity
-    markers slightly below. Value labels are placed above the Sensitivity
-    markers and below the Specificity markers so the two clusters never
-    collide.
+    Within each sub-row, three markers:
+      Dys    (red, leftmost usually)
+      Pooled (gray diamond, middle)
+      Typ    (blue, rightmost usually)
 
-    Blocks (Baseline / Fusion / Ensemble) are separated by dashed
-    horizontal lines. Methods whose subgroup values were unavailable
-    (fallback to combined) are drawn with the Pooled marker only and
-    flagged with '*' in the y-label.
+    Value labels sit just above the Sensitivity markers and just below
+    the Specificity markers so the two sub-rows never collide.
+
+    Blocks (Baseline / Fusion / Ensemble) are separated by dashed rules.
+    Methods with missing subgroup data are drawn using the pooled value
+    in all three slots and flagged with '*' in the y-label.
     """
     from matplotlib.lines import Line2D
 
@@ -2722,36 +2721,30 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
         return None
 
     grouped = plot_df.groupby('Method_Label').agg({
-        'sensitivity':                'mean',
-        'specificity':                'mean',
-        'subgroup_sensitivity':       'mean',
-        'subgroup_specificity':       'mean',
-        'non_subgroup_sensitivity':   'mean',
-        'non_subgroup_specificity':   'mean',
+        'sensitivity':              'mean',
+        'specificity':              'mean',
+        'subgroup_sensitivity':     'mean',
+        'subgroup_specificity':     'mean',
+        'non_subgroup_sensitivity': 'mean',
+        'non_subgroup_specificity': 'mean',
     }).reset_index()
 
-    # Drop the aggregate Meta-Fusion row — not a real method.
     grouped = grouped[grouped['Method_Label'].str.lower() != 'meta-fusion']
-
-    # Combined metrics are mandatory.
     grouped = grouped.dropna(subset=['sensitivity', 'specificity'], how='any')
     if grouped.empty:
         print("plot_sens_spec_compact: no rows with combined sens/spec")
         return None
 
-    # Flag missing subgroup BEFORE falling back.
     sub_cols = ['subgroup_sensitivity', 'subgroup_specificity',
                 'non_subgroup_sensitivity', 'non_subgroup_specificity']
     grouped['_missing_subgroup'] = grouped[sub_cols].isna().any(axis=1)
 
-    # Fallback: fill missing subgroup with combined so the marker exists.
     for sub_c, comb_c in [('subgroup_sensitivity',     'sensitivity'),
                           ('subgroup_specificity',     'specificity'),
                           ('non_subgroup_sensitivity', 'sensitivity'),
                           ('non_subgroup_specificity', 'specificity')]:
         grouped[sub_c] = grouped[sub_c].fillna(grouped[comb_c])
 
-    # ---- Block classification ----
     def _classify(label):
         ll = str(label).lower()
         if ('clinical-feature-only' in ll or 'text-embedding-only' in ll
@@ -2768,134 +2761,129 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
     grouped['BlockRank'] = grouped['Block'].apply(
         lambda b: block_order.index(b) if b in block_order else 99)
 
-    # Order: block, then within-block by combined sensitivity descending.
     grouped = grouped.sort_values(
         ['BlockRank', 'sensitivity'],
         ascending=[True, False],
     ).reset_index(drop=True)
 
-    methods = grouped['Method_Label'].tolist()
-    blocks  = grouped['Block'].tolist()
-    flags   = grouped['_missing_subgroup'].tolist()
-    y       = np.arange(len(methods))
-
+    methods  = grouped['Method_Label'].tolist()
+    blocks   = grouped['Block'].tolist()
+    flags    = grouped['_missing_subgroup'].tolist()
+    y        = np.arange(len(methods))
     y_labels = [f"{m} *" if f else m for m, f in zip(methods, flags)]
 
+    C_DYS  = '#C0392B'
+    C_POOL = '#7F8C8D'
+    C_TYP  = '#2980B9'
+
+    # Vertical offsets inside one method row
+    SENS_Y        = -0.18
+    SPEC_Y        = +0.18
+    SENS_LABEL_Y  = -0.30
+    SPEC_LABEL_Y  = +0.30
+
     # ---- Figure ----
-    fig, ax = plt.subplots(
-        figsize=(6.0, max(3.0, 0.30 * len(methods))),
-    )
+    fig_width  = 3.5
+    fig_height = max(3.4, 0.34 * len(methods) + 1.4)
 
-    C_DYS  = '#C0392B'   # red
-    C_POOL = '#7F8C8D'   # gray
-    C_TYP  = '#2980B9'   # blue
-
-    Y_OFFSET = 0.16           # how far above/below the row centre
-    LABEL_OFFSET = 0.30       # how far the value labels sit from the centre
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig.subplots_adjust(left=0.38, right=0.97, top=0.96, bottom=0.16)
 
     for i, row in grouped.iterrows():
         yy = y[i]
 
-        if flags[i]:
-            # No subgroup — draw Pooled markers only.
-            ax.scatter([row['sensitivity']], [yy - Y_OFFSET],
-                       marker='o', s=42, color=C_POOL,
-                       edgecolor='black', linewidth=0.6, zorder=3)
-            ax.scatter([row['specificity']], [yy + Y_OFFSET],
-                       marker='s', s=38, color=C_POOL,
-                       edgecolor='black', linewidth=0.6, zorder=3)
+        sens_vals = [row['subgroup_sensitivity'],
+                     row['sensitivity'],
+                     row['non_subgroup_sensitivity']]
+        spec_vals = [row['subgroup_specificity'],
+                     row['specificity'],
+                     row['non_subgroup_specificity']]
 
-            ax.text(row['sensitivity'], yy - LABEL_OFFSET,
-                    f"{row['sensitivity']:.3f}",
-                    ha='center', va='bottom', fontsize=6.2, color=C_POOL)
-            ax.text(row['specificity'], yy + LABEL_OFFSET,
-                    f"{row['specificity']:.3f}",
-                    ha='center', va='top', fontsize=6.2, color=C_POOL)
-        else:
-            # Full Dys / Pooled / Typ cluster.
-            # --- Sensitivity (top sub-row, circles) ---
-            xs_sens = [row['subgroup_sensitivity'],
-                       row['sensitivity'],
-                       row['non_subgroup_sensitivity']]
-            ax.plot([min(xs_sens), max(xs_sens)], [yy - Y_OFFSET] * 2,
-                    color='#D5D8DC', linewidth=0.9, zorder=1)
-            ax.scatter(xs_sens, [yy - Y_OFFSET] * 3,
-                       marker='o',
-                       s=[42, 44, 42],
-                       c=[C_DYS, C_POOL, C_TYP],
-                       edgecolor='black', linewidth=0.6, zorder=3)
+        # Connector lines
+        ax.plot([min(sens_vals), max(sens_vals)],
+                [yy + SENS_Y, yy + SENS_Y],
+                color='#B0B0B0', linewidth=0.7, alpha=0.9,
+                zorder=1, solid_capstyle='round')
+        ax.plot([min(spec_vals), max(spec_vals)],
+                [yy + SPEC_Y, yy + SPEC_Y],
+                color='#B0B0B0', linewidth=0.7, alpha=0.9,
+                zorder=1, solid_capstyle='round')
 
-            # --- Specificity (bottom sub-row, squares) ---
-            xs_spec = [row['subgroup_specificity'],
-                       row['specificity'],
-                       row['non_subgroup_specificity']]
-            ax.plot([min(xs_spec), max(xs_spec)], [yy + Y_OFFSET] * 2,
-                    color='#D5D8DC', linewidth=0.9, zorder=1)
-            ax.scatter(xs_spec, [yy + Y_OFFSET] * 3,
-                       marker='s',
-                       s=[38, 40, 38],
-                       c=[C_DYS, C_POOL, C_TYP],
-                       edgecolor='black', linewidth=0.6, zorder=3)
+        # Sensitivity markers (circles)
+        ax.scatter([sens_vals[0]], [yy + SENS_Y], s=26, marker='o',
+                   color=C_DYS, edgecolor='black', linewidth=0.5, zorder=3)
+        ax.scatter([sens_vals[1]], [yy + SENS_Y], s=22, marker='D',
+                   color=C_POOL, edgecolor='black', linewidth=0.5, zorder=4)
+        ax.scatter([sens_vals[2]], [yy + SENS_Y], s=26, marker='o',
+                   color=C_TYP, edgecolor='black', linewidth=0.5, zorder=3)
 
-            # --- Value labels ---
-            # Sensitivity: above the top sub-row
-            for val, col in zip(xs_sens, (C_DYS, C_POOL, C_TYP)):
-                ax.text(val, yy - LABEL_OFFSET, f"{val:.3f}",
-                        ha='center', va='bottom', fontsize=6.2,
-                        color=col, fontweight='bold')
-            # Specificity: below the bottom sub-row
-            for val, col in zip(xs_spec, (C_DYS, C_POOL, C_TYP)):
-                ax.text(val, yy + LABEL_OFFSET, f"{val:.3f}",
-                        ha='center', va='top', fontsize=6.2,
-                        color=col)
+        # Specificity markers (squares)
+        ax.scatter([spec_vals[0]], [yy + SPEC_Y], s=24, marker='s',
+                   color=C_DYS, edgecolor='black', linewidth=0.5, zorder=3)
+        ax.scatter([spec_vals[1]], [yy + SPEC_Y], s=20, marker='D',
+                   color=C_POOL, edgecolor='black', linewidth=0.5, zorder=4)
+        ax.scatter([spec_vals[2]], [yy + SPEC_Y], s=24, marker='s',
+                   color=C_TYP, edgecolor='black', linewidth=0.5, zorder=3)
 
-    # ---- Block separators ----
+        # Value labels — above Sens, below Spec
+        for val, col in zip(sens_vals, (C_DYS, C_POOL, C_TYP)):
+            ax.text(val, yy + SENS_LABEL_Y, f"{val:.3f}",
+                    ha='center', va='bottom', fontsize=4.5,
+                    color=col, fontweight='bold')
+        for val, col in zip(spec_vals, (C_DYS, C_POOL, C_TYP)):
+            ax.text(val, yy + SPEC_LABEL_Y, f"{val:.3f}",
+                    ha='center', va='top', fontsize=4.5, color=col)
+
+    # Block separators
     for i in range(1, len(y)):
         if blocks[i] != blocks[i - 1]:
-            ax.axhline(i - 0.5, color='#34495E', linewidth=0.7,
-                       linestyle='--', zorder=0, alpha=0.8)
+            ax.axhline(i - 0.5, color='#34495E', linewidth=0.6,
+                       linestyle='--', zorder=0, alpha=0.75)
 
-    # ---- Axis cosmetics ----
+    # ---- Axes ----
+    ax.set_xlim(0.6, 1.05)
+    ax.set_xticks([0.7, 0.8, 0.9, 1.0])
+    ax.set_xticklabels(['0.6', '0.7', '0.8', '0.9', '1.0'], fontsize=7)
+    ax.set_xlabel('Score', fontsize=8, fontweight='bold', labelpad=2)
+
     ax.set_yticks(y)
-    ax.set_yticklabels(y_labels, fontsize=8)
-    ax.set_ylim(len(methods) - 0.5, -0.7)   # inverted — first method on top
-    ax.set_xlim(0.6, 1.02)
-    ax.set_xticks([0.6, 0.7, 0.8, 0.9, 1.0])
-    ax.tick_params(axis='x', labelsize=8, length=3)
-    ax.set_xlabel('Score', fontsize=10, fontweight='bold')
-    ax.grid(True, alpha=0.25, axis='x', linewidth=0.4)
+    ax.set_yticklabels(y_labels, fontsize=6.5)
+    ax.set_ylim(len(methods) - 0.5, -0.7)
+    ax.tick_params(axis='y', length=2, pad=2)
+    ax.tick_params(axis='x', length=2, pad=2)
+    ax.grid(True, alpha=0.22, axis='x', linewidth=0.35)
     ax.set_axisbelow(True)
 
-    # ---- Legend (below the axes) ----
+    # ---- Legend at the bottom ----
     legend_handles = [
         Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
-               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
                label='Sensitivity'),
         Line2D([0], [0], marker='s', color='w', markerfacecolor='#888888',
-               markeredgecolor='black', markeredgewidth=0.6, markersize=6,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=4.5,
                label='Specificity'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor=C_DYS,
-               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
                label='Dys'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor=C_TYP,
-               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
                label='Typ'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=C_POOL,
-               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+        Line2D([0], [0], marker='D', color='w', markerfacecolor=C_POOL,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=4,
                label='Pooled'),
     ]
     ax.legend(handles=legend_handles,
-              loc='lower center', bbox_to_anchor=(0.5, -0.22),
-              ncol=5, frameon=False, fontsize=7,
-              handletextpad=0.3, columnspacing=1.0)
+              loc='upper center',
+              bbox_to_anchor=(0.5, -0.09),
+              ncol=5, frameon=False, fontsize=6,
+              handletextpad=0.3, columnspacing=0.8,
+              borderaxespad=0)
 
-    # ---- Footnote for asterisked methods ----
     if any(flags):
-        fig.text(0.5, -0.03,
+        fig.text(0.5, 0.005,
                  '* subgroup data unavailable for this method.',
-                 fontsize=6, color='#2C3E50', ha='center', va='top')
-
-    plt.tight_layout()
+                 fontsize=5.5, color='#2C3E50',
+                 ha='center', va='bottom')
 
     out_png = output_dir / f'sens_spec_compact_{task_type}.png'
     out_pdf = output_dir / f'sens_spec_compact_{task_type}.pdf'
@@ -2903,12 +2891,10 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
     plt.savefig(out_pdf, bbox_inches='tight')
     plt.close()
 
-    # ---- Sidecar CSV ----
     grouped.to_csv(
         output_dir / f'sens_spec_compact_data_{task_type}.csv', index=False)
 
     print(f"✓ Compact Sens/Spec plot saved: {out_png}")
-    print(f"  Blocks:")
     for b in block_order:
         names = grouped[grouped['Block'] == b]['Method_Label'].tolist()
         if names:
