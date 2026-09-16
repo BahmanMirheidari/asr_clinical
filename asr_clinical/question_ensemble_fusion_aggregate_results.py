@@ -553,8 +553,12 @@ def _detect_prediction_columns(pred_df: pd.DataFrame):
             if c == exclude:
                 continue
             cl = c.lower()
+            # tokenise on non-alphanumeric characters so 'id' only matches
+            # a standalone token (speaker_id, subject_id, ...) and never
+            # matches 'confidence', 'valid', 'hybrid', etc.
+            tokens = set(re.split(r'[^a-z0-9]+', cl))
             for s in substrings:
-                if s in cl:
+                if s in tokens:
                     if require_numeric:
                         v = pd.to_numeric(pred_df[c], errors='coerce')
                         if v.notna().sum() == 0:
@@ -651,19 +655,22 @@ def _load_base_ids(folder_path: Path,
 
 def _inject_speaker_ids(pred_df: pd.DataFrame,
                         folder_path: Path) -> pd.DataFrame:
-    """
-    If pred_df lacks a speaker-ID column, inject one by aligning it with a
-    base-method OOF file in the same experiment folder (matched on y_true).
-    Ensemble OOF files (e.g. ensemble_confidence_selection_oof_predictions.csv)
-    fall into this category — they were written without an ID column.
-
-    Returns a new DataFrame; the input is not mutated.
-    """
     obs_col, _, id_col, _ = _detect_prediction_columns(pred_df)
+
+    # Reject any "ID" column whose values look like probabilities or labels,
+    # not speaker identifiers.
     if id_col is not None:
-        return pred_df                      # already has IDs — leave alone
-    if obs_col is None:
-        return pred_df                      # can't align without y_true
+        vals = pd.to_numeric(pred_df[id_col], errors='coerce').dropna()
+        looks_like_score = (
+            len(vals) > 0
+            and vals.between(0, 1).all()
+            and vals.nunique() > 0.5 * len(vals)   # mostly unique floats
+        )
+        if looks_like_score:
+            id_col = None                          # discard, force injection
+
+    if id_col is not None or obs_col is None:
+        return pred_df
 
     y_true = pd.to_numeric(pred_df[obs_col], errors='coerce').values
     ids = _load_base_ids(folder_path, y_true)
