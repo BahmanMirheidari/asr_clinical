@@ -2859,8 +2859,8 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
     ax.set_yticks(y)
     ax.set_yticklabels(y_labels, fontsize=8)
     ax.set_ylim(len(methods) - 0.5, -0.7)   # inverted — first method on top
-    ax.set_xlim(0.0, 1.05)
-    ax.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_xlim(0.6, 1.02)
+    ax.set_xticks([0.6, 0.7, 0.8, 0.9, 1.0])
     ax.tick_params(axis='x', labelsize=8, length=3)
     ax.set_xlabel('Score', fontsize=10, fontweight='bold')
     ax.grid(True, alpha=0.25, axis='x', linewidth=0.4)
