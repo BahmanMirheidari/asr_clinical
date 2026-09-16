@@ -15,11 +15,21 @@ Prediction file discovery (two-phase):
   Phase 2 — fusion_results/meta_fusion/  (fallback, only if a key was not
             already filled by Phase 1)
 
-Backfill:
-  - Regression:     rmse / r2 from prediction CSVs when the JSON lacks them
-  - Classification: subgroup_sensitivity / subgroup_specificity and
-                    non_subgroup_* computed from prediction CSVs, split by
-                    Dys speaker IDs, whenever the JSON lacks them
+Metric sourcing:
+  For every (model, method) pair the aggregator builds a row from BOTH
+  sources and merges them:
+    * JSON aggregate metrics (when available) take precedence.
+    * Any missing metric is computed directly from the prediction CSV —
+      including ALL classification metrics (sensitivity, specificity,
+      macro-F1, balanced accuracy, ROC-AUC) and their Dys/Typ subgroup
+      variants, plus regression rmse / r2. This guarantees that ensemble_*
+      predictions (ensemble_weighted, ensemble_voting, ...) always appear
+      in the final dataframe even when no matching meta_fusion_metrics.json
+      entry exists.
+
+Plot-data CSVs (all_results.csv, summary_table_flat_*.csv,
+sens_spec_three_marker_data_*.csv) are consequently populated for every
+discovered method, including ensembles.
 """
 
 import os
@@ -33,6 +43,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from scipy.stats import ttest_rel, wilcoxon, ttest_ind, linregress, pearsonr
+from scipy.stats import rankdata
 import argparse
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -511,6 +522,330 @@ def load_predictions_file(file_path: Path) -> Optional[pd.DataFrame]:
         return None
 
 
+# =======================================================================
+#  PREDICTION-FILE METRIC COMPUTATION  (JSON-independent)
+# =======================================================================
+
+def _detect_prediction_columns(pred_df: pd.DataFrame):
+    """
+    Return (obs_col, pred_col, id_col, prob_col).
+
+    obs_col : ground-truth column (observed / true / target / y_true / ...)
+    pred_col: hard label / continuous prediction column
+              (predicted / pred / y_pred / output / ...)
+    id_col  : speaker / participant / subject / patient / id column, used
+              for the Dys vs Typ split.
+    prob_col: probability / score column (may equal pred_col when the
+              prediction is already a probability).
+    """
+    cols = list(pred_df.columns)
+
+    def _find_by_exact(exact_set, exclude=None):
+        for c in cols:
+            if c == exclude:
+                continue
+            if c.lower().strip() in exact_set:
+                return c
+        return None
+
+    def _find_by_substring(substrings, exclude=None, require_numeric=False):
+        for c in cols:
+            if c == exclude:
+                continue
+            cl = c.lower()
+            for s in substrings:
+                if s in cl:
+                    if require_numeric:
+                        v = pd.to_numeric(pred_df[c], errors='coerce')
+                        if v.notna().sum() == 0:
+                            continue
+                    return c
+        return None
+
+    obs_col = _find_by_exact(
+        {'observed', 'y_true', 'true', 'target', 'label', 'true_label',
+         'actual', 'ground_truth', 'observed_label', 'y'}
+    )
+    if obs_col is None:
+        obs_col = _find_by_substring(
+            ['observed', 'true', 'actual', 'target', 'y_true', 'label']
+        )
+
+    pred_col = _find_by_exact(
+        {'predicted', 'y_pred', 'pred', 'prediction', 'output', 'pred_label',
+         'predicted_label'},
+        exclude=obs_col,
+    )
+    if pred_col is None:
+        pred_col = _find_by_substring(
+            ['predicted', 'y_pred', 'pred', 'output'],
+            exclude=obs_col, require_numeric=True,
+        )
+
+    id_col = _find_by_exact(
+        {'speaker_id', 'participant_id', 'subject_id', 'patient_id',
+         'speaker', 'participant', 'subject', 'patient', 'id'}
+    )
+    if id_col is None:
+        id_col = _find_by_substring(
+            ['speaker', 'participant', 'subject', 'patient', 'id'],
+            exclude=obs_col,
+        )
+
+    prob_col = _find_by_exact(
+        {'probability', 'y_prob', 'prob', 'score', 'proba', 'pred_prob',
+         'probabilities', 'y_probability', 'predicted_probability'}
+    )
+    if prob_col is None:
+        prob_col = _find_by_substring(
+            ['probability', 'prob', 'y_prob', 'proba'],
+            exclude=obs_col,
+        )
+
+    # If pred_col is already a probability vector, treat it as prob_col too.
+    if prob_col is None and pred_col is not None:
+        v = pd.to_numeric(pred_df[pred_col], errors='coerce').dropna()
+        if len(v) > 0 and v.between(0, 1).all() and not v.isin([0, 1]).all():
+            prob_col = pred_col
+
+    return obs_col, pred_col, id_col, prob_col
+
+def _load_base_ids(folder_path: Path,
+                   y_true: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Find a base-method (non-ensemble) OOF prediction CSV in this experiment
+    folder that carries a speaker-ID column, and return its ID vector
+    aligned with the given y_true sequence.
+
+    Alignment is verified via exact y_true equality (NaN-safe). Returns
+    None if no candidate aligns.
+    """
+    if folder_path is None:
+        return None
+    y_true = np.asarray(y_true, dtype=float)
+    y_true_sig = np.nan_to_num(y_true, nan=-999.0)
+
+    for sub in ('leakage_safe_5fold', 'meta_fusion'):
+        d = folder_path / 'fusion_results' / sub
+        if not d.exists():
+            continue
+        for f in sorted(d.glob('*_oof_predictions.csv')):
+            stem = strip_predictions_suffix(f.stem)
+            if is_ensemble_method(stem):
+                continue
+            base_df = load_predictions_file(f)
+            if base_df is None or base_df.empty:
+                continue
+            if len(base_df) != len(y_true):
+                continue
+            b_obs, _, b_id, _ = _detect_prediction_columns(base_df)
+            if b_obs is None or b_id is None:
+                continue
+            b_true = pd.to_numeric(base_df[b_obs], errors='coerce').values
+            b_true_sig = np.nan_to_num(b_true, nan=-999.0)
+            if not np.array_equal(b_true_sig, y_true_sig):
+                continue
+            return base_df[b_id].astype(str).values
+    return None
+
+
+def _inject_speaker_ids(pred_df: pd.DataFrame,
+                        folder_path: Path) -> pd.DataFrame:
+    """
+    If pred_df lacks a speaker-ID column, inject one by aligning it with a
+    base-method OOF file in the same experiment folder (matched on y_true).
+    Ensemble OOF files (e.g. ensemble_confidence_selection_oof_predictions.csv)
+    fall into this category — they were written without an ID column.
+
+    Returns a new DataFrame; the input is not mutated.
+    """
+    obs_col, _, id_col, _ = _detect_prediction_columns(pred_df)
+    if id_col is not None:
+        return pred_df                      # already has IDs — leave alone
+    if obs_col is None:
+        return pred_df                      # can't align without y_true
+
+    y_true = pd.to_numeric(pred_df[obs_col], errors='coerce').values
+    ids = _load_base_ids(folder_path, y_true)
+    if ids is None:
+        return pred_df
+
+    out = pred_df.copy()
+    out['speaker_id'] = ids
+    return out
+
+def _compute_auc_rank(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """
+    Compute AUC-ROC using the Mann-Whitney U rank formula (no sklearn).
+    Robust to ties. Returns np.nan if a class is missing.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_score = np.asarray(y_score, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_score)
+    y_true = y_true[mask]
+    y_score = y_score[mask]
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    ranks = rankdata(y_score)
+    sum_pos = ranks[y_true == 1].sum()
+    auc = (sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
+
+
+def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray,
+                        prefix: str = '') -> Dict[str, float]:
+    """Compute rmse / r2 (with the given prefix) from paired arrays."""
+    out: Dict[str, float] = {}
+    if len(y_true) < 3:
+        return out
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    out[f'{prefix}rmse'] = rmse
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
+    if ss_tot > 0:
+        out[f'{prefix}r2'] = 1.0 - ss_res / ss_tot
+    return out
+
+
+def _classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: Optional[np.ndarray],
+    prefix: str = '',
+) -> Dict[str, float]:
+    """
+    Compute sensitivity / specificity / macro-F1 / balanced-accuracy / AUC
+    (with the given prefix) from hard labels + optional probabilities.
+    Positive class is assumed to be 1.
+    """
+    out: Dict[str, float] = {}
+    n = len(y_true)
+    if n < 2:
+        return out
+
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+
+    sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    prec_pos = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+    prec_neg = tn / (tn + fn) if (tn + fn) > 0 else np.nan
+    sens_neg = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+
+    f1_pos = (2 * prec_pos * sens / (prec_pos + sens)
+              if (prec_pos and sens and prec_pos + sens > 0) else np.nan)
+    f1_neg = (2 * prec_neg * sens_neg / (prec_neg + sens_neg)
+              if (prec_neg and sens_neg and prec_neg + sens_neg > 0) else np.nan)
+
+    if not np.isnan(sens):
+        out[f'{prefix}sensitivity'] = float(sens)
+    if not np.isnan(spec):
+        out[f'{prefix}specificity'] = float(spec)
+    if not (np.isnan(f1_pos) or np.isnan(f1_neg)):
+        out[f'{prefix}macro_f1'] = float((f1_pos + f1_neg) / 2.0)
+    if not (np.isnan(sens) or np.isnan(spec)):
+        out[f'{prefix}balanced_accuracy'] = float((sens + spec) / 2.0)
+
+    if y_prob is not None and len(y_prob) == n:
+        auc = _compute_auc_rank(y_true, y_prob)
+        if not np.isnan(auc):
+            out[f'{prefix}roc_auc'] = auc
+    return out
+
+
+def compute_metrics_from_predictions(
+    pred_df: pd.DataFrame,
+    task: str,
+    dys_ids: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """
+    Compute the FULL metric set (combined + subgroup + non_subgroup)
+    directly from a prediction DataFrame.
+
+    Classification output keys
+    --------------------------
+        sensitivity, specificity, macro_f1, balanced_accuracy, roc_auc
+        subgroup_*       (Dys split)
+        non_subgroup_*   (Typ split)
+
+    Regression output keys
+    ----------------------
+        rmse, r2
+        subgroup_rmse, subgroup_r2
+        non_subgroup_rmse, non_subgroup_r2
+    """
+    out: Dict[str, float] = {}
+    obs_col, pred_col, id_col, prob_col = _detect_prediction_columns(pred_df)
+    if obs_col is None or pred_col is None:
+        return out
+
+    y_true_raw = pd.to_numeric(pred_df[obs_col], errors='coerce')
+    y_pred_raw = pd.to_numeric(pred_df[pred_col], errors='coerce')
+    valid = y_true_raw.notna() & y_pred_raw.notna()
+    n_valid = int(valid.sum())
+    if n_valid < 3:
+        return out
+
+    y_true_v = y_true_raw[valid].values.astype(float)
+    y_pred_v = y_pred_raw[valid].values.astype(float)
+
+    prob_v: Optional[np.ndarray] = None
+    if prob_col is not None and prob_col != obs_col:
+        prob_v = pd.to_numeric(pred_df[prob_col], errors='coerce')[valid].values
+
+    ids_v: Optional[np.ndarray] = None
+    if id_col is not None:
+        ids_v = pred_df.loc[valid, id_col].astype(str).values
+
+    if task == 'regression':
+        out.update(_regression_metrics(y_true_v, y_pred_v, ''))
+        if ids_v is not None and dys_ids:
+            dys_set = {str(x) for x in dys_ids}
+            dys_mask = np.isin(ids_v, list(dys_set))
+            if dys_mask.any():
+                out.update(_regression_metrics(
+                    y_true_v[dys_mask], y_pred_v[dys_mask], 'subgroup_'))
+            if (~dys_mask).any():
+                out.update(_regression_metrics(
+                    y_true_v[~dys_mask], y_pred_v[~dys_mask], 'non_subgroup_'))
+        return out
+
+    # ---- classification ----
+    y_true_int = np.round(y_true_v).astype(int)
+
+    # decide if predictions are hard labels or probabilities
+    pr = y_pred_v
+    is_prob = (len(pr) > 0
+               and np.all((pr >= 0) & (pr <= 1))
+               and not np.all((pr == 0) | (pr == 1)))
+    if is_prob:
+        y_pred_int = (pr >= 0.5).astype(int)
+        if prob_v is None:
+            prob_v = pr
+    else:
+        y_pred_int = np.round(pr).astype(int)
+
+    out.update(_classification_metrics(y_true_int, y_pred_int, prob_v, ''))
+
+    if ids_v is not None and dys_ids:
+        dys_set = {str(x) for x in dys_ids}
+        dys_mask = np.isin(ids_v, list(dys_set))
+        if dys_mask.any():
+            p_d = prob_v[dys_mask] if prob_v is not None else None
+            out.update(_classification_metrics(
+                y_true_int[dys_mask], y_pred_int[dys_mask], p_d, 'subgroup_'))
+        if (~dys_mask).any():
+            p_n = prob_v[~dys_mask] if prob_v is not None else None
+            out.update(_classification_metrics(
+                y_true_int[~dys_mask], y_pred_int[~dys_mask], p_n,
+                'non_subgroup_'))
+    return out
+
+
 def load_predictions_unfiltered(experiments: Dict, model_name: str,
                                 method_key: str) -> Optional[pd.DataFrame]:
     """Load predictions for a model/method from the discovery cache or disk."""
@@ -522,7 +857,10 @@ def load_predictions_unfiltered(experiments: Dict, model_name: str,
     if pred_key in model_data:
         pred_file = model_data[pred_key].get('predictions_file')
         if pred_file and Path(pred_file).exists():
-            return load_predictions_file(Path(pred_file))
+            df = load_predictions_file(Path(pred_file))
+            if df is not None:
+                df = _inject_speaker_ids(df, model_data[pred_key].get('dir'))
+            return df
 
     for source_key, subdir in [('audio_only', 'leakage_safe_5fold'),
                                ('meta_fusion', 'meta_fusion')]:
@@ -809,14 +1147,40 @@ def discover_experiments(base_dir: Path, task_type: str = 'all',
 
 
 # =======================================================================
-#  DATA AGGREGATION
+#  DATA AGGREGATION  (JSON + prediction-derived, merged)
 # =======================================================================
 
-def aggregate_experiment_results(experiments: Dict,
-                                 config: ExperimentConfig) -> pd.DataFrame:
-    rows = []
+def aggregate_experiment_results(
+    experiments: Dict,
+    config: ExperimentConfig,
+    dys_ids: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Build the master dataframe.
+
+    One row per (model, method). Every (model, method) that appears in
+    EITHER a metrics JSON OR a prediction CSV becomes a row. Metrics are
+    merged in this order:
+
+      1. Compute every metric we can from the prediction CSV (all
+         classification metrics + subgroup split by Dys/Typ; regression
+         rmse/r2 + subgroup).
+      2. Overlay JSON-provided metrics. JSON wins when it provides a
+         non-null value (JSON was computed with the study's official
+         thresholding and subgroup bookkeeping).
+      3. For classification, if JSON only provided combined metrics
+         (sensitivity / specificity / ...) with no subgroup, we keep the
+         prediction-derived subgroup columns as a fallback — they get
+         computed in step 1 and JSON overlay leaves them intact.
+
+    This guarantees that ensemble_* prediction files (ensemble_weighted,
+    ensemble_voting, ...) always contribute a row even if
+    meta_fusion_metrics.json is missing or lacks that key.
+    """
+    rows: List[Dict[str, Any]] = []
 
     for model_name, model_data in experiments.items():
+        # --- infer task / size / family from any child entry ---
         task = 'unknown'
         size = 'Unknown'
         family = 'Other'
@@ -826,6 +1190,14 @@ def aggregate_experiment_results(experiments: Dict,
                 size = v.get('size', 'Unknown')
                 family = v.get('family', 'Other')
                 break
+        if task == 'unknown':
+            continue
+
+        # -----------------------------------------------------------
+        # (A) JSON-derived metrics, per method key
+        # -----------------------------------------------------------
+        json_metrics: Dict[str, Dict[str, float]] = {}
+        json_source: Dict[str, str] = {}
 
         for method_key, method_data in model_data.items():
             if method_key.startswith('predictions_'):
@@ -840,27 +1212,95 @@ def aggregate_experiment_results(experiments: Dict,
                     continue
                 ensemble_method = method_data.get('ensemble_method')
                 if ensemble_method and ensemble_method in metrics:
-                    extracted = extract_metrics_from_result(
+                    json_metrics[method_key] = extract_metrics_from_result(
                         metrics[ensemble_method], task)
-                    method_display = config.meta_fusion_display_names.get(
-                        ensemble_method, ensemble_method.title())
-                    source = 'meta_fusion'
-                else:
-                    extracted = {}
-                    method_display = get_method_display_name(method_key, config)
-                    source = 'meta_fusion'
+                    json_source[method_key] = 'meta_fusion'
             else:
                 metrics = load_metrics_file(metrics_file)
                 if metrics is None:
                     continue
-                extracted = extract_metrics_from_result(metrics, task)
-                method_display = get_method_display_name(method_key, config)
-                source = method_data.get('source', 'leakage_safe_5fold')
+                json_metrics[method_key] = extract_metrics_from_result(
+                    metrics, task)
+                json_source[method_key] = method_data.get(
+                    'source', 'leakage_safe_5fold')
 
-            row = {
+        # -----------------------------------------------------------
+        # (B) Prediction-derived metrics, per method key
+        # -----------------------------------------------------------
+        pred_metrics: Dict[str, Dict[str, float]] = {}
+        pred_source: Dict[str, str] = {}
+
+        for method_key, method_data in model_data.items():
+            if not method_key.startswith('predictions_'):
+                continue
+            canonical = method_key.replace('predictions_', '', 1)
+            pred_file = method_data.get('predictions_file')
+            if pred_file is None or not Path(pred_file).exists():
+                continue
+            pred_df = load_predictions_file(Path(pred_file))
+            if pred_df is None or pred_df.empty:
+                continue
+
+            # Inject speaker IDs if the ensemble file lacks them.
+            pred_df = _inject_speaker_ids(
+                pred_df, method_data.get('dir'))
+
+            computed = compute_metrics_from_predictions(
+                pred_df, task, dys_ids)
+
+            if computed:
+                pred_metrics[canonical] = computed
+                pred_source[canonical] = method_data.get(
+                    'source', 'prediction_csv')
+
+                # health check
+                has_ids = _detect_prediction_columns(pred_df)[2] is not None
+                has_sub = any(k.startswith('subgroup_') for k in computed)
+                tag = ('✓ IDs+subgroup' if (has_ids and has_sub)
+                       else '✓ IDs, no subgroup' if has_ids
+                       else '⚠ NO IDs — subgroup skipped')
+                print(f"    [PRED] {model_name} / {canonical}: "
+                      f"{len(computed)} metric(s)  {tag}  "
+                      f"← {Path(pred_file).name}")
+
+        # -----------------------------------------------------------
+        # (C) Union of every method key seen in JSON or predictions
+        # -----------------------------------------------------------
+        all_methods = set(json_metrics.keys()) | set(pred_metrics.keys())
+
+        for method_key in sorted(all_methods):
+            jm = json_metrics.get(method_key, {})
+            pm = pred_metrics.get(method_key, {})
+
+            # Start from prediction-derived values, overlay JSON
+            merged: Dict[str, float] = dict(pm)
+            for k, v in jm.items():
+                if v is None:
+                    continue
+                if isinstance(v, float) and np.isnan(v):
+                    continue
+                merged[k] = v
+
+            # Display label
+            if method_key.startswith('ensemble_'):
+                ens = method_key.replace('ensemble_', '')
+                method_display = config.meta_fusion_display_names.get(
+                    ens, ens.replace('_', ' ').title())
+            else:
+                method_display = get_method_display_name(method_key, config)
+
+            # Source tag
+            if method_key in json_metrics and method_key in pred_metrics:
+                source = 'json+pred'
+            elif method_key in json_metrics:
+                source = json_source.get(method_key, 'json')
+            else:
+                source = pred_source.get(method_key, 'prediction_csv')
+
+            row: Dict[str, Any] = {
                 'Task': task, 'Model': model_name, 'Size': size,
                 'Family': family, 'Method': method_key,
-                'Method_Label': method_display, 'Source': source
+                'Method_Label': method_display, 'Source': source,
             }
 
             if task == 'classification':
@@ -871,441 +1311,27 @@ def aggregate_experiment_results(experiments: Dict,
                                + config.regression_subgroup_metrics)
 
             for metric in all_metrics:
-                row[metric] = extracted.get(metric, None)
-                if row[metric] is None and isinstance(metrics, dict):
-                    row[metric] = metrics.get(metric, None)
+                row[metric] = merged.get(metric, np.nan)
 
             rows.append(row)
 
     df = pd.DataFrame(rows)
-    all_metrics = (config.classification_metrics
-                   + config.classification_subgroup_metrics
-                   + config.regression_metrics
-                   + config.regression_subgroup_metrics)
-    for metric in all_metrics:
+    if df.empty:
+        return df
+
+    numeric_cols = (config.classification_metrics
+                    + config.classification_subgroup_metrics
+                    + config.regression_metrics
+                    + config.regression_subgroup_metrics)
+    for metric in numeric_cols:
         if metric in df.columns:
             df[metric] = pd.to_numeric(df[metric], errors='coerce')
     return df
 
 
 # -----------------------------------------------------------------------
-#  BACKFILL: REGRESSION (rmse, r2)
+#  DIAGNOSTIC: PREDICTION-SCALE (regression)
 # -----------------------------------------------------------------------
-
-def backfill_regression_metrics_from_predictions(
-    df: pd.DataFrame, experiments: Dict, config: ExperimentConfig
-) -> pd.DataFrame:
-    """Fill missing regression metrics from the prediction CSVs."""
-    if df.empty:
-        return df
-
-    reg_mask = df['Task'] == 'regression'
-    if not reg_mask.any():
-        return df
-
-    df = df.copy()
-
-    def _extract_obs_pred(pred_df):
-        obs_col = pred_col = None
-        for c in pred_df.columns:
-            cl = c.lower()
-            if obs_col is None and any(x in cl for x in
-                    ['observed', 'true', 'actual', 'target', 'y_true']):
-                obs_col = c
-            if pred_col is None and any(x in cl for x in
-                    ['predicted', 'pred', 'y_pred', 'output']):
-                pred_col = c
-        if obs_col is None or pred_col is None:
-            return None, None
-        o = pd.to_numeric(pred_df[obs_col], errors='coerce').dropna().values
-        p = pd.to_numeric(pred_df[pred_col], errors='coerce').dropna().values
-        n = min(len(o), len(p))
-        if n < 3:
-            return None, None
-        return o[:n], p[:n]
-
-    filled_rmse = 0
-    filled_r2 = 0
-
-    for idx in df[reg_mask].index:
-        row = df.loc[idx]
-        model = row['Model']
-        method = row['Method']
-
-        need_rmse = pd.isna(row.get('rmse'))
-        need_r2 = pd.isna(row.get('r2'))
-        if not need_rmse and not need_r2:
-            continue
-
-        pred_df = load_predictions_unfiltered(experiments, model, method)
-        if pred_df is None:
-            continue
-
-        o, p = _extract_obs_pred(pred_df)
-        if o is None:
-            continue
-
-        if need_rmse:
-            rmse = float(np.sqrt(np.mean((o - p) ** 2)))
-            df.at[idx, 'rmse'] = rmse
-            filled_rmse += 1
-
-        if need_r2:
-            ss_res = np.sum((o - p) ** 2)
-            ss_tot = np.sum((o - o.mean()) ** 2)
-            if ss_tot > 0:
-                df.at[idx, 'r2'] = 1.0 - ss_res / ss_tot
-                filled_r2 += 1
-
-    print(f"  [BACKFILL-REG] Filled rmse for {filled_rmse} row(s), "
-          f"r2 for {filled_r2} row(s) from prediction CSVs")
-    return df
-
-
-# -----------------------------------------------------------------------
-#  BACKFILL: CLASSIFICATION SUBGROUP (sens/spec for Dys and Typ)
-# -----------------------------------------------------------------------
-
-def backfill_classification_subgroup_metrics_from_predictions(
-    df: pd.DataFrame,
-    experiments: Dict,
-    config: ExperimentConfig,
-    dys_ids: List[str],
-) -> pd.DataFrame:
-    """
-    Fill missing classification metrics from prediction CSVs.
-
-    Columns filled when NaN:
-        sensitivity, specificity                       (combined)
-        subgroup_sensitivity, subgroup_specificity     (Dys)
-        non_subgroup_sensitivity, non_subgroup_specificity  (Typ)
-
-    Combined metrics are computed on ALL rows; subgroup metrics on the
-    Dys/Typ split using the speaker-ID column.
-    """
-    if df.empty:
-        return df
-
-    cls_mask = df['Task'] == 'classification'
-    if not cls_mask.any():
-        return df
-
-    subgroup_cols = ['subgroup_sensitivity', 'subgroup_specificity',
-                     'non_subgroup_sensitivity', 'non_subgroup_specificity']
-    combined_cols = ['sensitivity', 'specificity']
-
-    df = df.copy()
-    dys_ids_str = {str(x) for x in dys_ids} if dys_ids else set()
-
-    def _detect_columns(pred_df):
-        obs_col = pred_col = id_col = None
-        for c in pred_df.columns:
-            cl = c.lower()
-            if obs_col is None and any(x in cl for x in
-                    ['observed', 'true', 'actual', 'target', 'y_true', 'label']):
-                obs_col = c
-            if pred_col is None and any(x in cl for x in
-                    ['predicted', 'pred', 'y_pred', 'output']):
-                pred_col = c
-            if id_col is None and any(x in cl for x in
-                    ['speaker', 'participant', 'subject', 'patient', 'id']):
-                id_col = c
-        return obs_col, pred_col, id_col
-
-    def _sens_spec(y_true, y_pred):
-        if len(y_true) == 0:
-            return np.nan, np.nan
-        tp = int(((y_true == 1) & (y_pred == 1)).sum())
-        fn = int(((y_true == 1) & (y_pred == 0)).sum())
-        tn = int(((y_true == 0) & (y_pred == 0)).sum())
-        fp = int(((y_true == 0) & (y_pred == 1)).sum())
-        sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-        spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-        return sens, spec
-
-    filled_combined = 0
-    filled_subgroup = 0
-    failed = []
-
-    for idx in df[cls_mask].index:
-        row = df.loc[idx]
-        model = row['Model']
-        method = row['Method']
-
-        need_combined = any(pd.isna(row.get(c)) for c in combined_cols)
-        need_subgroup = any(pd.isna(row.get(c)) for c in subgroup_cols)
-        if not need_combined and not need_subgroup:
-            continue
-
-        pred_df = load_predictions_unfiltered(experiments, model, method)
-        if pred_df is None:
-            failed.append((model, method, 'no prediction file'))
-            continue
-
-        obs_col, pred_col, id_col = _detect_columns(pred_df)
-        if obs_col is None or pred_col is None:
-            failed.append((model, method,
-                           f'obs/pred columns missing (obs={obs_col}, '
-                           f'pred={pred_col})'))
-            continue
-
-        y_true_raw = pd.to_numeric(pred_df[obs_col], errors='coerce')
-        y_pred_raw = pd.to_numeric(pred_df[pred_col], errors='coerce')
-
-        # Threshold probability-like predictions
-        y_pred_numeric = y_pred_raw.dropna()
-        if (len(y_pred_numeric) > 0
-                and y_pred_numeric.between(0, 1).all()
-                and not y_pred_numeric.isin([0, 1]).all()):
-            y_pred = (y_pred_raw >= 0.5).astype(int)
-        else:
-            y_pred = y_pred_raw.round().astype(int)
-        y_true = y_true_raw.round().astype(int)
-
-        valid = y_true_raw.notna() & y_pred_raw.notna()
-        y_true = y_true[valid]
-        y_pred = y_pred[valid]
-
-        if len(y_true) < 3:
-            failed.append((model, method,
-                           f'only {len(y_true)} valid rows'))
-            continue
-
-        # ---- Combined metrics (all rows) ----
-        if need_combined:
-            sens_all, spec_all = _sens_spec(y_true.values, y_pred.values)
-            if pd.isna(row.get('sensitivity')) and not np.isnan(sens_all):
-                df.at[idx, 'sensitivity'] = sens_all
-                filled_combined += 1
-            if pd.isna(row.get('specificity')) and not np.isnan(spec_all):
-                df.at[idx, 'specificity'] = spec_all
-
-        # ---- Subgroup metrics (requires IDs + dys list) ----
-        if need_subgroup and dys_ids_str and id_col is not None:
-            ids = pred_df.loc[valid.index, id_col].astype(str)
-            dys_mask = ids.isin(dys_ids_str).values
-
-            dys_sens, dys_spec = _sens_spec(
-                y_true.values[dys_mask], y_pred.values[dys_mask])
-            typ_sens, typ_spec = _sens_spec(
-                y_true.values[~dys_mask], y_pred.values[~dys_mask])
-
-            changed = False
-            if pd.isna(row.get('subgroup_sensitivity')) and not np.isnan(dys_sens):
-                df.at[idx, 'subgroup_sensitivity'] = dys_sens
-                changed = True
-            if pd.isna(row.get('subgroup_specificity')) and not np.isnan(dys_spec):
-                df.at[idx, 'subgroup_specificity'] = dys_spec
-                changed = True
-            if pd.isna(row.get('non_subgroup_sensitivity')) and not np.isnan(typ_sens):
-                df.at[idx, 'non_subgroup_sensitivity'] = typ_sens
-                changed = True
-            if pd.isna(row.get('non_subgroup_specificity')) and not np.isnan(typ_spec):
-                df.at[idx, 'non_subgroup_specificity'] = typ_spec
-                changed = True
-
-            if changed:
-                filled_subgroup += 1
-
-    print(f"  [BACKFILL-CLS] Combined metrics filled for "
-          f"{filled_combined} row(s)")
-    print(f"  [BACKFILL-CLS] Subgroup metrics filled for "
-          f"{filled_subgroup} row(s)")
-    if failed:
-        print(f"  [BACKFILL-CLS] {len(failed)} row(s) could not be backfilled:")
-        for model, method, reason in failed[:15]:
-            print(f"      ✗ {model} / {method}: {reason}")
-        if len(failed) > 15:
-            print(f"      ... and {len(failed) - 15} more")
-
-    return df
-
-
-# -----------------------------------------------------------------------
-#  BACKFILL: COMBINED
-# -----------------------------------------------------------------------
-
-def backfill_all_metrics_from_predictions(
-    df: pd.DataFrame,
-    experiments: Dict,
-    config: ExperimentConfig,
-    dys_ids: List[str],
-) -> pd.DataFrame:
-    """Run both regression and classification backfills."""
-    if df.empty:
-        return df
-
-    if 'regression' in df['Task'].unique():
-        df = backfill_regression_metrics_from_predictions(
-            df, experiments, config)
-
-    if 'classification' in df['Task'].unique():
-        if dys_ids:
-            df = backfill_classification_subgroup_metrics_from_predictions(
-                df, experiments, config, dys_ids)
-        else:
-            print("  [BACKFILL-CLS] Skipped — no Dys speaker IDs provided "
-                  "(pass --dys-ids)")
-
-    return df
-
-
-# =======================================================================
-#  TOP-K SELECTION
-# =======================================================================
-
-def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None,
-                        config: ExperimentConfig = None) -> pd.DataFrame:
-    if config is None:
-        config = ExperimentConfig()
-    if k <= 0:
-        return df
-
-    tasks = [task_type] if task_type else df['Task'].unique()
-    selected_models = []
-
-    for task in tasks:
-        task_df = df[df['Task'] == task]
-        if task_df.empty:
-            continue
-
-        if task == 'classification':
-            ranking_metric = config.ranking_metric_classification
-            lower_is_better = False
-        else:
-            ranking_metric = config.ranking_metric_regression
-            lower_is_better = True
-
-        if ranking_metric not in task_df.columns:
-            print(f"  Warning: Ranking metric {ranking_metric} not found for {task}")
-            continue
-
-        model_performance = task_df.groupby('Model')[ranking_metric].mean().reset_index()
-        model_performance = model_performance.dropna()
-        if model_performance.empty:
-            continue
-
-        model_performance = model_performance.sort_values(
-            ranking_metric, ascending=lower_is_better)
-
-        top_models = model_performance.head(k)['Model'].tolist()
-        selected_models.extend(top_models)
-
-        print(f"\n  Top {k} models for {task} "
-              f"(by {config.metric_labels.get(ranking_metric, ranking_metric)}, "
-              f"{'lower' if lower_is_better else 'higher'} is better):")
-        for _, row in model_performance.head(k).iterrows():
-            print(f"    {row['Model']}: {row[ranking_metric]:.4f}")
-
-    if selected_models:
-        return df[df['Model'].isin(selected_models)]
-    return df
-
-
-# =======================================================================
-#  DIAGNOSTICS
-# =======================================================================
-
-def print_method_coverage(df: pd.DataFrame):
-    """Print rows per (Task, Method_Label). Instantly reveals missing methods."""
-    if df.empty:
-        print("  (empty df — nothing to report)")
-        return
-    print(f"\n{'='*70}")
-    print("METHOD COVERAGE (rows per Task × Method_Label)")
-    print(f"{'='*70}")
-    pivot = df.groupby(['Task', 'Method_Label']).size().unstack(fill_value=0)
-    print(pivot.to_string())
-    print(f"{'='*70}\n")
-
-
-def print_regression_sanity_check(df: pd.DataFrame, config: ExperimentConfig):
-    reg = df[df['Task'] == 'regression'].copy()
-    if reg.empty:
-        print("  No regression rows — sanity check skipped.")
-        return
-
-    print(f"\n{'='*70}")
-    print("SANITY CHECK — regression metric distributions")
-    print(f"{'='*70}")
-    print(f"  Total regression rows: {len(reg)}")
-
-    for col in ['rmse', 'r2', 'subgroup_rmse', 'subgroup_r2']:
-        if col not in reg.columns:
-            print(f"\n  {col}: COLUMN MISSING")
-            continue
-        s = pd.to_numeric(reg[col], errors='coerce')
-        n_valid = int(s.notna().sum())
-        if n_valid == 0:
-            print(f"\n  {col}: all NaN")
-            continue
-        print(f"\n  {col}:")
-        print(f"    n_valid     : {n_valid} / {len(s)}")
-        print(f"    min / median / max : {s.min():.4f} / "
-              f"{s.median():.4f} / {s.max():.4f}")
-
-    reg['is_ens'] = reg['Method'].apply(is_ensemble_method)
-    print(f"\n  Ensemble coverage (regression):")
-    print(f"    Ensemble rows          : {reg['is_ens'].sum()}")
-    if 'rmse' in reg.columns:
-        print(f"    Ensemble rows with rmse: "
-              f"{reg.loc[reg['is_ens'], 'rmse'].notna().sum()}")
-    if 'r2' in reg.columns:
-        print(f"    Ensemble rows with r2  : "
-              f"{reg.loc[reg['is_ens'], 'r2'].notna().sum()}")
-
-    print(f"\n  Per-method 'rmse' (regression, ALL rows):")
-    print(f"  {'Method_Label':<32} {'n':>4} {'min':>10} {'max':>10} {'mean':>10}")
-    print(f"  {'-'*32} {'-'*4} {'-'*10} {'-'*10} {'-'*10}")
-    for m, g in reg.groupby('Method_Label'):
-        vals = pd.to_numeric(g['rmse'], errors='coerce').dropna()
-        if len(vals) == 0:
-            print(f"  {str(m):<32} {0:>4} {'—':>10} {'—':>10} {'—':>10}")
-        else:
-            print(f"  {str(m):<32} {len(vals):>4} {vals.min():>10.4f} "
-                  f"{vals.max():>10.4f} {vals.mean():>10.4f}")
-    print(f"{'='*70}\n")
-
-
-def print_classification_sanity_check(df: pd.DataFrame, config: ExperimentConfig):
-    cls = df[df['Task'] == 'classification'].copy()
-    if cls.empty:
-        print("  No classification rows — sanity check skipped.")
-        return
-
-    print(f"\n{'='*70}")
-    print("SANITY CHECK — classification subgroup coverage")
-    print(f"{'='*70}")
-    print(f"  Total classification rows: {len(cls)}")
-
-    cols = ['sensitivity', 'specificity',
-            'subgroup_sensitivity', 'subgroup_specificity',
-            'non_subgroup_sensitivity', 'non_subgroup_specificity']
-    for c in cols:
-        if c not in cls.columns:
-            print(f"  {c}: COLUMN MISSING")
-            continue
-        n_valid = int(cls[c].notna().sum())
-        print(f"  {c:<32}: {n_valid} / {len(cls)} populated")
-
-    print(f"\n  Per-method subgroup coverage:")
-    print(f"  {'Method_Label':<32} {'n':>4} "
-          f"{'sub_sens':>10} {'sub_spec':>10} "
-          f"{'typ_sens':>10} {'typ_spec':>10}")
-    print(f"  {'-'*32} {'-'*4} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
-    for m, g in cls.groupby('Method_Label'):
-        n = len(g)
-        ss = g['subgroup_sensitivity'].notna().sum() if \
-            'subgroup_sensitivity' in g.columns else 0
-        sp = g['subgroup_specificity'].notna().sum() if \
-            'subgroup_specificity' in g.columns else 0
-        ts = g['non_subgroup_sensitivity'].notna().sum() if \
-            'non_subgroup_sensitivity' in g.columns else 0
-        tp = g['non_subgroup_specificity'].notna().sum() if \
-            'non_subgroup_specificity' in g.columns else 0
-        print(f"  {str(m):<32} {n:>4} {ss:>10} {sp:>10} {ts:>10} {tp:>10}")
-    print(f"{'='*70}\n")
-
 
 def diagnose_diverged_predictions(experiments: Dict, output_dir: Path,
                                   config: ExperimentConfig):
@@ -1339,16 +1365,7 @@ def diagnose_diverged_predictions(experiments: Dict, output_dir: Path,
             if df is None or df.empty:
                 continue
 
-            obs_col = pred_col = None
-            for c in df.columns:
-                cl = c.lower()
-                if obs_col is None and any(x in cl for x in
-                        ['observed', 'true', 'actual', 'target', 'y_true']):
-                    obs_col = c
-                if pred_col is None and any(x in cl for x in
-                        ['predicted', 'pred', 'y_pred', 'output']):
-                    pred_col = c
-
+            obs_col, pred_col, id_col, prob_col = _detect_prediction_columns(df)
             method_short = method_key.replace('predictions_', '')
 
             if obs_col is None or pred_col is None:
@@ -1505,18 +1522,7 @@ def plot_dys_scatter_audio_text_fusion_single(
             ax.grid(True, alpha=0.3)
             continue
 
-        obs_col = pred_col = id_col = None
-        for col in pred_df.columns:
-            cl = col.lower()
-            if obs_col is None and any(x in cl for x in
-                    ['observed', 'true', 'actual', 'target', 'y_true']):
-                obs_col = col
-            if pred_col is None and any(x in cl for x in
-                    ['predicted', 'pred', 'y_pred', 'output']):
-                pred_col = col
-            if id_col is None and any(x in cl for x in
-                    ['speaker', 'participant', 'subject', 'patient', 'id']):
-                id_col = col
+        obs_col, pred_col, id_col, prob_col = _detect_prediction_columns(pred_df)
 
         if obs_col is None or pred_col is None:
             ax.text(0.5, 0.5, 'No obs/pred columns',
@@ -1650,6 +1656,174 @@ def plot_dys_scatter_audio_text_fusion_single(
               f"{output_dir / 'dys_scatter_summary.csv'}")
 
     return all_predictions
+
+
+# =======================================================================
+#  TOP-K SELECTION
+# =======================================================================
+
+def select_top_k_models(df: pd.DataFrame, k: int, task_type: str = None,
+                        config: ExperimentConfig = None) -> pd.DataFrame:
+    if config is None:
+        config = ExperimentConfig()
+    if k <= 0:
+        return df
+
+    tasks = [task_type] if task_type else df['Task'].unique()
+    selected_models = []
+
+    for task in tasks:
+        task_df = df[df['Task'] == task]
+        if task_df.empty:
+            continue
+
+        if task == 'classification':
+            ranking_metric = config.ranking_metric_classification
+            lower_is_better = False
+        else:
+            ranking_metric = config.ranking_metric_regression
+            lower_is_better = True
+
+        if ranking_metric not in task_df.columns:
+            print(f"  Warning: Ranking metric {ranking_metric} not found for {task}")
+            continue
+
+        model_performance = task_df.groupby('Model')[ranking_metric].mean().reset_index()
+        model_performance = model_performance.dropna()
+        if model_performance.empty:
+            continue
+
+        model_performance = model_performance.sort_values(
+            ranking_metric, ascending=lower_is_better)
+
+        top_models = model_performance.head(k)['Model'].tolist()
+        selected_models.extend(top_models)
+
+        print(f"\n  Top {k} models for {task} "
+              f"(by {config.metric_labels.get(ranking_metric, ranking_metric)}, "
+              f"{'lower' if lower_is_better else 'higher'} is better):")
+        for _, row in model_performance.head(k).iterrows():
+            print(f"    {row['Model']}: {row[ranking_metric]:.4f}")
+
+    if selected_models:
+        return df[df['Model'].isin(selected_models)]
+    return df
+
+
+# =======================================================================
+#  DIAGNOSTICS
+# =======================================================================
+
+def print_method_coverage(df: pd.DataFrame):
+    """Print rows per (Task, Method_Label). Instantly reveals missing methods."""
+    if df.empty:
+        print("  (empty df — nothing to report)")
+        return
+    print(f"\n{'='*70}")
+    print("METHOD COVERAGE (rows per Task × Method_Label)")
+    print(f"{'='*70}")
+    pivot = df.groupby(['Task', 'Method_Label']).size().unstack(fill_value=0)
+    print(pivot.to_string())
+    print(f"{'='*70}\n")
+
+
+def print_regression_sanity_check(df: pd.DataFrame, config: ExperimentConfig):
+    reg = df[df['Task'] == 'regression'].copy()
+    if reg.empty:
+        print("  No regression rows — sanity check skipped.")
+        return
+
+    print(f"\n{'='*70}")
+    print("SANITY CHECK — regression metric distributions")
+    print(f"{'='*70}")
+    print(f"  Total regression rows: {len(reg)}")
+
+    for col in ['rmse', 'r2', 'subgroup_rmse', 'subgroup_r2',
+                'non_subgroup_rmse', 'non_subgroup_r2']:
+        if col not in reg.columns:
+            print(f"\n  {col}: COLUMN MISSING")
+            continue
+        s = pd.to_numeric(reg[col], errors='coerce')
+        n_valid = int(s.notna().sum())
+        if n_valid == 0:
+            print(f"\n  {col}: all NaN")
+            continue
+        print(f"\n  {col}:")
+        print(f"    n_valid     : {n_valid} / {len(s)}")
+        print(f"    min / median / max : {s.min():.4f} / "
+              f"{s.median():.4f} / {s.max():.4f}")
+
+    reg['is_ens'] = reg['Method'].apply(is_ensemble_method)
+    print(f"\n  Ensemble coverage (regression):")
+    print(f"    Ensemble rows          : {reg['is_ens'].sum()}")
+    if 'rmse' in reg.columns:
+        print(f"    Ensemble rows with rmse: "
+              f"{reg.loc[reg['is_ens'], 'rmse'].notna().sum()}")
+    if 'r2' in reg.columns:
+        print(f"    Ensemble rows with r2  : "
+              f"{reg.loc[reg['is_ens'], 'r2'].notna().sum()}")
+
+    print(f"\n  Per-method 'rmse' (regression, ALL rows):")
+    print(f"  {'Method_Label':<32} {'n':>4} {'min':>10} {'max':>10} {'mean':>10}")
+    print(f"  {'-'*32} {'-'*4} {'-'*10} {'-'*10} {'-'*10}")
+    for m, g in reg.groupby('Method_Label'):
+        vals = pd.to_numeric(g['rmse'], errors='coerce').dropna()
+        if len(vals) == 0:
+            print(f"  {str(m):<32} {0:>4} {'—':>10} {'—':>10} {'—':>10}")
+        else:
+            print(f"  {str(m):<32} {len(vals):>4} {vals.min():>10.4f} "
+                  f"{vals.max():>10.4f} {vals.mean():>10.4f}")
+    print(f"{'='*70}\n")
+
+
+def print_classification_sanity_check(df: pd.DataFrame, config: ExperimentConfig):
+    cls = df[df['Task'] == 'classification'].copy()
+    if cls.empty:
+        print("  No classification rows — sanity check skipped.")
+        return
+
+    print(f"\n{'='*70}")
+    print("SANITY CHECK — classification subgroup coverage")
+    print(f"{'='*70}")
+    print(f"  Total classification rows: {len(cls)}")
+
+    cols = ['sensitivity', 'specificity', 'macro_f1', 'balanced_accuracy',
+            'roc_auc',
+            'subgroup_sensitivity', 'subgroup_specificity', 'subgroup_macro_f1',
+            'subgroup_balanced_accuracy', 'subgroup_roc_auc',
+            'non_subgroup_sensitivity', 'non_subgroup_specificity',
+            'non_subgroup_macro_f1', 'non_subgroup_balanced_accuracy',
+            'non_subgroup_roc_auc']
+    for c in cols:
+        if c not in cls.columns:
+            print(f"  {c}: COLUMN MISSING")
+            continue
+        n_valid = int(cls[c].notna().sum())
+        print(f"  {c:<32}: {n_valid} / {len(cls)} populated")
+
+    print(f"\n  Per-method subgroup coverage:")
+    print(f"  {'Method_Label':<32} {'n':>4} "
+          f"{'sub_f1':>10} {'sub_sens':>10} {'sub_spec':>10} "
+          f"{'typ_f1':>10} {'typ_sens':>10} {'typ_spec':>10}")
+    print(f"  {'-'*32} {'-'*4} {'-'*10} {'-'*10} {'-'*10} "
+          f"{'-'*10} {'-'*10} {'-'*10}")
+    for m, g in cls.groupby('Method_Label'):
+        n = len(g)
+        sf1 = g['subgroup_macro_f1'].notna().sum() if \
+            'subgroup_macro_f1' in g.columns else 0
+        ss = g['subgroup_sensitivity'].notna().sum() if \
+            'subgroup_sensitivity' in g.columns else 0
+        sp = g['subgroup_specificity'].notna().sum() if \
+            'subgroup_specificity' in g.columns else 0
+        tf1 = g['non_subgroup_macro_f1'].notna().sum() if \
+            'non_subgroup_macro_f1' in g.columns else 0
+        ts = g['non_subgroup_sensitivity'].notna().sum() if \
+            'non_subgroup_sensitivity' in g.columns else 0
+        tp = g['non_subgroup_specificity'].notna().sum() if \
+            'non_subgroup_specificity' in g.columns else 0
+        print(f"  {str(m):<32} {n:>4} {sf1:>10} {ss:>10} {sp:>10} "
+              f"{tf1:>10} {ts:>10} {tp:>10}")
+    print(f"{'='*70}\n")
 
 
 # =======================================================================
@@ -2502,11 +2676,248 @@ def plot_sens_spec_three_marker(df, output_dir, config,
         index=False)
     return grouped
 
+def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
+    """
+    Compact one-row-per-method Sens/Spec plot.
+
+    Per method:
+      ● / ■ / ▲  = marker shape encodes metric
+                    (circle = Sensitivity, square = Specificity)
+      Red        = Dys subgroup
+      Gray       = Pooled (combined)
+      Blue       = Typ subgroup
+
+    Sensitivity markers sit slightly above the row centre, Specificity
+    markers slightly below. Value labels are placed above the Sensitivity
+    markers and below the Specificity markers so the two clusters never
+    collide.
+
+    Blocks (Baseline / Fusion / Ensemble) are separated by dashed
+    horizontal lines. Methods whose subgroup values were unavailable
+    (fallback to combined) are drawn with the Pooled marker only and
+    flagged with '*' in the y-label.
+    """
+    from matplotlib.lines import Line2D
+
+    plot_df = df[df['Task'] == task_type].copy()
+    if plot_df.empty:
+        print("plot_sens_spec_compact: no rows")
+        return None
+
+    required = [
+        'sensitivity', 'specificity',
+        'subgroup_sensitivity', 'subgroup_specificity',
+        'non_subgroup_sensitivity', 'non_subgroup_specificity',
+    ]
+    missing = [c for c in required if c not in plot_df.columns]
+    if missing:
+        print(f"plot_sens_spec_compact: missing columns {missing}")
+        return None
+
+    grouped = plot_df.groupby('Method_Label').agg({
+        'sensitivity':                'mean',
+        'specificity':                'mean',
+        'subgroup_sensitivity':       'mean',
+        'subgroup_specificity':       'mean',
+        'non_subgroup_sensitivity':   'mean',
+        'non_subgroup_specificity':   'mean',
+    }).reset_index()
+
+    # Drop the aggregate Meta-Fusion row — not a real method.
+    grouped = grouped[grouped['Method_Label'].str.lower() != 'meta-fusion']
+
+    # Combined metrics are mandatory.
+    grouped = grouped.dropna(subset=['sensitivity', 'specificity'], how='any')
+    if grouped.empty:
+        print("plot_sens_spec_compact: no rows with combined sens/spec")
+        return None
+
+    # Flag missing subgroup BEFORE falling back.
+    sub_cols = ['subgroup_sensitivity', 'subgroup_specificity',
+                'non_subgroup_sensitivity', 'non_subgroup_specificity']
+    grouped['_missing_subgroup'] = grouped[sub_cols].isna().any(axis=1)
+
+    # Fallback: fill missing subgroup with combined so the marker exists.
+    for sub_c, comb_c in [('subgroup_sensitivity',     'sensitivity'),
+                          ('subgroup_specificity',     'specificity'),
+                          ('non_subgroup_sensitivity', 'sensitivity'),
+                          ('non_subgroup_specificity', 'specificity')]:
+        grouped[sub_c] = grouped[sub_c].fillna(grouped[comb_c])
+
+    # ---- Block classification ----
+    def _classify(label):
+        ll = str(label).lower()
+        if ('clinical-feature-only' in ll or 'text-embedding-only' in ll
+                or 'audio-only' in ll or 'text-only' in ll
+                or ll in ('clinical', 'text')):
+            return 'Baseline'
+        if ('ensemble' in ll or 'meta-fusion' in ll or 'metafusion' in ll
+                or 'confidence selection' in ll or 'best method' in ll):
+            return 'Ensemble'
+        return 'Fusion'
+
+    grouped['Block'] = grouped['Method_Label'].apply(_classify)
+    block_order = ['Baseline', 'Fusion', 'Ensemble']
+    grouped['BlockRank'] = grouped['Block'].apply(
+        lambda b: block_order.index(b) if b in block_order else 99)
+
+    # Order: block, then within-block by combined sensitivity descending.
+    grouped = grouped.sort_values(
+        ['BlockRank', 'sensitivity'],
+        ascending=[True, False],
+    ).reset_index(drop=True)
+
+    methods = grouped['Method_Label'].tolist()
+    blocks  = grouped['Block'].tolist()
+    flags   = grouped['_missing_subgroup'].tolist()
+    y       = np.arange(len(methods))
+
+    y_labels = [f"{m} *" if f else m for m, f in zip(methods, flags)]
+
+    # ---- Figure ----
+    fig, ax = plt.subplots(
+        figsize=(6.0, max(3.0, 0.30 * len(methods))),
+    )
+
+    C_DYS  = '#C0392B'   # red
+    C_POOL = '#7F8C8D'   # gray
+    C_TYP  = '#2980B9'   # blue
+
+    Y_OFFSET = 0.16           # how far above/below the row centre
+    LABEL_OFFSET = 0.30       # how far the value labels sit from the centre
+
+    for i, row in grouped.iterrows():
+        yy = y[i]
+
+        if flags[i]:
+            # No subgroup — draw Pooled markers only.
+            ax.scatter([row['sensitivity']], [yy - Y_OFFSET],
+                       marker='o', s=42, color=C_POOL,
+                       edgecolor='black', linewidth=0.6, zorder=3)
+            ax.scatter([row['specificity']], [yy + Y_OFFSET],
+                       marker='s', s=38, color=C_POOL,
+                       edgecolor='black', linewidth=0.6, zorder=3)
+
+            ax.text(row['sensitivity'], yy - LABEL_OFFSET,
+                    f"{row['sensitivity']:.3f}",
+                    ha='center', va='bottom', fontsize=6.2, color=C_POOL)
+            ax.text(row['specificity'], yy + LABEL_OFFSET,
+                    f"{row['specificity']:.3f}",
+                    ha='center', va='top', fontsize=6.2, color=C_POOL)
+        else:
+            # Full Dys / Pooled / Typ cluster.
+            # --- Sensitivity (top sub-row, circles) ---
+            xs_sens = [row['subgroup_sensitivity'],
+                       row['sensitivity'],
+                       row['non_subgroup_sensitivity']]
+            ax.plot([min(xs_sens), max(xs_sens)], [yy - Y_OFFSET] * 2,
+                    color='#D5D8DC', linewidth=0.9, zorder=1)
+            ax.scatter(xs_sens, [yy - Y_OFFSET] * 3,
+                       marker='o',
+                       s=[42, 44, 42],
+                       c=[C_DYS, C_POOL, C_TYP],
+                       edgecolor='black', linewidth=0.6, zorder=3)
+
+            # --- Specificity (bottom sub-row, squares) ---
+            xs_spec = [row['subgroup_specificity'],
+                       row['specificity'],
+                       row['non_subgroup_specificity']]
+            ax.plot([min(xs_spec), max(xs_spec)], [yy + Y_OFFSET] * 2,
+                    color='#D5D8DC', linewidth=0.9, zorder=1)
+            ax.scatter(xs_spec, [yy + Y_OFFSET] * 3,
+                       marker='s',
+                       s=[38, 40, 38],
+                       c=[C_DYS, C_POOL, C_TYP],
+                       edgecolor='black', linewidth=0.6, zorder=3)
+
+            # --- Value labels ---
+            # Sensitivity: above the top sub-row
+            for val, col in zip(xs_sens, (C_DYS, C_POOL, C_TYP)):
+                ax.text(val, yy - LABEL_OFFSET, f"{val:.3f}",
+                        ha='center', va='bottom', fontsize=6.2,
+                        color=col, fontweight='bold')
+            # Specificity: below the bottom sub-row
+            for val, col in zip(xs_spec, (C_DYS, C_POOL, C_TYP)):
+                ax.text(val, yy + LABEL_OFFSET, f"{val:.3f}",
+                        ha='center', va='top', fontsize=6.2,
+                        color=col)
+
+    # ---- Block separators ----
+    for i in range(1, len(y)):
+        if blocks[i] != blocks[i - 1]:
+            ax.axhline(i - 0.5, color='#34495E', linewidth=0.7,
+                       linestyle='--', zorder=0, alpha=0.8)
+
+    # ---- Axis cosmetics ----
+    ax.set_yticks(y)
+    ax.set_yticklabels(y_labels, fontsize=8)
+    ax.set_ylim(len(methods) - 0.5, -0.7)   # inverted — first method on top
+    ax.set_xlim(0.0, 1.05)
+    ax.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.tick_params(axis='x', labelsize=8, length=3)
+    ax.set_xlabel('Score', fontsize=10, fontweight='bold')
+    ax.grid(True, alpha=0.25, axis='x', linewidth=0.4)
+    ax.set_axisbelow(True)
+
+    # ---- Legend (below the axes) ----
+    legend_handles = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
+               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               label='Sensitivity'),
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='#888888',
+               markeredgecolor='black', markeredgewidth=0.6, markersize=6,
+               label='Specificity'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=C_DYS,
+               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               label='Dys'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=C_TYP,
+               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               label='Typ'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=C_POOL,
+               markeredgecolor='black', markeredgewidth=0.6, markersize=7,
+               label='Pooled'),
+    ]
+    ax.legend(handles=legend_handles,
+              loc='lower center', bbox_to_anchor=(0.5, -0.22),
+              ncol=5, frameon=False, fontsize=7,
+              handletextpad=0.3, columnspacing=1.0)
+
+    # ---- Footnote for asterisked methods ----
+    if any(flags):
+        fig.text(0.5, -0.03,
+                 '* subgroup data unavailable for this method.',
+                 fontsize=6, color='#2C3E50', ha='center', va='top')
+
+    plt.tight_layout()
+
+    out_png = output_dir / f'sens_spec_compact_{task_type}.png'
+    out_pdf = output_dir / f'sens_spec_compact_{task_type}.pdf'
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    plt.savefig(out_pdf, bbox_inches='tight')
+    plt.close()
+
+    # ---- Sidecar CSV ----
+    grouped.to_csv(
+        output_dir / f'sens_spec_compact_data_{task_type}.csv', index=False)
+
+    print(f"✓ Compact Sens/Spec plot saved: {out_png}")
+    print(f"  Blocks:")
+    for b in block_order:
+        names = grouped[grouped['Block'] == b]['Method_Label'].tolist()
+        if names:
+            print(f"    {b} ({len(names)}): {names}")
+    if any(flags):
+        starred = [m for m, f in zip(methods, flags) if f]
+        print(f"  Methods with * (subgroup data missing): {starred}")
+
+    return grouped
 
 def plot_subgroup_comparison(df, output_dir, config, task_type='classification'):
     plot_sens_spec_three_marker(df, output_dir, config, task_type=task_type)
+    plot_sens_spec_compact(df, output_dir, config, task_type=task_type)
 
-    metrics_to_compare = (['macro_f1', 'balanced_accuracy', 'roc_auc']
+    metrics_to_compare = (['macro_f1', 'balanced_accuracy', 'roc_auc',
+                           'sensitivity', 'specificity']
                           if task_type == 'classification' else ['rmse', 'r2'])
     for metric in metrics_to_compare:
         sm, nsm = f'subgroup_{metric}', f'non_subgroup_{metric}'
@@ -2644,7 +3055,8 @@ def create_summary_table(df, output_dir, config, prefix=''):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Experiment Results Aggregator (regression ranked by RMSE)')
+        description='Experiment Results Aggregator '
+                    '(JSON + prediction-derived metrics for every method)')
     parser.add_argument('--input-dir', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default='./results_summary')
     parser.add_argument('--task', type=str,
@@ -2675,6 +3087,10 @@ def main():
     dys_ids = []
     if args.dys_ids:
         dys_ids = load_dys_speaker_ids(Path(args.dys_ids))
+    if not dys_ids:
+        print("⚠ No Dys speaker IDs provided. Subgroup metrics will only be "
+              "computed when a prediction CSV contains a speaker-ID column; "
+              "otherwise only combined metrics are produced.")
 
     base_dir = Path(args.input_dir)
     experiments = discover_experiments(base_dir, args.task, config)
@@ -2694,13 +3110,9 @@ def main():
             print("ERROR: No experiments match the specified models!")
             return
 
-    print(f"\n{'='*60}\nAGGREGATING RESULTS\n{'='*60}")
-    df = aggregate_experiment_results(experiments, config)
+    print(f"\n{'='*60}\nAGGREGATING RESULTS (JSON + predictions)\n{'='*60}")
+    df = aggregate_experiment_results(experiments, config, dys_ids)
     print(f"Aggregated {len(df)} method results")
-
-    # ---- BACKFILL from prediction CSVs ----
-    print(f"\n{'='*60}\nBACKFILLING MISSING METRICS\n{'='*60}")
-    df = backfill_all_metrics_from_predictions(df, experiments, config, dys_ids)
 
     if args.ignore_methods:
         ignore_set = set(args.ignore_methods)
@@ -2727,6 +3139,7 @@ def main():
     print("Methods:", df['Method_Label'].unique().tolist())
 
     df.to_csv(output_dir / 'all_results.csv', index=False)
+    print(f"✓ all_results.csv written ({len(df)} rows)")
 
     print_method_coverage(df)
 
