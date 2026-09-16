@@ -2841,9 +2841,9 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
                        linestyle='--', zorder=0, alpha=0.75)
 
     # ---- Axes ----
-    ax.set_xlim(0.6, 1.05)
+    ax.set_xlim(0.60, 1.05)
     ax.set_xticks([0.7, 0.8, 0.9, 1.0])
-    ax.set_xticklabels(['0.6', '0.7', '0.8', '0.9', '1.0'], fontsize=7)
+    ax.set_xticklabels([ '0.7', '0.8', '0.9', '1.0'], fontsize=7)
     ax.set_xlabel('Score', fontsize=8, fontweight='bold', labelpad=2)
 
     ax.set_yticks(y)
