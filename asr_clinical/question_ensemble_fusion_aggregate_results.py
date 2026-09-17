@@ -2776,18 +2776,19 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
     C_POOL = '#7F8C8D'
     C_TYP  = '#2980B9'
 
-    # Vertical offsets inside one method row
-    SENS_Y        = -0.18
-    SPEC_Y        = +0.18
-    SENS_LABEL_Y  = -0.30
-    SPEC_LABEL_Y  = +0.30
+    # Vertical offsets inside one method row  (tighter than before)
+    SENS_Y        = -0.14
+    SPEC_Y        = +0.14
+    SENS_LABEL_Y  = -0.26
+    SPEC_LABEL_Y  = +0.26
 
     # ---- Figure ----
     fig_width  = 3.5
-    fig_height = max(3.4, 0.34 * len(methods) + 1.4)
+    # 0.34 -> 0.26 per method + trimmed constant for compact rows
+    fig_height = max(3.2, 0.26 * len(methods) + 1.3)
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    fig.subplots_adjust(left=0.38, right=0.97, top=0.96, bottom=0.16)
+    fig.subplots_adjust(left=0.42, right=0.98, top=0.97, bottom=0.13)
 
     for i, row in grouped.iterrows():
         yy = y[i]
@@ -2809,23 +2810,24 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
                 color='#B0B0B0', linewidth=0.7, alpha=0.9,
                 zorder=1, solid_capstyle='round')
 
-        # Sensitivity markers (circles)
-        ax.scatter([sens_vals[0]], [yy + SENS_Y], s=26, marker='o',
+        # Sensitivity markers (circles) — slightly larger for readability
+        ax.scatter([sens_vals[0]], [yy + SENS_Y], s=32, marker='o',
                    color=C_DYS, edgecolor='black', linewidth=0.5, zorder=3)
-        ax.scatter([sens_vals[1]], [yy + SENS_Y], s=22, marker='D',
+        ax.scatter([sens_vals[1]], [yy + SENS_Y], s=28, marker='D',
                    color=C_POOL, edgecolor='black', linewidth=0.5, zorder=4)
-        ax.scatter([sens_vals[2]], [yy + SENS_Y], s=26, marker='o',
+        ax.scatter([sens_vals[2]], [yy + SENS_Y], s=32, marker='o',
                    color=C_TYP, edgecolor='black', linewidth=0.5, zorder=3)
 
         # Specificity markers (squares)
-        ax.scatter([spec_vals[0]], [yy + SPEC_Y], s=24, marker='s',
+        ax.scatter([spec_vals[0]], [yy + SPEC_Y], s=30, marker='s',
                    color=C_DYS, edgecolor='black', linewidth=0.5, zorder=3)
-        ax.scatter([spec_vals[1]], [yy + SPEC_Y], s=20, marker='D',
+        ax.scatter([spec_vals[1]], [yy + SPEC_Y], s=26, marker='D',
                    color=C_POOL, edgecolor='black', linewidth=0.5, zorder=4)
-        ax.scatter([spec_vals[2]], [yy + SPEC_Y], s=24, marker='s',
+        ax.scatter([spec_vals[2]], [yy + SPEC_Y], s=30, marker='s',
                    color=C_TYP, edgecolor='black', linewidth=0.5, zorder=3)
 
         # Value labels — above Sens, below Spec
+        # Fontsize reduced (6.5 -> 4.5) so compressed rows don't overlap
         for val, col in zip(sens_vals, (C_DYS, C_POOL, C_TYP)):
             ax.text(val, yy + SENS_LABEL_Y, f"{val:.3f}",
                     ha='center', va='bottom', fontsize=4.5,
@@ -2841,13 +2843,13 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
                        linestyle='--', zorder=0, alpha=0.75)
 
     # ---- Axes ----
-    ax.set_xlim(0.60, 1.05)
+    ax.set_xlim(0.55, 1.1)
     ax.set_xticks([0.7, 0.8, 0.9, 1.0])
-    ax.set_xticklabels([ '0.7', '0.8', '0.9', '1.0'], fontsize=7)
-    ax.set_xlabel('Score', fontsize=8, fontweight='bold', labelpad=2)
+    ax.set_xticklabels(['0.7', '0.8', '0.9', '1.0'], fontsize=8)
+    # X-axis label removed (Score no longer shown)
 
     ax.set_yticks(y)
-    ax.set_yticklabels(y_labels, fontsize=6.5)
+    ax.set_yticklabels(y_labels, fontsize=8)
     ax.set_ylim(len(methods) - 0.5, -0.7)
     ax.tick_params(axis='y', length=2, pad=2)
     ax.tick_params(axis='x', length=2, pad=2)
@@ -2857,32 +2859,32 @@ def plot_sens_spec_compact(df, output_dir, config, task_type='classification'):
     # ---- Legend at the bottom ----
     legend_handles = [
         Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
-               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=6,
                label='Sensitivity'),
         Line2D([0], [0], marker='s', color='w', markerfacecolor='#888888',
-               markeredgecolor='black', markeredgewidth=0.5, markersize=4.5,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=5.5,
                label='Specificity'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor=C_DYS,
-               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=6,
                label='Dys'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor=C_TYP,
-               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=6,
                label='Typ'),
         Line2D([0], [0], marker='D', color='w', markerfacecolor=C_POOL,
-               markeredgecolor='black', markeredgewidth=0.5, markersize=4,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=5,
                label='Pooled'),
     ]
     ax.legend(handles=legend_handles,
               loc='upper center',
               bbox_to_anchor=(0.5, -0.09),
-              ncol=5, frameon=False, fontsize=6,
+              ncol=5, frameon=False, fontsize=7,
               handletextpad=0.3, columnspacing=0.8,
               borderaxespad=0)
 
     if any(flags):
         fig.text(0.5, 0.005,
                  '* subgroup data unavailable for this method.',
-                 fontsize=5.5, color='#2C3E50',
+                 fontsize=6.5, color='#2C3E50',
                  ha='center', va='bottom')
 
     out_png = output_dir / f'sens_spec_compact_{task_type}.png'
@@ -3238,5 +3240,8 @@ if __name__ == "__main__":
 '''
 
 for t in classification regression;do rm -rf outputs-ensemble-aggregate-$t;mkdir outputs-ensemble-aggregate-$t;python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble --output-dir outputs-ensemble-aggregate-$t --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee outputs-ensemble-aggregate-$t/log.txt;done
+
+
+for t in classification regression;do rm -rf outputs-ensemble-egemaps-aggregate-$t;mkdir outputs-ensemble-egemaps-aggregate-$t;python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble-egemaps --output-dir outputs-ensemble-egemaps-aggregate-$t --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee outputs-ensemble-egemaps-aggregate-$t/log.txt;done
 
 '''
