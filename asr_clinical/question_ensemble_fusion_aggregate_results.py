@@ -2066,10 +2066,94 @@ def perform_ablation_analysis_all_patients(df, config, task_type='classification
 #  ROBUSTNESS SUMMARY
 # =======================================================================
 
+def _bootstrap_ci_row(method_label: str,
+                      g: pd.DataFrame,
+                      metrics: List[str],
+                      task_type: str,
+                      n_iterations: int) -> Optional[Dict[str, Any]]:
+    """
+    Build a single wide row: for every metric in `metrics` compute
+    mean / lower / upper / std / n_models across the models that have a
+    valid value for that metric.
+
+    For classification, metrics are bounded in [0, 1] — we additionally
+    guard against NaNs. For regression, we apply the plausibility filter.
+    """
+    row: Dict[str, Any] = {'Method_Label': method_label}
+    models_all = list(g['Model'].unique())
+
+    any_metric_present = False
+    for metric in metrics:
+        if metric not in g.columns:
+            row[f'{metric}_mean'] = np.nan
+            row[f'{metric}_lower_ci'] = np.nan
+            row[f'{metric}_upper_ci'] = np.nan
+            row[f'{metric}_std'] = np.nan
+            row[f'{metric}_n_models'] = 0
+            continue
+
+        vals = pd.to_numeric(g[metric], errors='coerce').dropna().values
+
+        if task_type == 'regression':
+            vals = np.array(
+                [v for v in vals
+                 if is_plausible_regression_metric(v, metric)],
+                dtype=float,
+            )
+        else:
+            # classification metrics must lie in [0, 1]
+            vals = np.array(
+                [v for v in vals if np.isfinite(v) and 0.0 <= v <= 1.0],
+                dtype=float,
+            )
+
+        if len(vals) < 2:
+            row[f'{metric}_mean'] = np.nan
+            row[f'{metric}_lower_ci'] = np.nan
+            row[f'{metric}_upper_ci'] = np.nan
+            row[f'{metric}_std'] = np.nan
+            row[f'{metric}_n_models'] = int(len(vals))
+            continue
+
+        mean, lower, upper = bootstrap_ci(
+            vals, n_iterations=n_iterations, ci=0.95)
+        row[f'{metric}_mean'] = mean
+        row[f'{metric}_lower_ci'] = lower
+        row[f'{metric}_upper_ci'] = upper
+        row[f'{metric}_std'] = float(np.nanstd(vals, ddof=1))
+        row[f'{metric}_n_models'] = int(len(vals))
+        any_metric_present = True
+
+    row['n_models'] = len(models_all)
+    row['models'] = ';'.join(models_all)
+    return row if any_metric_present else None
+
+
 def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path,
                                          config: ExperimentConfig,
                                          task_type: str = 'classification',
                                          n_iterations: int = 1000):
+    """
+    Compute cross-model bootstrap confidence intervals for MULTIPLE
+    metrics, not just the ranking metric.
+
+      classification : macro_f1, sensitivity, specificity, roc_auc,
+                       balanced_accuracy  (any that exist as columns)
+      regression     : rmse, r2          (unchanged behaviour)
+
+    Output
+    ------
+    confidence_intervals_classification.csv  (or _regression.csv)
+        one row per Method_Label with columns:
+            <metric>_mean, <metric>_lower_ci, <metric>_upper_ci,
+            <metric>_std, <metric>_n_models
+        for every metric, plus `n_models` and `models`.
+
+    The old files (e.g. with `macro_f1_mean`) are superseded — but
+    because the same metric-prefixed columns are still present, any
+    downstream consumer that only looked at `<ranking_metric>_mean`
+    continues to work unchanged.
+    """
     if df.empty:
         return None, None
 
@@ -2083,40 +2167,69 @@ def plot_robustness_summary_all_patients(df: pd.DataFrame, output_dir: Path,
     if task_type == 'classification':
         metric = config.ranking_metric_classification
         lower_is_better = False
+        # ---- METRICS FOR WHICH WE WANT CIs ----
+        metrics_for_ci = [
+            'macro_f1', 'sensitivity', 'specificity',
+            'balanced_accuracy', 'roc_auc',
+        ]
     else:
         metric = config.ranking_metric_regression
         lower_is_better = True
+        metrics_for_ci = ['rmse', 'r2']
+
+    # keep only metrics that actually exist in the dataframe
+    metrics_for_ci = [m for m in metrics_for_ci if m in task_df.columns]
 
     try:
         print(f"\n[CI] Computing cross-model CIs for {task_type} "
-              f"(metric={metric})...")
+              f"across metrics: {metrics_for_ci} "
+              f"(ranking metric={metric}, n_iterations={n_iterations})")
+
         ci_rows = []
         for method_label, g in task_df.groupby('Method_Label'):
-            vals = pd.to_numeric(g[metric], errors='coerce').dropna().values
-            if task_type == 'regression':
-                vals = np.array([v for v in vals
-                                 if is_plausible_regression_metric(v, metric)])
-            if len(vals) < 2:
-                continue
-            mean, lower, upper = bootstrap_ci(vals, n_iterations=n_iterations,
-                                              ci=0.95)
-            ci_rows.append({
-                'Method_Label': method_label,
-                f'{metric}_mean': mean,
-                f'{metric}_lower_ci': lower,
-                f'{metric}_upper_ci': upper,
-                f'{metric}_std': np.nanstd(vals, ddof=1),
-                'n_models': len(vals),
-                'models': list(g['Model'].unique()),
-            })
+            row = _bootstrap_ci_row(method_label, g, metrics_for_ci,
+                                    task_type, n_iterations)
+            if row is not None:
+                ci_rows.append(row)
+
         ci_df = pd.DataFrame(ci_rows)
 
         if not ci_df.empty:
-            ci_df.to_csv(output_dir / f'confidence_intervals_{task_type}.csv',
-                         index=False)
-            print(f"✓ Confidence intervals data saved")
+            # Reorder so ranking-metric columns come first, then the rest,
+            # then the bookkeeping columns.
+            ordered_prefixes = [metric] + [m for m in metrics_for_ci
+                                            if m != metric]
+            ordered_cols = ['Method_Label']
+            for m in ordered_prefixes:
+                for suffix in ('_mean', '_lower_ci', '_upper_ci',
+                               '_std', '_n_models'):
+                    col = f'{m}{suffix}'
+                    if col in ci_df.columns:
+                        ordered_cols.append(col)
+            for extra in ('n_models', 'models'):
+                if extra in ci_df.columns:
+                    ordered_cols.append(extra)
+            # append anything we might have missed
+            ordered_cols += [c for c in ci_df.columns
+                             if c not in ordered_cols]
+            ci_df = ci_df[ordered_cols]
+
+            # sort by ranking metric mean (ascending if lower_is_better)
+            sort_col = f'{metric}_mean'
+            if sort_col in ci_df.columns:
+                ci_df = ci_df.sort_values(
+                    sort_col, ascending=lower_is_better,
+                    na_position='last',
+                ).reset_index(drop=True)
+
+            out_csv = output_dir / f'confidence_intervals_{task_type}.csv'
+            ci_df.to_csv(out_csv, index=False)
+            print(f"✓ Confidence intervals saved: {out_csv}")
+            print(f"  Columns: {list(ci_df.columns)}")
     except Exception as e:
+        import traceback
         print(f"⚠ Error computing confidence intervals: {e}")
+        traceback.print_exc()
 
     try:
         print(f"\n[ABLATION] Running ablation for {task_type}...")
