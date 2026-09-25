@@ -1408,8 +1408,20 @@ def plot_dys_scatter_audio_text_fusion_single(
     config: ExperimentConfig, task_type: str = 'regression',
     dys_ids: List[str] = None,
 ):
+    """
+    Two-panel Dys-only observed-vs-predicted scatter (regression).
+
+      Panel 1 : Multisource-Clinical-Only  (is_clinical_feature_only)
+      Panel 2 : Voting Ensemble            (ensemble_voting, fallback:
+                                            best non-baseline / non-ensemble)
+
+    Legend box per panel shows R^2, RMSE, MAE and n for the Dys subgroup.
+    """
     if task_type != 'regression':
         print("Scatter plots only available for regression tasks")
+        return
+    if not dys_ids:
+        print("⚠ No Dys speaker IDs provided — cannot build Dys-only scatter.")
         return
 
     plot_df = df[df['Task'] == 'regression'].copy()
@@ -1421,248 +1433,249 @@ def plot_dys_scatter_audio_text_fusion_single(
         print("⚠ 'subgroup_rmse' column not present — cannot rank candidates.")
         return
 
-    if dys_ids:
-        print(f"\nUsing Dys/Norm split with {len(dys_ids)} Dys speaker IDs")
-    else:
-        print("\n⚠ No Dys speaker IDs provided. Norm subgroup will be empty.")
-
+    dys_set = {str(x) for x in dys_ids}
     models = plot_df['Model'].unique()
-    print(f"\nFound {len(models)} models for regression")
 
-    def _validated_subgroup_rmse(model_name, method_key):
+    # ---------------------------------------------------------------
+    #  Helper: validated mean Dys RMSE for a (model, method) pair
+    # ---------------------------------------------------------------
+    def _validated_dys_rmse(model_name: str, method_key: str):
         sub = plot_df[(plot_df['Model'] == model_name)
                       & (plot_df['Method'] == method_key)]
         if sub.empty or 'subgroup_rmse' not in sub.columns:
-            return None, 0
-        vals = pd.to_numeric(sub['subgroup_rmse'], errors='coerce').dropna().values
+            return None
+        vals = pd.to_numeric(sub['subgroup_rmse'],
+                             errors='coerce').dropna().values
         if len(vals) == 0:
-            return None, 0
+            return None
         valid = vals[np.isfinite(vals) & (vals > 1e-6)]
         if len(valid) == 0:
-            return None, 0
-        return float(np.mean(valid)), int(len(valid))
+            return None
+        return float(np.mean(valid))
 
-    best_text_model = best_text_method = None
-    best_text_rmse = float('inf')
-    best_fusion_model = best_fusion_method = None
-    best_fusion_rmse = float('inf')
+    # ---------------------------------------------------------------
+    #  Panel 1: Multisource-Clinical-Only
+    #  Pick the model whose clinical-only baseline has the best Dys RMSE
+    #  (deterministic tie-break on model name).
+    # ---------------------------------------------------------------
+    clinical_candidates = []          # (rmse, model, method)
+    for model in models:
+        methods = plot_df[plot_df['Model'] == model]['Method'].unique()
+        for m in methods:
+            if is_clinical_feature_only(m):
+                r = _validated_dys_rmse(model, m)
+                if r is not None:
+                    clinical_candidates.append((r, model, m))
+
+    if clinical_candidates:
+        clinical_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, clinical_model, clinical_method = clinical_candidates[0]
+    else:
+        clinical_model = clinical_method = None
+
+    # ---------------------------------------------------------------
+    #  Panel 2: Voting Ensemble  (preferred), else best fusion
+    # ---------------------------------------------------------------
+    voting_candidates = []            # (rmse, model, method)
+    fusion_candidates = []            # (rmse, model, method)
 
     for model in models:
-        for method in plot_df[plot_df['Model'] == model]['Method'].unique():
-            rmse_val, _ = _validated_subgroup_rmse(model, method)
-            if rmse_val is None:
+        methods = plot_df[plot_df['Model'] == model]['Method'].unique()
+        for m in methods:
+            ml = str(m).lower()
+            r = _validated_dys_rmse(model, m)
+            if r is None:
                 continue
 
-            if is_text_embedding_only(method):
-                if rmse_val < best_text_rmse:
-                    best_text_rmse = rmse_val
-                    best_text_model = model
-                    best_text_method = method
+            # Voting ensemble: exact key or any ensemble_*_voting variant
+            if ml == 'ensemble_voting' or (
+                ml.startswith('ensemble_') and 'voting' in ml
+            ):
+                voting_candidates.append((r, model, m))
 
-            if (not is_clinical_feature_only(method)
-                    and not is_text_embedding_only(method)
-                    and not is_ensemble_method(method)):
-                if rmse_val < best_fusion_rmse:
-                    best_fusion_rmse = rmse_val
-                    best_fusion_model = model
-                    best_fusion_method = method
+            if (not is_clinical_feature_only(m)
+                    and not is_text_embedding_only(m)
+                    and not is_ensemble_method(m)):
+                fusion_candidates.append((r, model, m))
 
-    clinical_method = 'audio_only'
-    clinical_model = None
-    for model in models:
-        strict_matches = [m for m in plot_df[plot_df['Model'] == model]['Method'].unique()
-                          if is_clinical_feature_only(m)]
-        if strict_matches:
-            clinical_model = model
-            clinical_method = strict_matches[0]
-            break
+    if voting_candidates:
+        voting_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, fusion_model, fusion_method = voting_candidates[0]
+        fusion_label = 'Voting Ensemble'
+    elif fusion_candidates:
+        fusion_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, fusion_model, fusion_method = fusion_candidates[0]
+        fusion_label = 'Best Fusion'
+    else:
+        fusion_model = fusion_method = None
+        fusion_label = 'Voting Ensemble'
 
     print(f"\n{'='*100}")
-    print("SCATTER PLOT — METHOD SELECTION (Regression, validated Dys RMSE)")
+    print("SCATTER PLOT — METHOD SELECTION (Regression, Dys only)")
     print(f"{'='*100}")
-    print(f"  Clinical-Feature-Only panel: model={clinical_model}, "
+    print(f"  Panel 1 (Clinical-Only) : model={clinical_model}, "
           f"method={clinical_method}")
-    if best_text_method:
-        print(f"  Best Text-Embedding   panel: model={best_text_model}, "
-              f"method={best_text_method} (Dys RMSE={best_text_rmse:.4f})")
-    if best_fusion_method:
-        print(f"  Best Fusion           panel: model={best_fusion_model}, "
-              f"method={best_fusion_method} (Dys RMSE={best_fusion_rmse:.4f})")
+    print(f"  Panel 2 ({fusion_label}) : model={fusion_model}, "
+          f"method={fusion_method}")
     print(f"{'='*100}\n")
 
-    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+    # ---------------------------------------------------------------
+    #  Extract Dys (obs, pred) from a (model, method) prediction file
+    # ---------------------------------------------------------------
+    def _extract_dys(model_name: str, method_key: str):
+        if model_name is None or method_key is None:
+            return np.array([]), np.array([])
+
+        pred_df = load_predictions_unfiltered(experiments, model_name,
+                                             method_key)
+        if pred_df is None or pred_df.empty:
+            return np.array([]), np.array([])
+
+        obs_col, pred_col, id_col, _ = _detect_prediction_columns(pred_df)
+        if obs_col is None or pred_col is None:
+            return np.array([]), np.array([])
+
+        # Inject speaker IDs if the file (esp. ensembles) lacks them
+        dir_hint = None
+        pk = f'predictions_{method_key}'
+        if model_name in experiments and pk in experiments[model_name]:
+            dir_hint = experiments[model_name][pk].get('dir')
+        if id_col is None and dir_hint is not None:
+            pred_df = _inject_speaker_ids(pred_df, dir_hint)
+            obs_col, pred_col, id_col, _ = _detect_prediction_columns(pred_df)
+
+        if id_col is None:
+            return np.array([]), np.array([])
+
+        ids_str = pred_df[id_col].astype(str)
+        dys_mask = ids_str.isin(list(dys_set))
+        dys_df = pred_df[dys_mask].drop_duplicates(subset=[id_col],
+                                                   keep='first')
+        if dys_df.empty:
+            return np.array([]), np.array([])
+
+        o = pd.to_numeric(dys_df[obs_col], errors='coerce').values.astype(float)
+        p = pd.to_numeric(dys_df[pred_col], errors='coerce').values.astype(float)
+        m = ~(np.isnan(o) | np.isnan(p))
+        return o[m], p[m]
+
+    # ---------------------------------------------------------------
+    #  Metrics for the legend box
+    # ---------------------------------------------------------------
+    def _metrics(o: np.ndarray, p: np.ndarray):
+        n = len(o)
+        if n < 2:
+            return {'n': n, 'rmse': np.nan, 'r2': np.nan, 'mae': np.nan}
+        rmse = float(np.sqrt(np.mean((o - p) ** 2)))
+        mae = float(np.mean(np.abs(o - p)))
+        r2 = float(pearsonr(o, p)[0] ** 2) if n > 2 else np.nan
+        return {'n': n, 'rmse': rmse, 'r2': r2, 'mae': mae}
+
+    # ---------------------------------------------------------------
+    #  Figure: two panels, single row, Dys only
+    # ---------------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     plt.rcParams.update({
         'font.size': 16, 'axes.titlesize': 20, 'axes.labelsize': 18,
         'xtick.labelsize': 15, 'ytick.labelsize': 15, 'legend.fontsize': 14,
     })
 
-    method_types = [
-        ('clinical', 'Clinical-Feature-Only', axes[0],
+    panels = [
+        ('Clinical-Only', 'Multisource-Clinical-Only', axes[0],
          clinical_model, clinical_method),
-        ('text', 'Text-Embedding-Only', axes[1],
-         best_text_model, best_text_method),
-        ('fusion', 'Best Fusion', axes[2],
-         best_fusion_model, best_fusion_method),
+        (fusion_label,     fusion_label,               axes[1],
+         fusion_model,   fusion_method),
     ]
 
-    all_predictions = {}
+    summary_rows = []
 
-    for method_type, display_name, ax, model, method in method_types:
-        if model is None or method is None:
-            ax.text(0.5, 0.5, f'No model found\nfor {display_name}',
-                    ha='center', va='center', transform=ax.transAxes, fontsize=18)
+    for _, display_name, ax, model, method in panels:
+        dys_o, dys_p = _extract_dys(model, method)
+
+        if len(dys_o) == 0:
+            ax.text(0.5, 0.5,
+                    f'No Dys predictions\n{display_name}',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=18)
             ax.set_xlabel('Observed', fontsize=18)
             ax.set_ylabel('Predicted', fontsize=18)
-            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20,
+            ax.set_title(f'{display_name}\n(Dys subgroup)', fontsize=20,
                          fontweight='bold')
             ax.grid(True, alpha=0.3)
             continue
 
-        pred_df = load_predictions_unfiltered(experiments, model, method)
-        if pred_df is None:
-            ax.text(0.5, 0.5, 'No predictions file',
-                    ha='center', va='center', transform=ax.transAxes, fontsize=18)
-            ax.set_xlabel('Observed', fontsize=18)
-            ax.set_ylabel('Predicted', fontsize=18)
-            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20,
-                         fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            continue
+        m = _metrics(dys_o, dys_p)
 
-        obs_col, pred_col, id_col, prob_col = _detect_prediction_columns(pred_df)
+        # Scatter
+        ax.scatter(dys_o, dys_p, alpha=0.75, s=170, color='#E74C3C',
+                   marker='o', edgecolors='black', linewidths=1.4,
+                   label='Dys')
 
-        if obs_col is None or pred_col is None:
-            ax.text(0.5, 0.5, 'No obs/pred columns',
-                    ha='center', va='center', transform=ax.transAxes, fontsize=18)
-            ax.set_xlabel('Observed', fontsize=18)
-            ax.set_ylabel('Predicted', fontsize=18)
-            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20,
-                         fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            continue
-
-        if dys_ids and id_col is not None:
-            ids_str = pred_df[id_col].astype(str)
-            dys_id_strs = [str(x) for x in dys_ids]
-            dys_mask = ids_str.isin(dys_id_strs)
-            dys_df = pred_df[dys_mask].drop_duplicates(subset=[id_col], keep='first')
-            norm_df = pred_df[~dys_mask].drop_duplicates(subset=[id_col], keep='first')
-        else:
-            if id_col is not None:
-                dys_df = pred_df.drop_duplicates(subset=[id_col], keep='first')
-            else:
-                dys_df = pred_df
-            norm_df = pred_df.iloc[0:0]
-
-        def _extract(d):
-            if d is None or d.empty:
-                return np.array([]), np.array([])
-            o = pd.to_numeric(d[obs_col], errors='coerce').values.astype(float)
-            p = pd.to_numeric(d[pred_col], errors='coerce').values.astype(float)
-            m = ~(np.isnan(o) | np.isnan(p))
-            return o[m], p[m]
-
-        dys_o, dys_p = _extract(dys_df)
-        norm_o, norm_p = _extract(norm_df)
-
-        if len(dys_o) == 0 and len(norm_o) == 0:
-            ax.text(0.5, 0.5, 'No valid samples',
-                    ha='center', va='center', transform=ax.transAxes, fontsize=18)
-            ax.set_xlabel('Observed', fontsize=18)
-            ax.set_ylabel('Predicted', fontsize=18)
-            ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20,
-                         fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            continue
-
-        def _metrics(o, p):
-            if len(o) < 2:
-                return (np.nan, np.nan, len(o))
-            rmse = float(np.sqrt(np.mean((o - p) ** 2)))
-            r2 = float(pearsonr(o, p)[0] ** 2) if len(o) > 2 else np.nan
-            return rmse, r2, len(o)
-
-        dys_rmse_plot, dys_r2_plot, n_dys = _metrics(dys_o, dys_p)
-        norm_rmse_plot, norm_r2_plot, n_norm = _metrics(norm_o, norm_p)
-
-        if n_dys > 0:
-            ax.scatter(dys_o, dys_p, alpha=0.75, s=170, color='#E74C3C',
-                       marker='o', edgecolors='black', linewidths=1.4,
-                       label=f'Dys  (n={n_dys}, RMSE={dys_rmse_plot:.3f}, '
-                             f'R²={dys_r2_plot:.3f})')
-        if n_norm > 0:
-            ax.scatter(norm_o, norm_p, alpha=0.60, s=150, color='#3498DB',
-                       marker='^', edgecolors='black', linewidths=1.2,
-                       label=f'Norm (n={n_norm}, RMSE={norm_rmse_plot:.3f}, '
-                             f'R²={norm_r2_plot:.3f})')
-
-        all_obs = (np.concatenate([dys_o, norm_o])
-                   if (len(dys_o) + len(norm_o)) > 0 else np.array([0.0, 1.0]))
-        all_pred = (np.concatenate([dys_p, norm_p])
-                    if (len(dys_o) + len(norm_o)) > 0 else np.array([0.0, 1.0]))
-
-        dmin = float(np.nanmin([all_obs.min(), all_pred.min()]))
-        dmax = float(np.nanmax([all_obs.max(), all_pred.max()]))
+        # Diagonal y = x
+        dmin = float(np.nanmin([dys_o.min(), dys_p.min()]))
+        dmax = float(np.nanmax([dys_o.max(), dys_p.max()]))
         rng = dmax - dmin if dmax > dmin else 1.0
         pad = 0.05 * rng
         lo, hi = dmin - pad, dmax + pad
+        ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.6, linewidth=3)
 
-        ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.6, linewidth=3,
-                label='y = x (perfect)')
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
         ax.set_aspect('equal', adjustable='box')
         ax.set_xlabel('Observed', fontsize=18)
         ax.set_ylabel('Predicted', fontsize=18)
-        ax.set_title(f'{display_name}\nDys vs Norm', fontsize=20,
+        ax.set_title(f'{display_name}\n(Dys subgroup)', fontsize=20,
                      fontweight='bold')
-        ax.legend(loc='upper left', fontsize=13, framealpha=0.95,
-                  handletextpad=0.5, borderpad=0.6, labelspacing=0.6)
         ax.grid(True, alpha=0.3)
 
-        all_predictions[method_type] = {
-            'model': model, 'method': method,
-            'dys': {'obs': dys_o, 'pred': dys_p, 'rmse': dys_rmse_plot,
-                    'r2': dys_r2_plot, 'n': n_dys},
-            'norm': {'obs': norm_o, 'pred': norm_p, 'rmse': norm_rmse_plot,
-                     'r2': norm_r2_plot, 'n': n_norm},
-        }
+        # ---- Legend box with metrics ----
+        box_text = (
+            f"$R^2$ = {m['r2']:.3f}\n"
+            f"RMSE = {m['rmse']:.3f}\n"
+            f"MAE  = {m['mae']:.3f}\n"
+            f"n    = {m['n']}"
+        )
+        ax.text(
+            0.04, 0.96, box_text,
+            transform=ax.transAxes,
+            ha='left', va='top',
+            fontsize=14,
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.5',
+                      facecolor='white',
+                      edgecolor='black',
+                      alpha=0.9),
+        )
+
+        summary_rows.append({
+            'Panel': display_name,
+            'Subgroup': 'Dys',
+            'Model': get_ultra_short_model_name(model, config),
+            'Model_Full': model,
+            'Method_Used': get_method_display_name(method, config),
+            'Method_Key': method,
+            'Is_Ensemble': is_ensemble_method(method),
+            'R²': m['r2'], 'RMSE': m['rmse'], 'MAE': m['mae'], 'N': m['n'],
+        })
 
     plt.tight_layout()
-    out_png = output_dir / 'dys_scatter_audio_text_fusion_single.png'
+    out_png = output_dir / 'dys_scatter_clinical_vs_voting.png'
     plt.savefig(out_png, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"\n✓ Dys/Norm scatter plot saved to: {out_png}")
+    print(f"\n✓ Dys-only scatter plot saved to: {out_png}")
 
     plt.rcParams.update({
         'font.size': 11, 'axes.titlesize': 12, 'axes.labelsize': 11,
         'xtick.labelsize': 10, 'ytick.labelsize': 10, 'legend.fontsize': 10,
     })
 
-    if all_predictions:
-        rows = []
-        panel_display = {'clinical': 'Clinical-Feature-Only',
-                         'text': 'Text-Embedding-Only',
-                         'fusion': 'Best Fusion'}
-        for method_type, d in all_predictions.items():
-            panel_name = panel_display.get(method_type, method_type)
-            for grp_key, grp_label in [('dys', 'Dys'), ('norm', 'Norm')]:
-                g = d[grp_key]
-                rows.append({
-                    'Panel': panel_name, 'Subgroup': grp_label,
-                    'Model': get_ultra_short_model_name(d['model'], config),
-                    'Model_Full': d['model'],
-                    'Method_Used': get_method_display_name(d['method'], config),
-                    'Method_Key': d['method'],
-                    'Is_Ensemble': is_ensemble_method(d['method']),
-                    'RMSE': g['rmse'], 'R²': g['r2'], 'N': g['n'],
-                })
-        summary_df = pd.DataFrame(rows)
-        summary_df.to_csv(output_dir / 'dys_scatter_summary.csv', index=False)
-        print(f"✓ Dys/Norm scatter summary saved to: "
-              f"{output_dir / 'dys_scatter_summary.csv'}")
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        out_csv = output_dir / 'dys_scatter_clinical_vs_voting_summary.csv'
+        summary_df.to_csv(out_csv, index=False)
+        print(f"✓ Dys-only scatter summary saved to: {out_csv}")
 
-    return all_predictions
+    return summary_rows
 
 
 # =======================================================================
