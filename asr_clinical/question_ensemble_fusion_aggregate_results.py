@@ -3370,4 +3370,33 @@ for t in classification regression;do rm -rf outputs-ensemble-aggregate-$t;mkdir
 
 for t in classification regression;do rm -rf outputs-ensemble-egemaps-aggregate-$t;mkdir outputs-ensemble-egemaps-aggregate-$t;python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble-egemaps --output-dir outputs-ensemble-egemaps-aggregate-$t --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee outputs-ensemble-egemaps-aggregate-$t/log.txt;done
 
+
+
+
+
+
+Fifty-one people with ALS have been recruited to date; *14->15* met ECAS criteria for
+cognitive impairment. Task-completion rates were high across the range of
+dysarthria severity, with iterative refinement guided by patient and caregiver
+feedback. Against the ECAS total (global cognition), the *LLM-based model->Voting ensemble* achieved
+an AUC of *0.934 (95% CI 0.846-0.993)->1.000 (95% CI 1.000-1.000)*, sensitivity of *0.973 (0.914-1.0)->0.933 (0.88-0.987)*, and
+specificity of *0.786 (0.546-1.0)-> *0.856 (0.811-0.894). In the dysarthric subgroup, fusion weighting with the
+acoustic- and temporal-based models improved AUC from *0.905->0.912* to *0.913->*1.000, R² from
+0.55 to 0.62, and reduced root mean square error (RMSE) from 8.78 to 8.03. Task-
+importance analysis indicated complementary contributions from phonemic fluency,
+reading and picture description.
+
+Conclusion:
+CognoMND™ provides early evidence that remote, self-administered, speech-based
+cognitive screening is feasible in ALS. Automated analysis of spoken task responses
+identified ECAS-defined cognitive impairment with high sensitivity, while multimodal
+fusion with acoustic and temporal features modestly improved performance in
+participants with dysarthria. These findings support automated speech analysis as a
+scalable approach to cognitive screening in ALS, while highlighting the need for
+validation in larger, dysarthria-enriched cohorts.
+
+
+
+
+
 '''
