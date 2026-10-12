@@ -66,13 +66,12 @@ def load_tokenizer(model_name):
             tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
             return tokenizer
 
-
 def load_model(model_name: str, task: str, dropout_rate: float, num_labels: int, metadata: dict):
     # Load and modify config
     config = AutoConfig.from_pretrained(model_name)
 
     # Apply dropout from cfg (if available)
-    if hasattr(cfg, 'dropout_rate'):
+    if dropout_rate:
         config.hidden_dropout_prob = dropout_rate
         config.attention_probs_dropout_prob = dropout_rate
         if hasattr(config, 'classifier_dropout'):
