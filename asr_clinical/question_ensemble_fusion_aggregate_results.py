@@ -3371,6 +3371,7 @@ for t in classification regression;do rm -rf outputs-ensemble-aggregate-$t;mkdir
 for t in classification regression;do rm -rf outputs-ensemble-egemaps-aggregate-$t;mkdir outputs-ensemble-egemaps-aggregate-$t;python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble-egemaps --output-dir outputs-ensemble-egemaps-aggregate-$t --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee outputs-ensemble-egemaps-aggregate-$t/log.txt;done
 
 
+n=outputs-ensemble-leslies-automaoes-all-tasks-no-pho-no-ac;for t in classification;do rm -rf ${n}-${t};mkdir ${n}-${t};python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir ${n} --output-dir ${n}-${t} --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee ${n}-${t}/log.txt;done
 
 
 
