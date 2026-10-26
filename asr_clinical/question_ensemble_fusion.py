@@ -1716,21 +1716,21 @@ def apply_fusion_method(
 
     is_classification = (args.task == "classification")
 
-    # ===== 1. TEXT ONLY =====
-    if method == "text_only":
-        pred = pred_text
-        proba = proba_text_val
-        if is_classification and proba is not None and proba.shape[1] == 2:
-            best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
-            pred = (proba[:, 1] >= best_th).astype(int)
-
-    # ===== 2. AUDIO ONLY =====
-    elif method == "audio_only":
+    # ===== 1. AUDIO ONLY  =====
+    if method == "audio_only":
         pred = pred_audio
         proba = proba_audio_val
         if is_classification and proba is not None and proba.shape[1] == 2:
             best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
-            pred = (proba[:, 1] >= best_th).astype(int)
+            pred = (proba[:, 1] >= best_th).astype(int)  
+
+    # ===== 2. TEXT ONLY  =====
+    elif method == "text_only":
+        pred = pred_text
+        proba = proba_text_val
+        if is_classification and proba is not None and proba.shape[1] == 2:
+            best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
+            pred = (proba[:, 1] >= best_th).astype(int) 
 
     # ===== 3. EARLY FUSION =====
     elif method == "early":
