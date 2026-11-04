@@ -1,439 +1,525 @@
-"""Audio-features-only experiment.
+"""Audio-features-only experiment — split generation + CV that matches
+Pasted text.txt's audio-only path when starting from the same labels.
 
-If --splits-dir does NOT exist (or is empty, or --force-regenerate-splits):
-    Generates speaker-level K-Fold stratified splits using --seed and writes:
-        <splits-dir>/fold_{k}_train.csv   (speaker_id, label)
-        <splits-dir>/fold_{k}_val.csv     (speaker_id, label)
-        <splits-dir>/test.csv             (speaker_id, label)   # held-out
-If the splits dir already exists:
-    Loads splits from disk (k-fold files, or the fusion pipeline's
-    final_train/val/test.csv for backward compat) and reuses them.
+Split resolution (returns trainval sorted by speaker_id):
+  A. final_train.csv + final_val.csv exist → load (Script 2 format)
+  B. fold_*_train.csv exist → reconstruct trainval from union
+  C. neither → generate via Script 2's _speaker_split; write fold_k_*.csv + test.csv
+  --force-regenerate-splits forces Case C.
+
+CV (identical regardless of source):
+  * normalize trainval via groupby("speaker_id")["label"].first().reset_index()
+  * StratifiedKFold(n_cv_folds, shuffle=True, random_state=seed)
+  * raw sklearn ensemble members unless --use-smote, then
+    ImbPipeline(to_float → imputer → scaler → SMOTE(k=3) → model)
+  * np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+  * F1-optimal threshold over np.linspace(0, 1, 101) per fold
+  * OOF aggregate; no test evaluation
 """
-import argparse, json, sys, traceback
+import argparse
+import json
+import sys
+import traceback
 from pathlib import Path
-import numpy as np, pandas as pd, joblib
+
+import numpy as np
+import pandas as pd
+
 from sklearn.ensemble import (
     VotingClassifier, VotingRegressor,
     RandomForestClassifier, RandomForestRegressor,
     HistGradientBoostingClassifier, HistGradientBoostingRegressor,
-    GradientBoostingClassifier, GradientBoostingRegressor,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.svm import SVC, SVR
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.model_selection import StratifiedKFold, KFold, train_test_split
-from sklearn.metrics import (
-    accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score,
-    mean_squared_error, mean_absolute_error, r2_score, explained_variance_score,
-    recall_score, precision_score, confusion_matrix, matthews_corrcoef,
+from sklearn.model_selection import (
+    StratifiedKFold, KFold, StratifiedShuffleSplit, ShuffleSplit,
 )
+from sklearn.metrics import (
+    balanced_accuracy_score, f1_score, roc_auc_score,
+    mean_squared_error, mean_absolute_error, r2_score, confusion_matrix,
+)
+
 try:
-    from sklearn.metrics import mean_absolute_percentage_error
-except Exception:
-    mean_absolute_percentage_error = None
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    from imblearn.over_sampling import SMOTE
+    HAS_IMBLEARN = True
+except ImportError:
+    HAS_IMBLEARN = False
 
 
-# ---------------------------------------------------------------------------
-# Model builders
-# ---------------------------------------------------------------------------
-def _base(name, task, seed, n_est, max_depth):
+def to_float(X):
+    return X.astype(float)
+
+
+# =============================================================================
+#  Ensemble factories — must match Pasted text.txt's create_* exactly
+# =============================================================================
+CLF_FACTORIES = {
+    "linear":                 lambda s, a: LogisticRegression(
+        max_iter=5000, class_weight="balanced", random_state=s, C=1.0),
+    "random_forest":          lambda s, a: RandomForestClassifier(
+        n_estimators=a.n_estimators, random_state=s,
+        class_weight="balanced_subsample", min_samples_leaf=2, n_jobs=-1,
+        max_depth=a.max_depth),
+    "hist_gradient_boosting": lambda s, a: HistGradientBoostingClassifier(
+        max_iter=a.n_estimators, learning_rate=0.1, max_depth=a.max_depth,
+        random_state=s, verbose=0, class_weight="balanced"),
+    "svm":                    lambda s, a: SVC(
+        kernel="rbf", C=1.0, gamma="scale", probability=True,
+        class_weight="balanced", random_state=s),
+    "knn":                    lambda s, a: KNeighborsClassifier(
+        n_neighbors=5, weights="distance"),
+}
+REG_FACTORIES = {
+    "linear":                 lambda s, a: Ridge(alpha=1.0),
+    "random_forest":          lambda s, a: RandomForestRegressor(
+        n_estimators=a.n_estimators, min_samples_leaf=2, n_jobs=-1,
+        random_state=s, max_depth=a.max_depth),
+    "hist_gradient_boosting": lambda s, a: HistGradientBoostingRegressor(
+        max_iter=a.n_estimators, learning_rate=0.1, max_depth=a.max_depth,
+        random_state=s, verbose=0),
+    "svm":                    lambda s, a: SVR(kernel="rbf", C=1.0),
+    "knn":                    lambda s, a: KNeighborsRegressor(
+        n_neighbors=5, weights="distance"),
+}
+
+
+def _wrap_clf(model, seed, use_smote):
+    """Mirror create_balanced_pipeline: raw unless use_smote, then wrap."""
+    if not use_smote:
+        return model
+    if not HAS_IMBLEARN:
+        print("⚠️  imblearn not installed; ignoring --use-smote")
+        return model
+    return ImbPipeline([
+        ("to_float",  FunctionTransformer(to_float, validate=False)),
+        ("imputer",   SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler",    StandardScaler()),
+        ("imbalance", SMOTE(random_state=seed, k_neighbors=3)),
+        ("model",     model),
+    ])
+
+
+def make_ensemble(task, names, seed, use_smote, args):
     if task == "classification":
-        return {
-            "linear":                 LogisticRegression(max_iter=5000, class_weight="balanced", random_state=seed),
-            "random_forest":          RandomForestClassifier(n_estimators=n_est, class_weight="balanced_subsample",
-                                                              min_samples_leaf=2, n_jobs=-1, random_state=seed, max_depth=max_depth),
-            "hist_gradient_boosting": HistGradientBoostingClassifier(max_iter=n_est, learning_rate=0.1,
-                                                                     max_depth=max_depth, class_weight="balanced", random_state=seed),
-            "gradient_boosting":      GradientBoostingClassifier(n_estimators=n_est, learning_rate=0.1,
-                                                                 max_depth=3, random_state=seed),
-            "svm":                    SVC(kernel="rbf", C=1.0, gamma="scale", probability=True,
-                                          class_weight="balanced", random_state=seed),
-            "knn":                    KNeighborsClassifier(n_neighbors=5, weights="distance"),
-        }[name]
-    return {
-        "linear":                 Ridge(alpha=1.0),
-        "random_forest":          RandomForestRegressor(n_estimators=n_est, min_samples_leaf=2, n_jobs=-1,
-                                                        random_state=seed, max_depth=max_depth),
-        "hist_gradient_boosting": HistGradientBoostingRegressor(max_iter=n_est, learning_rate=0.1,
-                                                                max_depth=max_depth, random_state=seed),
-        "gradient_boosting":      GradientBoostingRegressor(n_estimators=n_est, learning_rate=0.1,
-                                                            max_depth=3, random_state=seed),
-        "svm":                    SVR(kernel="rbf", C=1.0),
-        "knn":                    KNeighborsRegressor(n_neighbors=5, weights="distance"),
-    }[name]
+        ests = [(n, _wrap_clf(CLF_FACTORIES[n](seed, args), seed, use_smote))
+                for n in names if n in CLF_FACTORIES]
+        if not ests:
+            raise ValueError("No valid ensemble estimators")
+        return VotingClassifier(estimators=ests, voting="soft", n_jobs=-1)
+
+    ests = [(n, Pipeline([
+                ("to_float", FunctionTransformer(to_float, validate=False)),
+                ("imputer",  SimpleImputer(strategy="constant", fill_value=0.0)),
+                ("scaler",   StandardScaler()),
+                ("model",    REG_FACTORIES[n](seed, args)),
+            ]))
+            for n in names if n in REG_FACTORIES]
+    if not ests:
+        raise ValueError("No valid ensemble estimators")
+    return VotingRegressor(estimators=ests, n_jobs=-1)
 
 
-def _pipe(name, task, seed, n_est, max_depth, use_smote):
-    base = _base(name, task, seed, n_est, max_depth)
-    steps = [("imp", SimpleImputer(strategy="constant", fill_value=0.0)),
-             ("sc",  StandardScaler())]
-    if use_smote and task == "classification":
-        from imblearn.pipeline import Pipeline as ImbPipeline
-        from imblearn.over_sampling import SMOTE
-        return ImbPipeline(steps + [("smote", SMOTE(random_state=seed, k_neighbors=3)), ("m", base)])
-    return Pipeline(steps + [("m", base)])
+# =============================================================================
+#  Speaker split — mirror SplitManager._speaker_split
+# =============================================================================
+def _speaker_split(speakers_df, test_size, seed, task):
+    if test_size <= 0:
+        return np.arange(len(speakers_df)), np.array([], dtype=int)
+    if test_size >= 1:
+        return np.array([], dtype=int), np.arange(len(speakers_df))
+    if task == "classification":
+        sp = StratifiedShuffleSplit(n_splits=1, test_size=test_size,
+                                    random_state=seed)
+        return next(sp.split(speakers_df, speakers_df["label"]))
+    sp = ShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    return next(sp.split(speakers_df))
 
 
-def make_ensemble(task, names, seed, n_est, max_depth, use_smote):
-    ests = [(n, _pipe(n, task, seed, n_est, max_depth, use_smote)) for n in names]
-    return (VotingClassifier(estimators=ests, voting="soft", n_jobs=-1)
-            if task == "classification" else
-            VotingRegressor(estimators=ests, n_jobs=-1))
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-def best_threshold(proba, y):
-    best_th, best = 0.5, -1.0
-    for th in np.linspace(0, 1, 101):
-        s = f1_score(y, (proba >= th).astype(int), zero_division=0)
-        if s > best:
-            best, best_th = s, th
-    return best_th
-
-
-def clf_metrics(y, pred, proba=None):
-    y = np.asarray(y).astype(int)
-    pred = np.asarray(pred).astype(int)
-    labels = sorted(np.unique(np.concatenate([y, pred])))
-    binary = (len(labels) == 2)
-
-    m = {
-        "accuracy":          float(accuracy_score(y, pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
-        "f1":                float(f1_score(y, pred, average="binary", zero_division=0)) if binary else float("nan"),
-        "macro_f1":          float(f1_score(y, pred, average="macro",  zero_division=0)),
-        "weighted_f1":       float(f1_score(y, pred, average="weighted", zero_division=0)),
-        "precision":         float(precision_score(y, pred, average="binary", zero_division=0)) if binary else float("nan"),
-        "sensitivity":       float(recall_score(y, pred, average="binary", zero_division=0)) if binary else float("nan"),
-        "mcc":               float(matthews_corrcoef(y, pred)) if len(labels) > 1 else float("nan"),
-    }
-
-    if binary:
-        tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
-        m["specificity"] = float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
-        m["npv"]         = float(tn / (tn + fn)) if (tn + fn) > 0 else float("nan")
-        m.update({"tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn)})
-    else:
-        m["specificity"] = float("nan")
-        m["npv"]         = float("nan")
-
-    if proba is not None:
-        try:
-            m["roc_auc"] = float(roc_auc_score(y, proba))
-        except Exception:
-            pass
-    return m
-
-
-def reg_metrics(y, pred):
-    y = np.asarray(y, dtype=float)
-    pred = np.asarray(pred, dtype=float)
-    m = {
-        "rmse":               float(np.sqrt(mean_squared_error(y, pred))),
-        "mae":                float(mean_absolute_error(y, pred)),
-        "r2":                 float(r2_score(y, pred)),
-        "explained_variance": float(explained_variance_score(y, pred)),
-    }
-    if mean_absolute_percentage_error is not None:
-        try:
-            m["mape"] = float(mean_absolute_percentage_error(y, pred))
-        except Exception:
-            pass
-    try:
-        from scipy.stats import pearsonr, spearmanr
-        if len(y) > 1 and np.std(pred) > 0:
-            m["pearson"]  = float(pearsonr(y, pred)[0])
-            m["spearman"] = float(spearmanr(y, pred)[0])
-    except Exception:
-        pass
-    return m
-
-
-# ---------------------------------------------------------------------------
-# Split resolution / generation
-# ---------------------------------------------------------------------------
-def _write_folds(sd, trainval_df, test_df, n_folds, seed, is_clf):
+# =============================================================================
+#  Split resolution
+# =============================================================================
+def resolve_splits(sd, labels_df, args):
+    """Return (trainval, test_df). trainval is sorted by speaker_id."""
+    sd = Path(sd)
     sd.mkdir(parents=True, exist_ok=True)
-    if is_clf:
-        split_iter = list(StratifiedKFold(n_folds, shuffle=True, random_state=seed)
-                          .split(trainval_df, trainval_df["label"]))
+    test_df = None
+
+    # ---- Case A: final_train / final_val ----
+    if not args.force_regenerate_splits:
+        ft = sd / "final_train.csv"
+        fv = sd / "final_val.csv"
+        if ft.exists() and fv.exists():
+            print(f"[splits] Case A: loading final_train + final_val from {sd}")
+            tv = pd.concat([pd.read_csv(ft), pd.read_csv(fv)], ignore_index=True)
+            ftest = sd / "final_test.csv"
+            if ftest.exists():
+                test_df = pd.read_csv(ftest)
+            tv = (tv[["speaker_id", "label"]]
+                  .groupby("speaker_id")["label"].first()
+                  .reset_index())
+            return tv, test_df
+
+    # ---- Case B: fold_*_train / fold_*_val ----
+    if not args.force_regenerate_splits:
+        fold_trains = sorted(sd.glob("fold_*_train.csv"))
+        if fold_trains:
+            print(f"[splits] Case B: reconstructing from {len(fold_trains)} fold files in {sd}")
+            parts = []
+            for f in fold_trains:
+                k = int(f.stem.split("_")[1])
+                parts.append(pd.read_csv(f))
+                va = sd / f"fold_{k}_val.csv"
+                if va.exists():
+                    parts.append(pd.read_csv(va))
+            tv = pd.concat(parts, ignore_index=True)
+            ttest = sd / "test.csv"
+            if ttest.exists():
+                test_df = pd.read_csv(ttest)
+            tv = (tv[["speaker_id", "label"]]
+                  .groupby("speaker_id")["label"].first()
+                  .reset_index())
+            return tv, test_df
+
+    # ---- Case C: generate ----
+    if labels_df is None:
+        print("❌ splits-dir is empty and no labels source.")
+        print("   Pass --labels-csv, OR ensure the audio CSV has a label column "
+              "via --label-col, OR point --splits-dir at existing split files.")
+        sys.exit(1)
+
+    print(f"[splits] Case C: generating splits at {sd} "
+          f"(seed={args.seed}, k={args.n_cv_folds}, "
+          f"test_fraction={args.test_fraction})")
+
+    # Sort by speaker_id (matches Script 2's groupby order)
+    all_speakers = (labels_df[["speaker_id", "label"]]
+                    .groupby("speaker_id")["label"].first()
+                    .reset_index())
+
+    tv_i, te_i = _speaker_split(all_speakers, args.test_fraction, args.seed, args.task)
+    trainval_sorted = all_speakers.iloc[tv_i].reset_index(drop=True)
+    test_df = all_speakers.iloc[te_i].reset_index(drop=True)
+
+    # Normalize trainval order (sorted by speaker_id) for consistent fold assignment
+    trainval_sorted = (trainval_sorted[["speaker_id", "label"]]
+                       .groupby("speaker_id")["label"].first()
+                       .reset_index())
+
+    # Save fold files (Script 1's original output format)
+    if args.task == "classification":
+        split_iter = StratifiedKFold(args.n_cv_folds, shuffle=True,
+                                     random_state=args.seed).split(
+            trainval_sorted, trainval_sorted["label"])
     else:
-        split_iter = list(KFold(n_folds, shuffle=True, random_state=seed)
-                          .split(trainval_df))
+        split_iter = KFold(args.n_cv_folds, shuffle=True,
+                           random_state=args.seed).split(trainval_sorted)
+
+    for k, (tr_i, va_i) in enumerate(split_iter):
+        trainval_sorted.iloc[tr_i][["speaker_id", "label"]].reset_index(drop=True).to_csv(
+            sd / f"fold_{k}_train.csv", index=False)
+        trainval_sorted.iloc[va_i][["speaker_id", "label"]].reset_index(drop=True).to_csv(
+            sd / f"fold_{k}_val.csv", index=False)
+    test_df[["speaker_id", "label"]].to_csv(sd / "test.csv", index=False)
+    print(f"[splits] wrote {args.n_cv_folds} fold pairs + test "
+          f"({len(test_df)} speakers) to {sd}")
+
+    return trainval_sorted, test_df
+
+
+# =============================================================================
+#  Fold construction — mirror make_outer_folds
+# =============================================================================
+def build_outer_folds(trainval_sorted, args):
+    if args.task == "classification":
+        sp = StratifiedKFold(n_splits=args.n_cv_folds, shuffle=True,
+                             random_state=args.seed)
+        splits = sp.split(trainval_sorted, trainval_sorted["label"])
+    else:
+        sp = KFold(n_splits=args.n_cv_folds, shuffle=True,
+                   random_state=args.seed)
+        splits = sp.split(trainval_sorted)
 
     folds = []
-    for k, (tri, vai) in enumerate(split_iter):
-        tr = trainval_df.iloc[tri][["speaker_id", "label"]].reset_index(drop=True)
-        va = trainval_df.iloc[vai][["speaker_id", "label"]].reset_index(drop=True)
-        tr.to_csv(sd / f"fold_{k}_train.csv", index=False)
-        va.to_csv(sd / f"fold_{k}_val.csv", index=False)
-        folds.append((tr, va))
-
-    if test_df is not None and len(test_df) > 0:
-        test_df[["speaker_id", "label"]].reset_index(drop=True).to_csv(sd / "test.csv", index=False)
+    for k, (tr_i, va_i) in enumerate(splits):
+        tr_sp = set(trainval_sorted.iloc[tr_i]["speaker_id"])
+        va_sp = set(trainval_sorted.iloc[va_i]["speaker_id"])
+        if tr_sp & va_sp:
+            raise RuntimeError(f"Speaker leakage in fold {k}")
+        folds.append((tr_sp, va_sp))
     return folds
 
 
-def resolve_splits(args, labels_df, is_clf):
-    """Return (folds, test_df). folds: list of (train_df, val_df) with speaker_id,label."""
-    sd = Path(args.splits_dir)
+# =============================================================================
+#  Metrics — mirror score_meta_model
+# =============================================================================
+def best_f1_threshold(y_true, y_proba):
+    best_th, best_s = 0.5, -np.inf
+    for th in np.linspace(0.0, 1.0, 101):
+        s = f1_score(y_true, (y_proba >= th).astype(int), zero_division=0)
+        if s > best_s:
+            best_s, best_th = s, th
+    return best_th, best_s
 
-    kfold_files = sorted(sd.glob("fold_*_train.csv")) if sd.exists() else []
-    has_final   = sd.exists() and (sd / "final_train.csv").exists() and (sd / "final_val.csv").exists()
 
-    # ---- Case A: existing k-fold files ----
-    if kfold_files and not args.force_regenerate_splits:
-        print(f"[splits] loading existing k-fold files from {sd}")
-        folds = []
-        for f in kfold_files:
-            k = int(f.stem.split("_")[1])
-            tr = pd.read_csv(f)
-            va = pd.read_csv(sd / f"fold_{k}_val.csv")
-            folds.append((tr, va))
-        test_path = sd / "test.csv"
-        test_df = pd.read_csv(test_path) if test_path.exists() else None
-        return folds, test_df
+def clf_metrics(y_true, y_pred, y_proba=None, threshold_used=None):
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    m = {
+        "macro_f1":          float(f1_score(y_true, y_pred, average="macro",    zero_division=0)),
+        "weighted_f1":       float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "confusion_matrix":  confusion_matrix(y_true, y_pred).tolist(),
+        "threshold_used":    float(threshold_used) if threshold_used is not None else 0.5,
+    }
+    labels = sorted(np.unique(np.concatenate([y_true, y_pred])))
+    if len(labels) == 2:
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        npv  = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+        acc  = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+        f1v  = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        m.update({
+            "sensitivity": float(rec), "specificity": float(spec),
+            "precision":   float(prec), "npv":         float(npv),
+            "accuracy":    float(acc),  "f1":          float(f1v),
+        })
+        if y_proba is not None:
+            try:
+                m["roc_auc"] = float(roc_auc_score(y_true, y_proba))
+            except Exception:
+                pass
+    return m
 
-    # ---- Case B: backward-compat final_train/val/test (fusion pipeline) ----
-    if has_final and not args.force_regenerate_splits:
-        print(f"[splits] loading final_train/val/test from {sd}")
-        tr = pd.read_csv(sd / "final_train.csv")
-        va = pd.read_csv(sd / "final_val.csv")
-        te_path = sd / "final_test.csv"
-        te = pd.read_csv(te_path) if te_path.exists() else None
 
-        trainval = pd.concat([tr, va], ignore_index=True)
-        trainval = trainval[["speaker_id", "label"]].drop_duplicates(subset="speaker_id").reset_index(drop=True)
-        test_df = (te[["speaker_id", "label"]].drop_duplicates(subset="speaker_id").reset_index(drop=True)
-                   if te is not None and not te.empty else None)
+def reg_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "mae":  float(mean_absolute_error(y_true, y_pred)),
+        "r2":   float(r2_score(y_true, y_pred)),
+    }
 
-        # internal k-fold on train+val (identical to original script)
-        if is_clf:
-            split_iter = list(StratifiedKFold(args.n_cv_folds, shuffle=True, random_state=args.seed)
-                              .split(trainval, trainval["label"]))
-        else:
-            split_iter = list(KFold(args.n_cv_folds, shuffle=True, random_state=args.seed)
-                              .split(trainval))
-        folds = []
-        for tri, vai in split_iter:
-            folds.append((trainval.iloc[tri].reset_index(drop=True),
-                          trainval.iloc[vai].reset_index(drop=True)))
-        return folds, test_df
 
-    # ---- Case C: generate new splits ----
-    if labels_df is None or "label" not in labels_df.columns:
-        print("❌ Splits dir is missing and no label source found.")
-        print("   Provide --labels-csv OR a 'label' column in --audio-features-csv.")
+# =============================================================================
+#  Audio loading — mirror load_audio_features
+# =============================================================================
+def load_audio_csv(path):
+    df = pd.read_csv(path)
+    if "speaker_id" not in df.columns:
+        print("❌ audio CSV must contain a 'speaker_id' column")
         sys.exit(1)
-
-    print(f"[splits] generating new splits at {sd}  (seed={args.seed}, k={args.n_cv_folds}, task={args.task})")
-    spk = labels_df.groupby("speaker_id")["label"].first().reset_index()
-
-    if is_clf:
-        trainval_df, test_df = train_test_split(
-            spk, test_size=args.test_fraction, stratify=spk["label"], random_state=args.seed)
-    else:
-        trainval_df, test_df = train_test_split(
-            spk, test_size=args.test_fraction, random_state=args.seed)
-    trainval_df = trainval_df.reset_index(drop=True)
-    test_df     = test_df.reset_index(drop=True)
-
-    folds = _write_folds(sd, trainval_df, test_df, args.n_cv_folds, args.seed, is_clf)
-    print(f"[splits] wrote {len(folds)} fold pairs + test to {sd}")
-    return folds, test_df
+    exclude = {"speaker_id", "session_id", "utterance_id", "question_id",
+               "label", "y_true", "target"}
+    feats = [c for c in df.select_dtypes(include=[np.number]).columns
+             if c not in exclude]
+    if not feats:
+        print("❌ No numeric audio feature columns found")
+        sys.exit(1)
+    audio = df[["speaker_id"] + feats].copy()
+    if audio.duplicated(subset=["speaker_id"]).any():
+        audio = audio.groupby("speaker_id").mean().reset_index()
+    return audio, feats, df
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
+# =============================================================================
+#  CLI
+# =============================================================================
+def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--splits-dir", required=True,
-                   help="dir with split CSVs; created + populated if missing")
+                   help="Contains or will contain split CSVs")
     p.add_argument("--audio-features-csv", required=True)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--task", choices=["classification", "regression"], required=True)
+    p.add_argument("--task", choices=["classification", "regression"],
+                   default="classification")
+
     p.add_argument("--n-cv-folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--n-estimators", type=int, default=500)
     p.add_argument("--max-depth", type=int, default=None)
-    p.add_argument("--use-smote", action="store_true")
-    p.add_argument("--force-recompute", action="store_true")
-    p.add_argument("--force-regenerate-splits", action="store_true",
-                   help="ignore existing split files and regenerate from labels")
-    p.add_argument("--test-fraction", type=float, default=0.15,
-                   help="held-out test fraction when generating splits")
-    p.add_argument("--ensemble-models", nargs="+", default=[
-        "linear", "random_forest", "hist_gradient_boosting", "svm", "knn"])
-    p.add_argument("--labels-csv", default=None,
-               help="optional speaker-level CSV used to generate splits when needed")
-    p.add_argument("--speaker-col", default="speaker_id",
-                   help="column name for speaker id (default: speaker_id)")
-    p.add_argument("--label-col", default="label",
-                   help="column name for the label/target (default: label)")
-    args = p.parse_args()
 
+    p.add_argument("--ensemble-models", nargs="+", default=[
+        "linear", "random_forest", "hist_gradient_boosting", "svm", "knn",
+    ])
+    p.add_argument("--use-smote", action="store_true")
+
+    # Split generation (only used in Case C)
+    p.add_argument("--test-fraction", type=float, default=0.1,
+                   help="Held-out test fraction when generating splits")
+    p.add_argument("--force-regenerate-splits", action="store_true",
+                   help="Ignore existing split files and regenerate")
+    p.add_argument("--labels-csv", default=None,
+                   help="Speaker-level CSV for split generation "
+                        "(needs --speaker-col + --label-col)")
+    p.add_argument("--speaker-col", default="speaker_id")
+    p.add_argument("--label-col",   default="label")
+
+    return p
+
+
+# =============================================================================
+#  Main
+# =============================================================================
+def main():
+    args = build_parser().parse_args()
     np.random.seed(args.seed)
-    is_clf = (args.task == "classification")
-    out = Path(args.output_dir) / "audio_only"
+
+    out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # -- preflight --------------------------------------------------------
-    old = out / "fold_0" / "model.joblib"
-    if old.exists() and not args.force_recompute:
-        try:
-            m_old = joblib.load(old)
-            names = [n for n, _ in m_old.estimators] if hasattr(m_old, "estimators") else None
-            smote = ("imblearn" in type(m_old.estimators[0][1]).__module__) if names else None
-            print(f"[preflight] existing model → {type(m_old).__name__} {names} (smote={smote})")
-        except Exception:
-            pass
+    audio, feats, audio_raw = load_audio_csv(args.audio_features_csv)
+    print(f"Audio features: {len(feats)} columns, {len(audio)} speakers")
 
-    # -- audio features ---------------------------------------------------
-    audio_raw = pd.read_csv(args.audio_features_csv)
-    if "speaker_id" not in audio_raw.columns:
-        print("❌ audio CSV needs a 'speaker_id' column"); sys.exit(1)
-
-    exclude = {"speaker_id", "session_id", "utterance_id", "question_id",
-               "label", "y_true", "target"}
-    feats = [c for c in audio_raw.select_dtypes("number").columns if c not in exclude]
-    if not feats:
-        print("❌ No numeric audio feature columns"); sys.exit(1)
-
-    audio = (audio_raw[["speaker_id"] + feats]
-             .groupby("speaker_id").mean().reset_index())
-
-    exclude = {"speaker_id", "session_id", "utterance_id", "question_id",
-           "label", "y_true", "target", args.speaker_col, args.label_col}
-
-    # -- labels source (only needed when generating splits) ---------------
+    # ---- Labels source (only needed if generating splits) ----
     labels_df = None
     if args.labels_csv:
         ldf = pd.read_csv(args.labels_csv)
-        missing = [c for c in (args.speaker_col, args.label_col) if c not in ldf.columns]
+        missing = [c for c in (args.speaker_col, args.label_col)
+                   if c not in ldf.columns]
         if missing:
-            print(f"❌ --labels-csv missing {missing}; found columns: {list(ldf.columns)}")
+            print(f"❌ --labels-csv missing {missing}; found: {list(ldf.columns)}")
             sys.exit(1)
         labels_df = (ldf.rename(columns={args.speaker_col: "speaker_id",
                                          args.label_col:   "label"})
-                        [["speaker_id", "label"]]
-                        .groupby("speaker_id")["label"].first()
-                        .reset_index())
+                        [["speaker_id", "label"]])
+        print(f"[labels] from {args.labels_csv}: {len(labels_df)} speakers")
     elif args.label_col in audio_raw.columns:
-        if args.speaker_col not in audio_raw.columns:
-            print(f"❌ audio CSV has no '{args.speaker_col}' column"); sys.exit(1)
-        labels_df = (audio_raw.rename(columns={args.speaker_col: "speaker_id",
-                                                args.label_col:   "label"})
-                              [["speaker_id", "label"]]
-                              .groupby("speaker_id")["label"].first()
-                              .reset_index())
+        labels_df = (audio_raw.rename(
+                        columns={args.speaker_col: "speaker_id",
+                                 args.label_col:   "label"})
+                     [["speaker_id", "label"]])
+        print(f"[labels] from audio CSV '{args.label_col}': "
+              f"{len(labels_df)} speakers")
 
-    print(f"Audio features: {len(feats)}   ensemble: {args.ensemble_models}")
+    # ---- Split resolution ----
+    trainval, test_df = resolve_splits(args.splits_dir, labels_df, args)
+    print(f"[splits] trainval: {len(trainval)} speakers, "
+          f"test: {len(test_df) if test_df is not None and len(test_df) > 0 else 0}")
 
-    # -- splits -----------------------------------------------------------
-    folds, test_df = resolve_splits(args, labels_df, is_clf)
-    print(f"Folds: {len(folds)}   test speakers: {len(test_df) if test_df is not None else 0}")
-
-    # -- cross-validation ------------------------------------------------
-    oof_rows, fold_rows = [], []
-    for k, (tr_df, va_df) in enumerate(folds):
-        tr_k = audio.merge(tr_df[["speaker_id", "label"]], on="speaker_id", how="inner").fillna(0.0)
-        va_k = audio.merge(va_df[["speaker_id", "label"]], on="speaker_id", how="inner").fillna(0.0)
-        if len(tr_k) == 0 or len(va_k) == 0:
-            print(f"  fold {k}: skipped (no overlapping speakers with audio features)")
-            continue
-
-        Xtr = tr_k[feats].to_numpy(float); ytr = tr_k["label"].to_numpy()
-        Xva = va_k[feats].to_numpy(float); yva = va_k["label"].to_numpy()
-        if is_clf:
-            ytr, yva = ytr.astype(int), yva.astype(int)
-
-        mdl = make_ensemble(args.task, args.ensemble_models, args.seed,
-                            args.n_estimators, args.max_depth, args.use_smote).fit(Xtr, ytr)
-
-        if is_clf:
-            proba = mdl.predict_proba(Xva)[:, 1] if hasattr(mdl, "predict_proba") else None
-            th    = best_threshold(proba, yva) if proba is not None else 0.5
-            pred  = (proba >= th).astype(int) if proba is not None else mdl.predict(Xva)
-            met   = clf_metrics(yva, pred, proba)
-            row   = pd.DataFrame({"speaker_id": va_k.speaker_id.values,
-                                  "y_true": yva, "y_pred": pred, "fold": k})
-            if proba is not None:
-                row["y_proba"] = proba
-        else:
-            pred = mdl.predict(Xva)
-            met  = reg_metrics(yva, pred)
-            row  = pd.DataFrame({"speaker_id": va_k.speaker_id.values,
-                                 "y_true": yva, "y_pred": pred, "fold": k})
-
-        fold_rows.append({"fold": k, **met})
-        oof_rows.append(row)
-
-        pretty = ", ".join(
-            f"{kk}={vv:.4f}" for kk, vv in met.items()
-            if isinstance(vv, (int, float)) and not (isinstance(vv, float) and np.isnan(vv))
-        )
-        print(f"  fold {k}: {pretty}")
-
-    if not oof_rows:
-        print("❌ No fold produced predictions; check that speaker_ids match audio features.")
+    # ---- Attach labels to audio ----
+    audio_labels = audio.merge(trainval, on="speaker_id", how="inner")
+    if args.task == "classification":
+        audio_labels["label"] = audio_labels["label"].astype(int)
+        cc = audio_labels["label"].value_counts()
+        print(f"Class distribution (audio ∩ trainval): {dict(cc)}")
+        if len(cc) < 2:
+            print("❌ Only one class present in audio data")
+            sys.exit(1)
+    if len(audio_labels) < 10:
+        print(f"❌ Not enough audio speakers with labels ({len(audio_labels)})")
         sys.exit(1)
 
-    # -- aggregate OOF ----------------------------------------------------
-    oof = pd.concat(oof_rows, ignore_index=True)
-    if is_clf:
-        agg = clf_metrics(oof.y_true.astype(int), oof.y_pred.astype(int),
-                          oof["y_proba"].values if "y_proba" in oof else None)
-    else:
-        agg = reg_metrics(oof.y_true.values, oof.y_pred.values)
+    # ---- Build CV folds ----
+    folds = build_outer_folds(trainval, args)
+    print(f"Built {len(folds)} speaker-disjoint folds")
 
+    # ---- CV loop ----
+    oof_rows, fold_rows = [], []
+
+    for fold_idx, (tr_sp, va_sp) in enumerate(folds):
+        print(f"\n--- Fold {fold_idx + 1}/{len(folds)} "
+              f"(train={len(tr_sp)} spk, val={len(va_sp)} spk) ---")
+
+        atr = audio_labels[audio_labels.speaker_id.isin(tr_sp)].copy()
+        ava = audio_labels[audio_labels.speaker_id.isin(va_sp)].copy()
+        if len(atr) < 3 or len(ava) < 2:
+            print(f"  ⚠️ skipped: train={len(atr)}, val={len(ava)}")
+            continue
+
+        Xtr = np.nan_to_num(atr[feats].to_numpy(float),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+        Xva = np.nan_to_num(ava[feats].to_numpy(float),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+        ytr = atr["label"].to_numpy()
+        yva = ava["label"].to_numpy()
+        if args.task == "classification":
+            ytr = ytr.astype(int)
+            yva = yva.astype(int)
+
+        mdl = make_ensemble(args.task, args.ensemble_models,
+                            args.seed, args.use_smote, args)
+        mdl.fit(Xtr, ytr)
+
+        if args.task == "classification":
+            proba = None
+            if hasattr(mdl, "predict_proba"):
+                try:
+                    proba = mdl.predict_proba(Xva)
+                except Exception as e:
+                    print(f"  ⚠️ predict_proba failed: {e}")
+
+            if proba is not None and proba.ndim == 2 and proba.shape[1] == 2:
+                best_th, _ = best_f1_threshold(yva, proba[:, 1])
+                pred = (proba[:, 1] >= best_th).astype(int)
+                y_proba_col = proba[:, 1]
+            elif proba is not None:
+                pred = np.argmax(proba, axis=1)
+                best_th, y_proba_col = 0.5, None
+            else:
+                pred = mdl.predict(Xva)
+                best_th, y_proba_col = 0.5, None
+
+            met = clf_metrics(yva, pred, y_proba_col, threshold_used=best_th)
+            print(f"  F1={met.get('f1', 0):.4f}  "
+                  f"macro_F1={met.get('macro_f1', 0):.4f}  "
+                  f"AUC={met.get('roc_auc', 0):.4f}  th={best_th:.3f}")
+
+            row = pd.DataFrame({
+                "speaker_id": ava.speaker_id.values,
+                "y_true": yva, "y_pred": pred, "fold": fold_idx,
+            })
+            if y_proba_col is not None:
+                row["y_proba"] = y_proba_col
+        else:
+            pred = mdl.predict(Xva)
+            met = reg_metrics(yva, pred)
+            print(f"  RMSE={met['rmse']:.4f}  R²={met['r2']:.4f}")
+            row = pd.DataFrame({
+                "speaker_id": ava.speaker_id.values,
+                "y_true": yva, "y_pred": pred, "fold": fold_idx,
+            })
+
+        oof_rows.append(row)
+        fold_rows.append({"fold": fold_idx, **{
+            k: v for k, v in met.items()
+            if isinstance(v, (int, float, np.integer, np.floating))
+        }})
+
+    if not oof_rows:
+        print("❌ No fold produced predictions")
+        sys.exit(1)
+
+    # ---- Aggregate OOF (mirror compute_subgroup_metrics) ----
+    oof = pd.concat(oof_rows, ignore_index=True)
+    if not (oof.groupby("speaker_id").size() == 1).all():
+        print("⚠️  Deduplicating speakers (keep first)")
+        oof = oof.drop_duplicates(subset=["speaker_id"], keep="first")
+
+    if args.task == "classification":
+        agg = clf_metrics(
+            oof["y_true"].values.astype(int),
+            oof["y_pred"].values.astype(int),
+            oof["y_proba"].values if "y_proba" in oof.columns else None,
+        )
+    else:
+        agg = reg_metrics(oof["y_true"].values, oof["y_pred"].values)
+
+    # ---- Output ----
     oof.to_csv(out / "oof_predictions.csv", index=False)
     pd.DataFrame(fold_rows).to_csv(out / "fold_metrics.csv", index=False)
     (out / "aggregate_metrics.json").write_text(json.dumps(agg, indent=2))
-    print("\nOOF aggregate:", json.dumps(agg, indent=2))
 
-    # -- refit on all train+val, eval on held-out test --------------------
-    if test_df is not None and len(test_df) > 0:
-        # union of fold train/val speakers → training pool
-        all_tv = pd.concat(
-            [tr for tr, _ in folds] + [va for _, va in folds],
-            ignore_index=True,
-        )[["speaker_id", "label"]].drop_duplicates(subset="speaker_id").reset_index(drop=True)
-
-        tv = audio.merge(all_tv, on="speaker_id", how="inner").fillna(0.0)
-        Xtr = tv[feats].to_numpy(float); ytr = tv["label"].to_numpy()
-        if is_clf:
-            ytr = ytr.astype(int)
-
-        mdl = make_ensemble(args.task, args.ensemble_models, args.seed,
-                            args.n_estimators, args.max_depth, args.use_smote).fit(Xtr, ytr)
-        joblib.dump(mdl, out / "model.joblib")
-
-        te = audio.merge(test_df[["speaker_id", "label"]], on="speaker_id", how="inner").fillna(0.0)
-        if len(te) == 0:
-            print("\n⚠ Test split has no speakers overlapping the audio features; skipping test eval.")
-        else:
-            Xte = te[feats].to_numpy(float); yte = te["label"].to_numpy()
-            if is_clf:
-                yte   = yte.astype(int)
-                proba = mdl.predict_proba(Xte)[:, 1] if hasattr(mdl, "predict_proba") else None
-                th    = best_threshold(proba, yte) if proba is not None else 0.5
-                pred  = (proba >= th).astype(int) if proba is not None else mdl.predict(Xte)
-                met   = clf_metrics(yte, pred, proba)
-            else:
-                pred = mdl.predict(Xte); met = reg_metrics(yte, pred)
-
-            pd.DataFrame({"speaker_id": te.speaker_id.values,
-                          "y_true": yte, "y_pred": pred}) \
-              .to_csv(out / "test_predictions.csv", index=False)
-            (out / "test_metrics.json").write_text(json.dumps(met, indent=2))
-            print("\nTEST:", json.dumps(met, indent=2))
-
+    print("\n=== AGGREGATE OOF METRICS ===")
+    print(json.dumps(agg, indent=2))
     print(f"\nDone → {out}")
 
 
