@@ -38,6 +38,8 @@ class TrainConfig:
     label_smoothing: float = 0.0
     gradient_clip_val: float = 1.0
     dropout_rate: float = 0.1
+    y_mean: float = 0.0
+    y_std:  float = 1.0
 
 
 def build_parser() -> argparse.ArgumentParser:
