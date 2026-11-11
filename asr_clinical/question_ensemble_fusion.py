@@ -29,6 +29,12 @@ META-FUSION (5 strategies):
   18. Confidence Selection - Select most confident prediction
   19. Stacked        - Meta-learner on all predictions
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Bounded / Ordinal Regression (regression task only, --regression-mode):
+  - none           : standard regressor (default)
+  - ordinal        : cumulative-logit ordinal regression
+  - bounded_integer: probit-binned Bounded Integer model
+  - qpm            : quantized-prediction model over quantile centres
 """
 
 import os
@@ -81,7 +87,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostin
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import FunctionTransformer
-from sklearn.base import ClassifierMixin, RegressorMixin
+from sklearn.base import ClassifierMixin, RegressorMixin, BaseEstimator
 from sklearn.cluster import KMeans
 from sklearn.cross_decomposition import CCA
 from sklearn.feature_selection import SelectKBest, f_classif, f_regression
@@ -106,6 +112,8 @@ from imblearn.over_sampling import SMOTE, ADASYN
 from imblearn.combine import SMOTETomek
 from imblearn.pipeline import Pipeline as ImbPipeline
 
+from scipy.stats import rankdata, spearmanr, norm
+
 os.environ['HF_HOME'] = '/home/bahman/.cache/huggingface'
 os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers'
 
@@ -119,33 +127,28 @@ os.environ['PYTHONHASHSEED'] = '42'   # will be overridden by set_seed()
 @dataclass
 class FusionConfig:
     """Configuration for fusion methods."""
-    
-    # All available fusion methods
+
     all_methods: List[str] = field(default_factory=lambda: [
         'text_only', 'audio_only', 'early', 'late',
-        'confidence', 'interaction', 'moe', 'mlp', 
+        'confidence', 'interaction', 'moe', 'mlp',
         'stacking', 'cca', 'dynamic', 'cross_attention',
         'adaptive_weighted', 'bilinear'
     ])
-    
-    # Meta-fusion strategies
+
     meta_fusion_methods: List[str] = field(default_factory=lambda: [
         'average', 'weighted', 'voting', 'confidence_selection', 'stacked'
     ])
-    
-    # Base methods (simple)
+
     base_methods: List[str] = field(default_factory=lambda: [
         'text_only', 'audio_only', 'early', 'late'
     ])
-    
-    # Advanced methods (complex)
+
     advanced_methods: List[str] = field(default_factory=lambda: [
-        'confidence', 'interaction', 'moe', 'mlp', 
+        'confidence', 'interaction', 'moe', 'mlp',
         'stacking', 'cca', 'dynamic', 'cross_attention',
         'adaptive_weighted', 'bilinear'
     ])
-    
-    # Method descriptions
+
     method_descriptions: Dict[str, str] = field(default_factory=lambda: {
         'text_only': 'Text-only classification using pre-trained language model',
         'audio_only': 'Audio-only classification using acoustic features',
@@ -167,8 +170,7 @@ class FusionConfig:
         'confidence_selection': 'Meta-fusion: select most confident prediction',
         'stacked': 'Meta-fusion: meta-learner on all predictions'
     })
-    
-    # Default weights for late fusion
+
     default_audio_weight: float = 0.5
     default_text_weight: float = 0.5
 
@@ -178,33 +180,25 @@ class FusionConfig:
 # =======================================================================
 def set_seed(seed: int, deterministic: bool = True):
     """Set all random seeds for full reproducibility."""
-    # 1. Python hash seed (must be set before any dict/set is created,
-    #    so we also set it at the very top of the file – see below)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    # 2. cuBLAS workspace configuration (prevents non‑deterministic kernel selection)
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    
-    # 3. Standard libraries
+
     random.seed(seed)
     np.random.seed(seed)
-    
-    # 4. PyTorch
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
+
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.enabled = False   # disables non‑deterministic cuDNN ops
-        
-        # 5. PyTorch ≥ 1.9 – force deterministic algorithms everywhere
+        torch.backends.cudnn.enabled = False
         try:
             torch.use_deterministic_algorithms(True)
         except AttributeError:
             pass
-    
+
     print(f"✅ All seeds set to: {seed} (deterministic={deterministic})")
 
 
@@ -296,6 +290,266 @@ def load_subgroup_ids(filepath: Path) -> Set[str]:
     with open(filepath, 'r') as f:
         ids = [line.strip() for line in f if line.strip()]
     return set(ids)
+
+
+# =======================================================================
+#  BOUNDED / ORDINAL REGRESSION MODELS (regression task only)
+# =======================================================================
+
+class OrdinalRegressionModel(BaseEstimator, RegressorMixin):
+    """Ordinal regression via cumulative-logit binary classifiers.
+
+    Trains K-1 binary classifiers of the form (Y > k), then combines them
+    into monotone cumulative probabilities using P(Y=k) = P(Y>k-1) - P(Y>k).
+    Predictions are either the mode (most probable class) or the rounded
+    posterior mean E[Y|X], both of which are integers in the observed range.
+    """
+
+    def __init__(self, alpha: float = 1.0, max_iter: int = 2000,
+                 random_state: int = 42, aggregation: str = "expected",
+                 round_output: bool = True):
+        self.alpha = alpha
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.aggregation = aggregation
+        self.round_output = round_output
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y).ravel().astype(float)
+        self.classes_ = np.sort(np.unique(y))
+        K = len(self.classes_)
+        self.K_ = K
+        self.class_to_idx_ = {c: i for i, c in enumerate(self.classes_)}
+
+        if K == 1:
+            self.single_value_ = float(self.classes_[0])
+            self.classifiers_ = []
+            return self
+
+        y_idx = np.array([self.class_to_idx_[v] for v in y])
+        self.classifiers_ = []
+        for k in range(K - 1):
+            y_bin = (y_idx > k).astype(int)
+            if y_bin.sum() == 0:
+                self.classifiers_.append(('const', 0.0))
+            elif y_bin.sum() == len(y_bin):
+                self.classifiers_.append(('const', 1.0))
+            else:
+                clf = LogisticRegression(
+                    C=1.0 / max(float(self.alpha), 1e-9),
+                    max_iter=self.max_iter,
+                    random_state=self.random_state,
+                )
+                clf.fit(X, y_bin)
+                self.classifiers_.append(('clf', clf))
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        n = X.shape[0]
+        K = self.K_
+        if K == 1:
+            return np.ones((n, 1), dtype=float)
+
+        cum = np.zeros((n, K - 1), dtype=float)
+        for k, (kind, obj) in enumerate(self.classifiers_):
+            if kind == 'const':
+                cum[:, k] = float(obj)
+            else:
+                cum[:, k] = obj.predict_proba(X)[:, 1]
+        # Enforce monotonicity P(Y>k) non-increasing in k
+        cum = np.minimum.accumulate(cum, axis=1)
+        cum = np.clip(cum, 0.0, 1.0)
+
+        probs = np.zeros((n, K), dtype=float)
+        probs[:, 0] = 1.0 - cum[:, 0]
+        for k in range(1, K - 1):
+            probs[:, k] = cum[:, k - 1] - cum[:, k]
+        probs[:, K - 1] = cum[:, K - 2]
+        probs = np.clip(probs, 0.0, 1.0)
+        row_sum = probs.sum(axis=1, keepdims=True)
+        row_sum[row_sum == 0] = 1.0
+        probs = probs / row_sum
+        return probs
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        if self.K_ == 1:
+            return np.full(len(X), self.single_value_, dtype=float)
+        probs = self.predict_proba(X)
+        if self.aggregation == "mode":
+            idx = np.argmax(probs, axis=1)
+            return self.classes_[idx].astype(float)
+        expected = probs @ self.classes_.astype(float)
+        if self.round_output:
+            expected = np.round(expected)
+        return expected.astype(float)
+
+
+class BoundedIntegerModel(BaseEstimator, RegressorMixin):
+    """Bounded Integer (BI) model.
+
+    Assumes a latent continuous score mu(X), and a probit likelihood that
+    maps mu(X) to integer bins of unit width via normal CDF differences.
+    Bounds are inferred from training data (or supplied via min/max).
+    """
+
+    def __init__(self, alpha: float = 1.0, min_val: Optional[float] = None,
+                 max_val: Optional[float] = None, random_state: int = 42,
+                 round_output: bool = True):
+        self.alpha = alpha
+        self.min_val = min_val
+        self.max_val = max_val
+        self.random_state = random_state
+        self.round_output = round_output
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y).ravel().astype(float)
+
+        y_lo = int(np.floor(y.min())) if self.min_val is None else int(self.min_val)
+        y_hi = int(np.ceil(y.max())) if self.max_val is None else int(self.max_val)
+        if y_hi <= y_lo:
+            y_hi = y_lo + 1
+        self.min_val_ = y_lo
+        self.max_val_ = y_hi
+
+        self.ridge_ = Ridge(alpha=float(self.alpha), random_state=self.random_state)
+        self.ridge_.fit(X, y)
+
+        resid = y - self.ridge_.predict(X)
+        sigma = float(np.std(resid))
+        self.sigma_ = max(sigma, 1.0)
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        mu = self.ridge_.predict(X)
+        vals = np.arange(self.min_val_, self.max_val_ + 1, dtype=float)
+        upper = norm.cdf((vals[None, :] + 0.5 - mu[:, None]) / self.sigma_)
+        lower = norm.cdf((vals[None, :] - 0.5 - mu[:, None]) / self.sigma_)
+        probs = upper - lower
+        probs = np.clip(probs, 1e-12, 1.0)
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        return probs
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        mu = self.ridge_.predict(X)
+        pred = np.clip(mu, self.min_val_, self.max_val_)
+        if self.round_output:
+            pred = np.round(pred)
+        return pred.astype(float)
+
+
+class QuantizedPredictionModel(BaseEstimator, RegressorMixin):
+    """Quantized Prediction Model (QPM).
+
+    Discretizes the target into quantile centres (in the observed output
+    space), trains a multinomial logistic classifier over those centres,
+    and predicts either the posterior-mean-weighted average of the centres
+    (continuous) or its rounded integer value.
+    """
+
+    def __init__(self, n_quantiles: int = 20, alpha: float = 1.0,
+                 random_state: int = 42, round_output: bool = True):
+        self.n_quantiles = n_quantiles
+        self.alpha = alpha
+        self.random_state = random_state
+        self.round_output = round_output
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y).ravel().astype(float)
+
+        n_q = max(2, int(self.n_quantiles))
+        qs = np.linspace(0.0, 1.0, n_q)
+        centers = np.unique(np.quantile(y, qs))
+        if len(centers) < 2:
+            self.single_value_ = float(centers[0]) if len(centers) else float(y.mean())
+            self.centers_ = centers
+            self.kept_centers_ = centers
+            self.clf_ = None
+            return self
+
+        y_idx = np.argmin(np.abs(y[:, None] - centers[None, :]), axis=1)
+        unique, counts = np.unique(y_idx, return_counts=True)
+        keep = unique[counts >= 2]
+        if len(keep) < 2:
+            self.single_value_ = float(centers[unique[0]])
+            self.centers_ = centers
+            self.kept_centers_ = centers
+            self.clf_ = None
+            return self
+
+        mask = np.isin(y_idx, keep)
+        X_f = X[mask]
+        y_f = y_idx[mask]
+        self.class_map_ = {int(old): int(new) for new, old in enumerate(keep)}
+        y_remapped = np.array([self.class_map_[int(v)] for v in y_f], dtype=int)
+        self.centers_ = centers
+        self.kept_centers_ = centers[keep]
+
+        self.clf_ = LogisticRegression(
+            C=1.0 / max(float(self.alpha), 1e-9),
+            max_iter=2000,
+            random_state=self.random_state,
+            multi_class="multinomial",
+            solver="lbfgs",
+        )
+        self.clf_.fit(X_f, y_remapped)
+        return self
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        if self.clf_ is None:
+            return np.ones((len(X), 1), dtype=float)
+        return self.clf_.predict_proba(X)
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        if self.clf_ is None:
+            return np.full(len(X), self.single_value_, dtype=float)
+        probs = self.predict_proba(X)
+        expected = probs @ self.kept_centers_
+        if self.round_output:
+            expected = np.round(expected)
+        return expected.astype(float)
+
+
+def create_bounded_regression_model(mode: str, args):
+    """Create a bounded/ordinal regression model based on mode."""
+    y_min = getattr(args, 'bounded_min', None)
+    y_max = getattr(args, 'bounded_max', None)
+    round_output = getattr(args, 'round_output', True)
+    alpha = float(getattr(args, 'ordinal_alpha', 1.0))
+    seed = int(getattr(args, 'seed', 42))
+
+    if mode == 'ordinal':
+        return OrdinalRegressionModel(
+            alpha=alpha,
+            random_state=seed,
+            aggregation='expected',
+            round_output=round_output,
+        )
+    elif mode == 'bounded_integer':
+        return BoundedIntegerModel(
+            alpha=alpha,
+            min_val=y_min,
+            max_val=y_max,
+            random_state=seed,
+            round_output=round_output,
+        )
+    elif mode == 'qpm':
+        return QuantizedPredictionModel(
+            n_quantiles=int(getattr(args, 'qpm_n_quantiles', 20)),
+            alpha=alpha,
+            random_state=seed,
+            round_output=round_output,
+        )
+    else:
+        raise ValueError(f"Unknown regression mode: {mode}")
 
 
 # =======================================================================
@@ -590,8 +844,28 @@ def create_ensemble_model(task, args):
 
 
 def make_meta_model(args):
-    """Create the meta-model for fusion."""
+    """Create the meta-model for fusion.
+
+    Bounded/ordinal regression modes (--regression-mode ordinal|bounded_integer|qpm)
+    are ONLY applied for regression tasks and override --use-ensemble when set.
+    """
     use_smote = getattr(args, 'use_smote', False)
+
+    # ---- Bounded/ordinal regression override ----
+    if args.task == "regression":
+        mode = getattr(args, 'regression_mode', 'none')
+        if mode and mode != 'none':
+            if getattr(args, 'use_ensemble', False):
+                print(f"\n⚠️  --use-ensemble ignored because "
+                      f"--regression-mode '{mode}' takes priority")
+            print("\n" + "=" * 50)
+            print(f"BOUNDED REGRESSION MODE: {mode.upper()}")
+            print("=" * 50)
+            model = create_bounded_regression_model(mode, args)
+            print(f"  ✅ Created {model.__class__.__name__}")
+            return model
+
+    # ---- Existing logic ----
     if getattr(args, 'use_ensemble', False):
         print("\n" + "=" * 50)
         print("CREATING ENSEMBLE META-MODEL")
@@ -1005,7 +1279,7 @@ def get_audio_feature_cols(audio_df: pd.DataFrame) -> list:
 
 def hyperparameter_search_optuna_all_questions(
     train_df: pd.DataFrame,
-    fold_splits: List[Tuple[pd.DataFrame, pd.DataFrame]],  # precomputed folds
+    fold_splits: List[Tuple[pd.DataFrame, pd.DataFrame]],
     args,
     metadata: dict,
 ) -> dict:
@@ -1501,7 +1775,7 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
 
 def safe_question_train_and_embed(train_df, val_df, metadata, args,
                                    best_hparams, question, fold_dir,
-                                   include_val=True): 
+                                   include_val=True):
     """Safely train a question model and extract embeddings."""
     set_seed(args.seed, deterministic=True)
     q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
@@ -1692,18 +1966,13 @@ def apply_fusion_method(
     method: str,
     pred_text, pred_audio,
     proba_text_val, proba_audio_val,
-    proba_text_train, proba_audio_train,  # added for stacking
+    proba_text_train, proba_audio_train,
     Xtr_t, Xtr_a, Xva_t, Xva_a,
     ytr, yva, args,
     text_weight=0.5, audio_weight=0.5,
     fold_idx=0
 ):
-    """
-    Apply a specific fusion method.
-    Now receives training probabilities for stacking.
-    Returns:
-        pred, proba, best_threshold
-    """
+    """Apply a specific fusion method."""
     from sklearn.neural_network import MLPClassifier, MLPRegressor
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -1716,23 +1985,20 @@ def apply_fusion_method(
 
     is_classification = (args.task == "classification")
 
-    # ===== 1. AUDIO ONLY  =====
     if method == "audio_only":
         pred = pred_audio
         proba = proba_audio_val
         if is_classification and proba is not None and proba.shape[1] == 2:
             best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
-            pred = (proba[:, 1] >= best_th).astype(int)  
+            pred = (proba[:, 1] >= best_th).astype(int)
 
-    # ===== 2. TEXT ONLY  =====
     elif method == "text_only":
         pred = pred_text
         proba = proba_text_val
         if is_classification and proba is not None and proba.shape[1] == 2:
             best_th, _ = find_threshold_from_proba(proba, yva, metric='f1')
-            pred = (proba[:, 1] >= best_th).astype(int) 
+            pred = (proba[:, 1] >= best_th).astype(int)
 
-    # ===== 3. EARLY FUSION =====
     elif method == "early":
         Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
         Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
@@ -1773,7 +2039,6 @@ def apply_fusion_method(
             pred = mlp.predict(Xva_scaled)
             proba = None
 
-    # ===== 4. LATE FUSION =====
     elif method == "late":
         if is_classification and proba_text_val is not None and proba_audio_val is not None:
             proba = text_weight * proba_text_val + audio_weight * proba_audio_val
@@ -1787,7 +2052,6 @@ def apply_fusion_method(
             if is_classification:
                 pred = np.round(pred).astype(int)
 
-    # ===== 5. CONFIDENCE-BASED FUSION =====
     elif method == "confidence":
         if is_classification and proba_text_val is not None and proba_audio_val is not None:
             if proba_text_val.ndim > 1:
@@ -1828,7 +2092,6 @@ def apply_fusion_method(
             if is_classification:
                 pred = np.round(pred).astype(int)
 
-    # ===== 6. INTERACTION FUSION (Hadamard Product) =====
     elif method == "interaction":
         n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0] - 1)
         if n_comp > 1:
@@ -1885,7 +2148,6 @@ def apply_fusion_method(
             pred = mlp.predict(Xva_scaled)
             proba = None
 
-    # ===== 7. MIXTURE OF EXPERTS (MoE) =====
     elif method == "moe":
         try:
             if is_classification:
@@ -1970,7 +2232,6 @@ def apply_fusion_method(
                 pred = np.round(pred).astype(int)
             return pred, None, None
 
-    # ===== 8. MLP FUSION =====
     elif method == "mlp":
         Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
         Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
@@ -2013,16 +2274,12 @@ def apply_fusion_method(
             pred = mlp.predict(Xva_scaled)
             proba = None
 
-    # ===== 9. STACKING - FIXED =====
     elif method == "stacking":
         try:
-            # Use TRAINING probabilities for meta‑learner training,
-            # and VALIDATION probabilities for evaluation.
             if is_classification and proba_text_train is not None and proba_audio_train is not None:
                 Xtr_stack = np.hstack([text_weight * proba_text_train, audio_weight * proba_audio_train])
                 Xva_stack = np.hstack([text_weight * proba_text_val, audio_weight * proba_audio_val])
             else:
-                # Fallback: use predictions (but we recommend probabilities)
                 pred_text_train = pred_text if pred_text is not None else np.zeros(len(ytr))
                 pred_audio_train = pred_audio if pred_audio is not None else np.zeros(len(ytr))
                 pred_text_reshaped = pred_text_train.reshape(-1, 1)
@@ -2035,7 +2292,6 @@ def apply_fusion_method(
                 pred_audio_val_reshaped = pred_audio_val.reshape(-1, 1)
                 Xva_stack = np.hstack([text_weight * pred_text_val_reshaped, audio_weight * pred_audio_val_reshaped])
 
-            # Ensure lengths match (trim if necessary)
             min_len_tr = min(len(Xtr_stack), len(ytr))
             Xtr_stack = Xtr_stack[:min_len_tr]
             ytr_trim = ytr[:min_len_tr]
@@ -2064,7 +2320,6 @@ def apply_fusion_method(
                 pred = np.round(pred).astype(int)
             return pred, None, None
 
-    # ===== 10. CCA FUSION =====
     elif method == "cca":
         try:
             n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0] - 1)
@@ -2114,7 +2369,6 @@ def apply_fusion_method(
                 pred = np.round(pred).astype(int)
             proba = None
 
-    # ===== 11. DYNAMIC FUSION =====
     elif method == "dynamic":
         if is_classification and proba_text_val is not None and proba_audio_val is not None:
             if proba_text_val.ndim > 1:
@@ -2147,13 +2401,11 @@ def apply_fusion_method(
             if is_classification:
                 pred = np.round(pred).astype(int)
 
-    # ===== 12. CROSS-ATTENTION FUSION =====
     elif method == "cross_attention":
         try:
             import torch
             import torch.nn as nn
 
-            # Reduce dimension to avoid memory blow‑up
             reducer_t = PCA(n_components=min(128, Xtr_t.shape[1]), random_state=args.seed)
             reducer_a = PCA(n_components=min(128, Xtr_a.shape[1]), random_state=args.seed)
             Xtr_t_pca = reducer_t.fit_transform(Xtr_t)
@@ -2226,7 +2478,6 @@ def apply_fusion_method(
                 pred = np.round(pred).astype(int)
             proba = None
 
-    # ===== 13. ADAPTIVE WEIGHTED FUSION =====
     elif method == "adaptive_weighted":
         if is_classification and proba_text_val is not None and proba_audio_val is not None:
             val_proba_t = proba_text_val
@@ -2267,13 +2518,11 @@ def apply_fusion_method(
             if is_classification:
                 pred = np.round(pred).astype(int)
 
-    # ===== 14. BILINEAR FUSION =====
     elif method == "bilinear":
         try:
             import torch
             import torch.nn as nn
 
-            # Reduce dimension to avoid memory blow‑up
             reducer_t = PCA(n_components=min(64, Xtr_t.shape[1]), random_state=args.seed)
             reducer_a = PCA(n_components=min(64, Xtr_a.shape[1]), random_state=args.seed)
             Xtr_t_pca = reducer_t.fit_transform(Xtr_t)
@@ -2355,7 +2604,7 @@ def apply_fusion_method(
 
 
 # =======================================================================
-#  META-FUSION IMPLEMENTATIONS (unchanged, except for removal of duplicate)
+#  META-FUSION IMPLEMENTATIONS
 # =======================================================================
 
 def load_fusion_predictions(fusion_dir: Path, method_names: List[str]) -> Dict:
@@ -2507,7 +2756,6 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict, args, y_true
 
     results = {}
 
-    # ===== 1. AVERAGE FUSION =====
     print("\n  Computing Average Ensemble...")
     try:
         if all_probas and all_probas[0] is not None:
@@ -2546,7 +2794,6 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict, args, y_true
         print(f"    ⚠️ Average ensemble failed: {e}")
         traceback.print_exc()
 
-    # ===== 2. WEIGHTED FUSION =====
     print("\n  Computing Weighted Ensemble...")
     try:
         weights = {}
@@ -2620,7 +2867,6 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict, args, y_true
         print(f"    ⚠️ Weighted ensemble failed: {e}")
         traceback.print_exc()
 
-    # ===== 3. MAJORITY VOTING =====
     print("\n  Computing Majority Voting...")
     try:
         if len(method_names) >= 2:
@@ -2653,7 +2899,6 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict, args, y_true
         print(f"    ⚠️ Voting ensemble failed: {e}")
         traceback.print_exc()
 
-    # ===== 4. CONFIDENCE SELECTION =====
     print("\n  Computing Confidence Selection...")
     try:
         if all_confidences:
@@ -2681,7 +2926,6 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict, args, y_true
         print(f"    ⚠️ Confidence selection failed: {e}")
         traceback.print_exc()
 
-    # ===== 5. STACKED META-LEARNER =====
     print("\n  Computing Stacked Meta-Learner...")
     try:
         X_stack = np.column_stack(all_preds)
@@ -3041,7 +3285,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         speakers_tr = set(tr.speaker_id)
         speakers_va = set(va.speaker_id)
 
-        # ===== Prepare audio data =====
         try:
             atr = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_tr)].copy()
             ava = audio_with_labels[audio_with_labels.speaker_id.isin(speakers_va)].copy()
@@ -3057,9 +3300,7 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             traceback.print_exc()
             continue
 
-        # ===== Prepare text data =====
         try:
-            # Initialize q_scores to avoid NameError later
             q_scores = {}
             if args.task == "regression":
                 if len(tr.speaker_id.unique()) < 6:
@@ -3082,7 +3323,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             traceback.print_exc()
             continue
 
-        # ===== Train text models =====
         tpaths, vpaths = {}, {}
         for q in selected_questions:
             try:
@@ -3098,7 +3338,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             print(f"  ❌ No text embeddings for fold {fold_idx}")
             continue
 
-        # ===== Build feature tables =====
         try:
             tf, tc = build_feature_table(tpaths, list(tpaths))
             vf, _ = build_feature_table(vpaths, list(vpaths))
@@ -3108,7 +3347,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             traceback.print_exc()
             continue
 
-        # ===== Align speakers =====
         common_tr = tf.index.intersection(atr.index)
         common_va = vf.index.intersection(ava.index)
 
@@ -3121,7 +3359,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         vf = vf.loc[common_va]
         ava = ava.loc[common_va]
 
-        # ===== Extract labels =====
         if args.task == "regression":
             ytr = tf["y_true"].to_numpy().astype(float)
             yva = vf["y_true"].to_numpy().astype(float)
@@ -3129,7 +3366,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             ytr = tf["y_true"].to_numpy().astype(int)
             yva = vf["y_true"].to_numpy().astype(int)
 
-        # ===== Prepare features =====
         tx = [c for c in tf.columns if "__" in c]
         ax = [c for c in atr.columns if c not in ("y_true",)]
 
@@ -3138,7 +3374,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         Xtr_a = atr[ax].to_numpy(float)
         Xva_a = ava[ax].to_numpy(float)
 
-        # ===== PCA for text (optional) =====
         n_pca = getattr(args, 'pca_text_components', 0)
         if n_pca > 0 and Xtr_t.shape[1] > n_pca:
             n_comp = min(n_pca, Xtr_t.shape[0] - 1, Xtr_t.shape[1])
@@ -3148,7 +3383,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                 Xva_t = pca.transform(Xva_t)
                 print(f"    PCA reduced text features to {n_comp}")
 
-        # ===== Train base models =====
         def fit_predict_base(X_train, X_val, y_train, y_val):
             try:
                 m = make_meta_model(args)
@@ -3174,7 +3408,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             traceback.print_exc()
             continue
 
-        # Get training probabilities for stacking
         proba_text_train = None
         proba_audio_train = None
         if args.task == "classification":
@@ -3186,7 +3419,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
             except Exception as e:
                 print(f"  ⚠️ Could not get training probabilities: {e}")
 
-        # ===== Apply fusion methods =====
         for method in methods_to_run:
             pred = None
             proba = None
@@ -3242,9 +3474,6 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
                 traceback.print_exc()
                 continue
 
-    # ===================================================================
-    # AGGREGATE RESULTS
-    # ===================================================================
     print("\n" + "=" * 60)
     print("📊 AGGREGATING FUSION RESULTS")
     print("=" * 60)
@@ -3357,7 +3586,7 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
         print("=" * 70)
 
         try:
-            q_scores = {}  # initialize to avoid NameError
+            q_scores = {}
             if args.task == "regression":
                 if len(outer_train.speaker_id.unique()) < 6:
                     print(f"  ⚠️ Not enough speakers for regression question selection")
@@ -3792,7 +4021,6 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
     prod_dir.mkdir(parents=True, exist_ok=True)
     questions = [q.upper() for q in args.questions]
 
-    # Load question selection from CV if available, else use all questions
     qs_path = cv_result["cv_dir"] / "question_selection_all_folds.csv"
     if qs_path.exists():
         qs = pd.read_csv(qs_path)
@@ -3970,6 +4198,31 @@ def build_parser():
                         choices=["linear", "random_forest", "svm", "hist_gradient_boosting",
                                 "gradient_boosting", "knn", "ridge", "lasso", "elasticnet"],
                         default="linear")
+
+    # ---- NEW: bounded/ordinal regression modes ----
+    parser.add_argument(
+        "--regression-mode",
+        choices=["none", "ordinal", "bounded_integer", "qpm"],
+        default="none",
+        help="Bounded/ordinal regression strategy for regression task only. "
+             "'none' (default) = standard regressor. "
+             "'ordinal' = cumulative-logit ordinal regression. "
+             "'bounded_integer' = probit-binned Bounded Integer model. "
+             "'qpm' = quantized-prediction model over quantile centres. "
+             "Overrides --use-ensemble when set.",
+    )
+    parser.add_argument("--ordinal-alpha", type=float, default=1.0,
+                        help="Regularization strength for ordinal/BI/QPM models")
+    parser.add_argument("--qpm-n-quantiles", type=int, default=20,
+                        help="Number of quantile bins for QPM")
+    parser.add_argument("--bounded-min", type=float, default=None,
+                        help="Min target value for BoundedIntegerModel (default: from training)")
+    parser.add_argument("--bounded-max", type=float, default=None,
+                        help="Max target value for BoundedIntegerModel (default: from training)")
+    parser.add_argument("--no-round", action="store_false", dest="round_output",
+                        default=True,
+                        help="Disable rounding of outputs for bounded regression models")
+
     parser.add_argument("--use-ensemble", action="store_true")
     parser.add_argument("--ensemble-models", nargs="+",
                         choices=["linear", "random_forest", "svm", "hist_gradient_boosting",
@@ -4028,8 +4281,14 @@ def main():
         print("=" * 72)
         print(f"Fusion methods: {args.fusion_methods}")
         print(f"Task: {args.task}")
+        print(f"Regression mode: {args.regression_mode}")
         print(f"Force recompute: {args.force_recompute}")
         print("=" * 72)
+
+        if args.task == "classification" and args.regression_mode != "none":
+            print(f"⚠️  --regression-mode '{args.regression_mode}' ignored "
+                  f"because task is classification")
+            args.regression_mode = "none"
 
         from .data import load_examples
         questions = [q.upper() for q in args.questions]
@@ -4040,7 +4299,6 @@ def main():
         )
         (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
 
-        # ========== CREATE TRAIN/VAL/TEST SPLITS ==========
         split_mgr = SplitManager(
             splits_dir, args.task, args.train_frac, args.val_frac, args.test_frac,
             args.seed, args.n_cv_folds
@@ -4051,9 +4309,7 @@ def main():
         print(f"Val speakers:   {final_val.speaker_id.nunique()}")
         print(f"Test speakers:  {final_test.speaker_id.nunique() if not final_test.empty else 0}")
 
-        # ========== PRE‑COMPUTE FOLD SPLITS FOR HPO (reuse split_mgr) ==========
         fold_splits = split_mgr.get_fold_splits(trainval, pd.DataFrame())
-        # ------------------------------------------------------------
 
         audio_df = None
         if args.audio_features_csv:
@@ -4062,7 +4318,6 @@ def main():
             )
             print(f"Loaded {len(get_audio_feature_cols(audio_df))} audio features")
 
-        # ----- HPO -----
         best_hparams_path = out_dir / "best_hyperparams_all_questions.json"
         if best_hparams_path.exists() and not args.force_hpo:
             with open(best_hparams_path, 'r') as f:
@@ -4071,19 +4326,16 @@ def main():
         else:
             if args.force_hpo:
                 print("Forcing HPO recomputation due to --force-hpo")
-            # Use precomputed folds
             best_hparams = hyperparameter_search_optuna_all_questions(
                 trainval, fold_splits, args, metadata
             )
             best_hparams_path.write_text(json.dumps(best_hparams, indent=2))
             cleanup_temp_dirs(out_dir, force=True)
 
-        # Ensure required keys exist
         for key in ['learning_rate', 'batch_size', 'epochs', 'weight_decay', 'warmup_ratio', 'max_length', 'patience']:
             if key not in best_hparams:
                 best_hparams[key] = getattr(args, key, None)
 
-        # ----- AUDIO CV -----
         audio_only_result = None
         if audio_df is not None:
             audio_only_result = train_audio_only_cv(
@@ -4091,7 +4343,6 @@ def main():
                 force_recompute=args.force_recompute
             )
 
-        # ----- TEXT CV -----
         cv_result = leakage_safe_text_cv(
             trainval, metadata, args, best_hparams, out_dir, subgroup_ids,
             force_recompute=args.force_recompute
@@ -4105,7 +4356,6 @@ def main():
         )
         cv_result["oof_predictions"].to_csv(out_dir / "cv_oof_predictions.csv", index=False)
 
-        # ----- PRODUCTION MODEL (if test set exists) -----
         if not final_test.empty:
             print("\nTraining production model on train+validation only...")
             _, train_features, test_features, selected_cols, test_metrics = train_production_text_model(
@@ -4120,7 +4370,6 @@ def main():
                 trainval, pd.DataFrame(), metadata, args, best_hparams, cv_result, out_dir, subgroup_ids
             )
 
-        # ----- FUSION CV -----
         if audio_df is not None:
             fusion_result = run_leakage_safe_fusion_cv(
                 trainval, audio_df, metadata, args, best_hparams, out_dir, subgroup_ids
@@ -4137,11 +4386,9 @@ def main():
                         else:
                             print(f"  {method}: RMSE={all_m.get('rmse', 0):.4f}, R²={all_m.get('r2', 0):.4f}")
 
-                # ----- META-FUSION -----
                 meta_metrics, meta_results = run_meta_fusion(out_dir, args)
                 if meta_metrics:
                     meta_dir = out_dir / 'fusion_results' / 'meta_fusion'
-                    # Visualization is now inside run_meta_fusion
         else:
             print("No audio features supplied; skipping audio fusion.")
 
