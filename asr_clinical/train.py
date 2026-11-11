@@ -116,6 +116,27 @@ def train_one_fold(
     metadata: dict,
     fold_dir: Path,
 ):
+    # ── regression: normalise labels if not already normalised ──────────
+    if cfg.task == "regression":
+        _ymean = float(getattr(cfg, "y_mean", 0.0))
+        _ystd  = float(getattr(cfg, "y_std", 1.0))
+        # Heuristic: raw-scale ECAS has |mean| ≈ 110; normalised has |mean| ≈ 0
+        if _ystd > 0 and abs(float(train_df["label"].mean())) > 5.0:
+            train_df = train_df.copy()
+            val_df = val_df.copy()
+            train_df["label"] = (train_df["label"] - _ymean) / _ystd
+            val_df["label"]   = (val_df["label"]   - _ymean) / _ystd
+            print(f"[train_one_fold] normalised labels: "
+                  f"train mean={train_df['label'].mean():.3f} "
+                  f"std={train_df['label'].std():.3f}, "
+                  f"val mean={val_df['label'].mean():.3f} "
+                  f"std={val_df['label'].std():.3f}")
+        else:
+            print(f"[train_one_fold] labels already normalised "
+                  f"(train mean={train_df['label'].mean():.3f}, "
+                  f"std={train_df['label'].std():.3f})")
+    # ────────────────────────────────────────────────────────────────────
+
     cached = maybe_load_trained_fold(fold_dir, val_df, cfg, metadata)
     if cached is not None:
         return cached
