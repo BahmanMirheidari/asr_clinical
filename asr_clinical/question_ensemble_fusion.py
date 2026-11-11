@@ -240,6 +240,34 @@ def _denorm(arr):
         return np.asarray(arr, dtype=float)
     return np.asarray(arr, dtype=float) * _Y_STATS["std"] + _Y_STATS["mean"]
 
+def _maybe_denorm(arr):
+    """Denormalise only if the values look normalised.
+
+    Robust to being called twice: if the input already has |mean| close to
+    y_mean (i.e. is on the original ECAS scale), it is returned unchanged.
+    """
+    arr = np.asarray(arr, dtype=float)
+    if not _Y_STATS["normalized"] or arr.size == 0:
+        return arr
+    mu = _Y_STATS["mean"]
+    if mu == 0:
+        return _denorm(arr)
+    if abs(float(np.nanmean(arr))) < abs(mu) / 2.0:
+        return _denorm(arr)
+    return arr
+
+
+def _denorm_df(df, cols=("y_true", "y_pred")):
+    """Return a copy of df with y_true/y_pred on the original ECAS scale."""
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = _maybe_denorm(out[c])
+    return out
+
+
 def to_float(X):
     return X.astype(float)
 
@@ -1096,8 +1124,8 @@ def score_meta_model(model, x, y, task, threshold=0.5):
                     metrics["roc_auc"] = 0.0
         return metrics
     else:
-        y_eval = _denorm(np.asarray(y, dtype=float))
-        p_eval = _denorm(np.asarray(pred, dtype=float))
+        y_eval = _maybe_denorm(np.asarray(y, dtype=float))
+        p_eval = _maybe_denorm(np.asarray(pred, dtype=float))
         return {
             "rmse": float(np.sqrt(mean_squared_error(y_eval, p_eval))),
             "mae": float(mean_absolute_error(y_eval, p_eval)),
@@ -1635,8 +1663,8 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
                     "accuracy": accuracy_score(labels, preds),
                 }
             else:
-                labels_d = _denorm(labels)
-                preds_d = _denorm(preds)
+                labels_d = _maybe_denorm(labels)
+                preds_d = _maybe_denorm(preds)
                 result = {
                     "rmse": float(np.sqrt(mean_squared_error(labels_d, preds_d))),
                     "mae": float(mean_absolute_error(labels_d, preds_d)),
@@ -1988,8 +2016,8 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
             y_pred = np.array(preds)
 
             if args.task == "regression":
-                y_true = _denorm(y_true.astype(float))
-                y_pred = _denorm(y_pred.astype(float))
+                y_true = _maybe_denorm(y_true.astype(float))
+                y_pred = _maybe_denorm(y_pred.astype(float))
                 try:
                     score = -float(np.sqrt(mean_squared_error(y_true, y_pred)))
                     scores[q] = score if np.isfinite(score) else -np.inf
@@ -3126,7 +3154,7 @@ def run_meta_fusion(out_dir: Path, args):
             df['selected_method'] = method_data['selected_methods']
         if 'weights' in method_data:
             df['weights'] = str(method_data['weights'])
-        df.to_csv(meta_dir / f'{method_name}_predictions.csv', index=False)
+        _denorm_df(df).to_csv(meta_dir / f'{method_name}_predictions.csv', index=False)
         print(f"  ✓ Saved {method_name} predictions")
 
     meta_metrics = {}
@@ -3154,8 +3182,8 @@ def run_meta_fusion(out_dir: Path, args):
                     pass
         else:
             from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-            yt_d = _denorm(y_true)
-            yp_d = _denorm(y_pred)
+            yt_d = _maybe_denorm(y_true)
+            yp_d = _maybe_denorm(y_pred)
             meta_metrics[method_name] = {
                 'rmse': float(np.sqrt(mean_squared_error(yt_d, yp_d))),
                 'mae': float(mean_absolute_error(yt_d, yp_d)),
@@ -3584,7 +3612,7 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         agg_metrics = compute_subgroup_metrics(pred_df, args, subgroup_ids)
         result[method]["aggregate_metrics"] = agg_metrics
 
-        pred_df.to_csv(fusion_dir / f"{method}_oof_predictions.csv", index=False)
+        _denorm_df(pred_df).to_csv(fusion_dir / f"{method}_oof_predictions.csv", index=False)
         pd.DataFrame(result[method]["fold_metrics"]).to_csv(
             fusion_dir / f"{method}_fold_metrics.csv", index=False
         )
@@ -3781,7 +3809,9 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
         pd.DataFrame({"feature": selected_cols}).to_csv(
             fold_dir / "selected_features.csv", index=False
         )
-        val_out.to_csv(fold_dir / "validation_predictions.csv", index=False)
+
+        _denorm_df(val_out).to_csv(fold_dir / "validation_predictions.csv", index=False)
+        
         (fold_dir / "metrics.json").write_text(
             json.dumps(convert_to_serializable(metrics), indent=2)
         )
@@ -3799,7 +3829,7 @@ def leakage_safe_text_cv(trainval_df, metadata, args, best_hparams, out_dir, sub
     aggregate_metrics = compute_subgroup_metrics(oof, args, subgroup_ids)
     pd.DataFrame(fold_rows).to_csv(cv_dir / "fold_metrics.csv", index=False)
     pd.DataFrame(fold_question_rows).to_csv(cv_dir / "question_selection_all_folds.csv", index=False)
-    oof.to_csv(cv_dir / "oof_predictions.csv", index=False)
+    _denorm_df(oof).to_csv(cv_dir / "oof_predictions.csv", index=False)
     (cv_dir / "aggregate_metrics.json").write_text(
         json.dumps(convert_to_serializable(aggregate_metrics), indent=2)
     )
@@ -4047,7 +4077,7 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None,
         oof_rows.append(out_df)
 
         joblib.dump(model, fold_dir / "model.joblib")
-        out_df.to_csv(fold_dir / "predictions.csv", index=False)
+        _denorm_df(out_df).to_csv(fold_dir / "predictions.csv", index=False)
 
         with open(fold_dir / "metrics.json", "w") as f:
             json.dump(convert_to_serializable(metrics), f, indent=2)
@@ -4076,7 +4106,7 @@ def train_audio_only_cv(audio_df, trainval_df, args, out_dir, subgroup_ids=None,
 
     aggregate_metrics = compute_subgroup_metrics(oof, args, subgroup_ids)
 
-    oof.to_csv(audio_dir / "oof_predictions.csv", index=False)
+    _denorm_df(oof).to_csv(audio_dir / "oof_predictions.csv", index=False)
     pd.DataFrame(fold_metrics).to_csv(audio_dir / "fold_metrics.csv", index=False)
     pd.DataFrame(fold_details).to_csv(audio_dir / "fold_details.csv", index=False)
 
@@ -4248,7 +4278,8 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
                     pred_df["y_proba"] = p[:, 1]
             except Exception:
                 pass
-        pred_df.to_csv(out_dir / "meta_test_predictions.csv", index=False)
+        
+        _denorm_df(pred_df).to_csv(out_dir / "meta_test_predictions.csv", index=False)
 
         if subgroup_ids is not None:
             test_metrics_subgroup = compute_subgroup_metrics(pred_df, args, subgroup_ids)
@@ -4495,7 +4526,8 @@ def main():
         (out_dir / "cv_aggregate_metrics.json").write_text(
             json.dumps(convert_to_serializable(cv_result["aggregate_metrics"]), indent=2)
         )
-        cv_result["oof_predictions"].to_csv(out_dir / "cv_oof_predictions.csv", index=False)
+        
+        _denorm_df(cv_result["oof_predictions"]).to_csv(out_dir / "cv_oof_predictions.csv", index=False)
 
         if not final_test.empty:
             print("\nTraining production model on train+validation only...")
