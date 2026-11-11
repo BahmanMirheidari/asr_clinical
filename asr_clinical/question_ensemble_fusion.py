@@ -219,6 +219,26 @@ def convert_to_serializable(obj):
     else:
         return obj
 
+# ---------------------------------------------------------------------------
+#  Target-scale helpers (regression only)
+# ---------------------------------------------------------------------------
+_Y_STATS: Dict[str, Any] = {"mean": 0.0, "std": 1.0, "normalized": False}
+
+
+def set_y_stats(mean: float, std: float) -> None:
+    global _Y_STATS
+    _Y_STATS = {"mean": float(mean),
+                "std": float(std) if std and std > 1e-9 else 1.0,
+                "normalized": True}
+    print(f"  [y-scale] normalised target: mean={_Y_STATS['mean']:.3f}, "
+          f"std={_Y_STATS['std']:.3f}")
+
+
+def _denorm(arr):
+    """Inverse-transform a normalised prediction back to the original scale."""
+    if not _Y_STATS["normalized"]:
+        return np.asarray(arr, dtype=float)
+    return np.asarray(arr, dtype=float) * _Y_STATS["std"] + _Y_STATS["mean"]
 
 def to_float(X):
     return X.astype(float)
@@ -297,37 +317,70 @@ def load_subgroup_ids(filepath: Path) -> Set[str]:
 # =======================================================================
 
 class OrdinalRegressionModel(BaseEstimator, RegressorMixin):
-    """Ordinal regression via cumulative-logit binary classifiers.
+    """Cumulative-logit ordinal regression with optional target binning.
 
-    Trains K-1 binary classifiers of the form (Y > k), then combines them
-    into monotone cumulative probabilities using P(Y=k) = P(Y>k-1) - P(Y>k).
-    Predictions are either the mode (most probable class) or the rounded
-    posterior mean E[Y|X], both of which are integers in the observed range.
+    - If `max_classes` is set and the raw target has more unique values,
+      the target is binned into `max_classes` ordinal groups (quantile edges).
+    - Internally: `StandardScaler` + K-1 binary logistic regressions on (Y > k).
+    - Predicts either the mode or the posterior mean, mapped back to bin
+      centres (if binning was used) or to the raw integer classes.
     """
 
-    def __init__(self, alpha: float = 1.0, max_iter: int = 2000,
+    def __init__(self, alpha: float = 10.0, max_iter: int = 2000,
                  random_state: int = 42, aggregation: str = "expected",
-                 round_output: bool = True):
+                 round_output: bool = True, max_classes: Optional[int] = None):
         self.alpha = alpha
         self.max_iter = max_iter
         self.random_state = random_state
         self.aggregation = aggregation
         self.round_output = round_output
+        self.max_classes = max_classes
 
     def fit(self, X, y):
+        from sklearn.preprocessing import StandardScaler
         X = np.asarray(X, dtype=float)
         y = np.asarray(y).ravel().astype(float)
-        self.classes_ = np.sort(np.unique(y))
+
+        # ---- 1) optional target binning ----
+        y_uniq = np.unique(y)
+        if self.max_classes is not None and len(y_uniq) > self.max_classes:
+            n_bins = int(self.max_classes)
+            qs = np.linspace(0.0, 1.0, n_bins + 1)[1:-1]
+            edges = np.quantile(y, qs)
+            bin_ids = np.digitize(y, edges, right=False).astype(int)
+            bin_centres = np.zeros(n_bins, dtype=float)
+            for b in range(n_bins):
+                members = y[bin_ids == b]
+                bin_centres[b] = members.mean() if len(members) else np.nan
+            # fill missing centres by interpolation
+            valid = ~np.isnan(bin_centres)
+            if not valid.any():
+                bin_centres = np.linspace(y.min(), y.max(), n_bins)
+            else:
+                idx = np.arange(n_bins)
+                bin_centres = np.interp(idx, idx[valid], bin_centres[valid])
+            self.bin_centres_ = bin_centres
+            self.classes_ = np.arange(n_bins, dtype=float)
+            y_ord = bin_ids.astype(float)
+        else:
+            self.bin_centres_ = None
+            self.classes_ = np.sort(y_uniq)
+            y_ord = y
+
         K = len(self.classes_)
         self.K_ = K
-        self.class_to_idx_ = {c: i for i, c in enumerate(self.classes_)}
+        self.class_to_idx_ = {float(c): i for i, c in enumerate(self.classes_)}
+
+        # ---- 2) scale features once ----
+        self.scaler_ = StandardScaler()
+        Xs = self.scaler_.fit_transform(X)
 
         if K == 1:
-            self.single_value_ = float(self.classes_[0])
+            self.single_value_ = float(y.mean())
             self.classifiers_ = []
             return self
 
-        y_idx = np.array([self.class_to_idx_[v] for v in y])
+        y_idx = np.array([self.class_to_idx_[float(v)] for v in y_ord])
         self.classifiers_ = []
         for k in range(K - 1):
             y_bin = (y_idx > k).astype(int)
@@ -341,13 +394,14 @@ class OrdinalRegressionModel(BaseEstimator, RegressorMixin):
                     max_iter=self.max_iter,
                     random_state=self.random_state,
                 )
-                clf.fit(X, y_bin)
+                clf.fit(Xs, y_bin)
                 self.classifiers_.append(('clf', clf))
         return self
 
     def predict_proba(self, X):
         X = np.asarray(X, dtype=float)
-        n = X.shape[0]
+        Xs = self.scaler_.transform(X)
+        n = Xs.shape[0]
         K = self.K_
         if K == 1:
             return np.ones((n, 1), dtype=float)
@@ -357,8 +411,7 @@ class OrdinalRegressionModel(BaseEstimator, RegressorMixin):
             if kind == 'const':
                 cum[:, k] = float(obj)
             else:
-                cum[:, k] = obj.predict_proba(X)[:, 1]
-        # Enforce monotonicity P(Y>k) non-increasing in k
+                cum[:, k] = obj.predict_proba(Xs)[:, 1]
         cum = np.minimum.accumulate(cum, axis=1)
         cum = np.clip(cum, 0.0, 1.0)
 
@@ -368,34 +421,37 @@ class OrdinalRegressionModel(BaseEstimator, RegressorMixin):
             probs[:, k] = cum[:, k - 1] - cum[:, k]
         probs[:, K - 1] = cum[:, K - 2]
         probs = np.clip(probs, 0.0, 1.0)
-        row_sum = probs.sum(axis=1, keepdims=True)
-        row_sum[row_sum == 0] = 1.0
-        probs = probs / row_sum
+        rs = probs.sum(axis=1, keepdims=True)
+        rs[rs == 0] = 1.0
+        probs = probs / rs
         return probs
 
     def predict(self, X):
         X = np.asarray(X, dtype=float)
         if self.K_ == 1:
             return np.full(len(X), self.single_value_, dtype=float)
+
         probs = self.predict_proba(X)
+        output_values = (self.bin_centres_ if self.bin_centres_ is not None
+                         else self.classes_.astype(float))
         if self.aggregation == "mode":
             idx = np.argmax(probs, axis=1)
-            return self.classes_[idx].astype(float)
-        expected = probs @ self.classes_.astype(float)
-        if self.round_output:
-            expected = np.round(expected)
-        return expected.astype(float)
+            pred = output_values[idx]
+        else:
+            pred = probs @ output_values
+
+        if self.bin_centres_ is None and self.round_output:
+            pred = np.round(pred)
+        return pred.astype(float)
 
 
 class BoundedIntegerModel(BaseEstimator, RegressorMixin):
-    """Bounded Integer (BI) model.
-
-    Assumes a latent continuous score mu(X), and a probit likelihood that
-    maps mu(X) to integer bins of unit width via normal CDF differences.
-    Bounds are inferred from training data (or supplied via min/max).
+    """Bounded Integer model: StandardScaler + Ridge for latent mean mu(X),
+    with probit bin likelihood for predict_proba. Predictions are clipped
+    to [min_val, max_val] and optionally rounded.
     """
 
-    def __init__(self, alpha: float = 1.0, min_val: Optional[float] = None,
+    def __init__(self, alpha: float = 10.0, min_val: Optional[float] = None,
                  max_val: Optional[float] = None, random_state: int = 42,
                  round_output: bool = True):
         self.alpha = alpha
@@ -405,8 +461,15 @@ class BoundedIntegerModel(BaseEstimator, RegressorMixin):
         self.round_output = round_output
 
     def fit(self, X, y):
+        from sklearn.preprocessing import StandardScaler
         X = np.asarray(X, dtype=float)
         y = np.asarray(y).ravel().astype(float)
+
+        self.scaler_ = StandardScaler()
+        Xs = self.scaler_.fit_transform(X)
+
+        self.ridge_ = Ridge(alpha=float(self.alpha), random_state=self.random_state)
+        self.ridge_.fit(Xs, y)
 
         y_lo = int(np.floor(y.min())) if self.min_val is None else int(self.min_val)
         y_hi = int(np.ceil(y.max())) if self.max_val is None else int(self.max_val)
@@ -415,28 +478,25 @@ class BoundedIntegerModel(BaseEstimator, RegressorMixin):
         self.min_val_ = y_lo
         self.max_val_ = y_hi
 
-        self.ridge_ = Ridge(alpha=float(self.alpha), random_state=self.random_state)
-        self.ridge_.fit(X, y)
-
-        resid = y - self.ridge_.predict(X)
-        sigma = float(np.std(resid))
-        self.sigma_ = max(sigma, 1.0)
+        resid = y - self.ridge_.predict(Xs)
+        self.sigma_ = max(float(np.std(resid)), 1.0)
         return self
 
     def predict_proba(self, X):
         X = np.asarray(X, dtype=float)
-        mu = self.ridge_.predict(X)
+        Xs = self.scaler_.transform(X)
+        mu = self.ridge_.predict(Xs)
         vals = np.arange(self.min_val_, self.max_val_ + 1, dtype=float)
         upper = norm.cdf((vals[None, :] + 0.5 - mu[:, None]) / self.sigma_)
         lower = norm.cdf((vals[None, :] - 0.5 - mu[:, None]) / self.sigma_)
-        probs = upper - lower
-        probs = np.clip(probs, 1e-12, 1.0)
+        probs = np.clip(upper - lower, 1e-12, 1.0)
         probs = probs / probs.sum(axis=1, keepdims=True)
         return probs
 
     def predict(self, X):
         X = np.asarray(X, dtype=float)
-        mu = self.ridge_.predict(X)
+        Xs = self.scaler_.transform(X)
+        mu = self.ridge_.predict(Xs)
         pred = np.clip(mu, self.min_val_, self.max_val_)
         if self.round_output:
             pred = np.round(pred)
@@ -444,15 +504,12 @@ class BoundedIntegerModel(BaseEstimator, RegressorMixin):
 
 
 class QuantizedPredictionModel(BaseEstimator, RegressorMixin):
-    """Quantized Prediction Model (QPM).
-
-    Discretizes the target into quantile centres (in the observed output
-    space), trains a multinomial logistic classifier over those centres,
-    and predicts either the posterior-mean-weighted average of the centres
-    (continuous) or its rounded integer value.
+    """Quantized Prediction Model with StandardScaler + multinomial logistic
+    over quantile centres. `n_quantiles` is honoured but capped at
+    `n_train / 2` to prevent classes with <2 samples.
     """
 
-    def __init__(self, n_quantiles: int = 20, alpha: float = 1.0,
+    def __init__(self, n_quantiles: int = 10, alpha: float = 10.0,
                  random_state: int = 42, round_output: bool = True):
         self.n_quantiles = n_quantiles
         self.alpha = alpha
@@ -460,44 +517,54 @@ class QuantizedPredictionModel(BaseEstimator, RegressorMixin):
         self.round_output = round_output
 
     def fit(self, X, y):
+        from sklearn.preprocessing import StandardScaler
         X = np.asarray(X, dtype=float)
         y = np.asarray(y).ravel().astype(float)
 
-        n_q = max(2, int(self.n_quantiles))
+        self.scaler_ = StandardScaler()
+        Xs = self.scaler_.fit_transform(X)
+
+        n_q = max(2, min(int(self.n_quantiles), max(2, len(y) // 2)))
         qs = np.linspace(0.0, 1.0, n_q)
-        centers = np.unique(np.quantile(y, qs))
-        if len(centers) < 2:
-            self.single_value_ = float(centers[0]) if len(centers) else float(y.mean())
-            self.centers_ = centers
-            self.kept_centers_ = centers
+        centres = np.unique(np.quantile(y, qs))
+        if len(centres) < 2:
+            self.single_value_ = float(centres[0]) if len(centres) else float(y.mean())
+            self.centres_ = centres
+            self.kept_centres_ = centres
             self.clf_ = None
             return self
 
-        y_idx = np.argmin(np.abs(y[:, None] - centers[None, :]), axis=1)
+        y_idx = np.argmin(np.abs(y[:, None] - centres[None, :]), axis=1)
         unique, counts = np.unique(y_idx, return_counts=True)
         keep = unique[counts >= 2]
         if len(keep) < 2:
-            self.single_value_ = float(centers[unique[0]])
-            self.centers_ = centers
-            self.kept_centers_ = centers
+            self.single_value_ = float(centres[unique[0]])
+            self.centres_ = centres
+            self.kept_centres_ = centres
             self.clf_ = None
             return self
 
         mask = np.isin(y_idx, keep)
-        X_f = X[mask]
+        X_f = Xs[mask]
         y_f = y_idx[mask]
         self.class_map_ = {int(old): int(new) for new, old in enumerate(keep)}
         y_remapped = np.array([self.class_map_[int(v)] for v in y_f], dtype=int)
-        self.centers_ = centers
-        self.kept_centers_ = centers[keep]
+        self.centres_ = centres
+        self.kept_centres_ = centres[keep]
 
-        self.clf_ = LogisticRegression(
+        import inspect
+        _lr_kwargs = dict(
             C=1.0 / max(float(self.alpha), 1e-9),
             max_iter=2000,
             random_state=self.random_state,
-            multi_class="multinomial",
             solver="lbfgs",
         )
+        # multi_class was deprecated in 1.5 and removed in 1.7;
+        # lbfgs already uses multinomial for >2 classes.
+        if "multi_class" in inspect.signature(LogisticRegression.__init__).parameters:
+            _lr_kwargs["multi_class"] = "multinomial"
+        self.clf_ = LogisticRegression(**_lr_kwargs)
+
         self.clf_.fit(X_f, y_remapped)
         return self
 
@@ -505,48 +572,49 @@ class QuantizedPredictionModel(BaseEstimator, RegressorMixin):
         X = np.asarray(X, dtype=float)
         if self.clf_ is None:
             return np.ones((len(X), 1), dtype=float)
-        return self.clf_.predict_proba(X)
+        Xs = self.scaler_.transform(X)
+        return self.clf_.predict_proba(Xs)
 
     def predict(self, X):
         X = np.asarray(X, dtype=float)
         if self.clf_ is None:
             return np.full(len(X), self.single_value_, dtype=float)
         probs = self.predict_proba(X)
-        expected = probs @ self.kept_centers_
+        pred = probs @ self.kept_centres_
         if self.round_output:
-            expected = np.round(expected)
-        return expected.astype(float)
+            pred = np.round(pred)
+        return pred.astype(float)
 
 
 def create_bounded_regression_model(mode: str, args):
-    """Create a bounded/ordinal regression model based on mode."""
     y_min = getattr(args, 'bounded_min', None)
     y_max = getattr(args, 'bounded_max', None)
     round_output = getattr(args, 'round_output', True)
-    alpha = float(getattr(args, 'ordinal_alpha', 1.0))
     seed = int(getattr(args, 'seed', 42))
 
+    per_mode_alpha = {'ordinal': 1.0, 'bounded_integer': 10.0, 'qpm': 0.1}
+    user_alpha = getattr(args, 'ordinal_alpha', None)
+    alpha = float(user_alpha) if user_alpha is not None else per_mode_alpha.get(mode, 1.0)
+
     if mode == 'ordinal':
+        max_classes = getattr(args, 'ordinal_max_classes', None)
+        if max_classes is None:
+            print("  ⚠️  --regression-mode ordinal without --ordinal-max-classes: "
+                  "will fit K-1 binary classifiers for every unique target value. "
+                  "Recommend --ordinal-max-classes 5 for wide integer scales.")
         return OrdinalRegressionModel(
-            alpha=alpha,
-            random_state=seed,
-            aggregation='expected',
-            round_output=round_output,
+            alpha=alpha, random_state=seed, aggregation='expected',
+            round_output=round_output, max_classes=max_classes,
         )
     elif mode == 'bounded_integer':
         return BoundedIntegerModel(
-            alpha=alpha,
-            min_val=y_min,
-            max_val=y_max,
-            random_state=seed,
-            round_output=round_output,
+            alpha=alpha, min_val=y_min, max_val=y_max,
+            random_state=seed, round_output=round_output,
         )
     elif mode == 'qpm':
         return QuantizedPredictionModel(
-            n_quantiles=int(getattr(args, 'qpm_n_quantiles', 20)),
-            alpha=alpha,
-            random_state=seed,
-            round_output=round_output,
+            n_quantiles=int(getattr(args, 'qpm_n_quantiles', 5)),
+            alpha=alpha, random_state=seed, round_output=round_output,
         )
     else:
         raise ValueError(f"Unknown regression mode: {mode}")
@@ -1028,11 +1096,12 @@ def score_meta_model(model, x, y, task, threshold=0.5):
                     metrics["roc_auc"] = 0.0
         return metrics
     else:
-        rmse = np.sqrt(mean_squared_error(y, pred))
+        y_eval = _denorm(np.asarray(y, dtype=float))
+        p_eval = _denorm(np.asarray(pred, dtype=float))
         return {
-            "rmse": rmse,
-            "mae": mean_absolute_error(y, pred),
-            "r2": r2_score(y, pred),
+            "rmse": float(np.sqrt(mean_squared_error(y_eval, p_eval))),
+            "mae": float(mean_absolute_error(y_eval, p_eval)),
+            "r2": float(r2_score(y_eval, p_eval)),
         }
 
 
@@ -1370,42 +1439,52 @@ def objective_function_all_questions(
         gradient_accumulation_steps = max(1, min(gradient_accumulation_steps, 8))
         effective_batch_size = batch_size * gradient_accumulation_steps
 
+        is_regression = (args.task == "regression")
+
         params = {
             "learning_rate": trial.suggest_float(
                 "learning_rate",
                 1e-6 if is_large_model else 5e-6,
-                5e-4 if not is_large_model else 2e-4,
-                log=True
+                # Regression needs a much narrower ceiling than classification
+                (3e-5 if is_regression else (2e-4 if is_large_model else 5e-4)),
+                log=True,
             ),
             "batch_size": batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
-            "epochs": trial.suggest_int("epochs", 3, 10),
+            "epochs": trial.suggest_int("epochs", 5 if is_regression else 3,
+                                        15 if is_regression else 10),
             "patience": args.patience,
             "weight_decay": trial.suggest_float(
                 "weight_decay",
                 0.001 if is_large_model else 0.005,
                 0.03 if is_large_model else 0.05,
-                log=True
+                log=True,
             ),
             "dropout_rate": trial.suggest_float(
                 "dropout_rate",
                 0.0 if is_large_model else 0.05,
-                0.15 if is_large_model else 0.25
+                0.15 if is_large_model else 0.25,
             ),
-            "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
+            "warmup_ratio": trial.suggest_float(
+                "warmup_ratio",
+                0.05 if is_regression else 0.0,
+                0.2 if is_regression else 0.1,
+            ),
             "max_length": trial.suggest_categorical(
-                "max_length",
-                [128, 256] if is_large_model else [128, 256, 512]
+                "max_length", [128, 256] if is_large_model else [128, 256, 512]
             ),
-            "focal_gamma": trial.suggest_float("focal_gamma", 0.0, 2.5),
-            "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.15),
             "gradient_clip_val": trial.suggest_float(
-                "gradient_clip_val",
-                0.5,
-                5.0,
-                log=True
+                "gradient_clip_val", 0.5, 5.0, log=True
             ),
         }
+
+        # Classification-only regularizers
+        if is_regression:
+            params["focal_gamma"] = 0.0
+            params["label_smoothing"] = 0.0
+        else:
+            params["focal_gamma"] = trial.suggest_float("focal_gamma", 0.0, 2.5)
+            params["label_smoothing"] = trial.suggest_float("label_smoothing", 0.0, 0.15)
 
         print(f"  Effective batch size: {effective_batch_size} "
               f"(batch_size={batch_size}, grad_accum={gradient_accumulation_steps})")
@@ -1451,9 +1530,9 @@ def objective_function_all_questions(
                         weight_decay=params["weight_decay"],
                         warmup_ratio=params["warmup_ratio"],
                         patience=params["patience"],
-                        class_weights=args.class_weights,
-                        loss=args.loss,
-                        focal_gamma=args.focal_gamma,
+                        class_weights=("none" if args.task == "regression" else args.class_weights),
+                        loss=("mse" if args.task == "regression" else args.loss),
+                        focal_gamma=(0.0 if args.task == "regression" else params["focal_gamma"]),
                         filter_questions=[question],
                         min_text_chars=args.min_text_chars,
                     )
@@ -1554,11 +1633,12 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig, metadata: dict)
                     "accuracy": accuracy_score(labels, preds),
                 }
             else:
-                rmse = np.sqrt(mean_squared_error(labels, preds))
+                labels_d = _denorm(labels)
+                preds_d = _denorm(preds)
                 result = {
-                    "rmse": rmse,
-                    "mae": mean_absolute_error(labels, preds),
-                    "r2": r2_score(labels, preds),
+                    "rmse": float(np.sqrt(mean_squared_error(labels_d, preds_d))),
+                    "mae": float(mean_absolute_error(labels_d, preds_d)),
+                    "r2": float(r2_score(labels_d, preds_d)),
                 }
             return result
         except Exception as e:
@@ -1765,9 +1845,9 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
         weight_decay=best_hparams["weight_decay"],
         warmup_ratio=best_hparams["warmup_ratio"],
         patience=best_hparams["patience"],
-        class_weights=args.class_weights,
-        loss=args.loss,
-        focal_gamma=args.focal_gamma,
+        class_weights=("none" if args.task == "regression" else args.class_weights),
+        loss=("mse" if args.task == "regression" else args.loss),
+        focal_gamma=(0.0 if args.task == "regression" else args.focal_gamma),
         filter_questions=[question],
         min_text_chars=args.min_text_chars,
     )
@@ -1904,8 +1984,8 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
             y_pred = np.array(preds)
 
             if args.task == "regression":
-                y_true = y_true.astype(float)
-                y_pred = y_pred.astype(float)
+                y_true = _denorm(y_true.astype(float))
+                y_pred = _denorm(y_pred.astype(float))
                 try:
                     score = -float(np.sqrt(mean_squared_error(y_true, y_pred)))
                     scores[q] = score if np.isfinite(score) else -np.inf
@@ -3070,10 +3150,12 @@ def run_meta_fusion(out_dir: Path, args):
                     pass
         else:
             from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+            yt_d = _denorm(y_true)
+            yp_d = _denorm(y_pred)
             meta_metrics[method_name] = {
-                'rmse': float(np.sqrt(mean_squared_error(y_true, y_pred))),
-                'mae': float(mean_absolute_error(y_true, y_pred)),
-                'r2': float(r2_score(y_true, y_pred))
+                'rmse': float(np.sqrt(mean_squared_error(yt_d, yp_d))),
+                'mae': float(mean_absolute_error(yt_d, yp_d)),
+                'r2': float(r2_score(yt_d, yp_d))
             }
 
     with open(meta_dir / 'meta_fusion_metrics.json', 'w') as f:
@@ -3375,6 +3457,12 @@ def run_leakage_safe_fusion_cv(trainval_df, audio_df, metadata, args, best_hpara
         Xva_a = ava[ax].to_numpy(float)
 
         n_pca = getattr(args, 'pca_text_components', 0)
+        if (args.task == "regression"
+                and getattr(args, 'regression_mode', 'none') in ('qpm', 'ordinal')
+                and n_pca == 0 and Xtr_t.shape[1] > 20):
+            n_pca = 20
+            print(f"    ℹ️  Auto-PCA: reducing text features to {n_pca} "
+                  f"for --regression-mode {args.regression_mode}")
         if n_pca > 0 and Xtr_t.shape[1] > n_pca:
             n_comp = min(n_pca, Xtr_t.shape[0] - 1, Xtr_t.shape[1])
             if n_comp > 1:
@@ -3751,6 +3839,10 @@ def fit_meta_model_for_fold(train_features, val_features, feature_cols, args,
         ytr = ytr.astype(int)
         yva = yva.astype(int)
     n_pca = getattr(args, 'pca_text_components', 0)
+    if args.task == "regression" and getattr(args, 'regression_mode', 'none') in ('qpm', 'ordinal') and n_pca == 0:
+        n_pca = 20
+        print(f"  ℹ️  Auto-PCA: reducing text features to {n_pca} "
+              f"for --regression-mode {args.regression_mode}")
     if n_pca > 0:
         n_components = min(n_pca, Xtr.shape[0] - 1, Xtr.shape[1])
         if n_components > 1:
@@ -4087,6 +4179,12 @@ def train_production_text_model(trainval_df, test_df, metadata, args,
         y_train = y_train.astype(int)
     pca = None
     n_pca = getattr(args, 'pca_text_components', 0)
+    if (args.task == "regression"
+            and getattr(args, 'regression_mode', 'none') in ('qpm', 'ordinal')
+            and n_pca == 0 and X_train.shape[1] > 20):
+        n_pca = 20
+        print(f"  ℹ️  Auto-PCA: reducing text features to {n_pca} "
+              f"for --regression-mode {args.regression_mode}")
     if n_pca > 0 and X_train.shape[1] > n_pca:
         n_components = min(n_pca, X_train.shape[0] - 1, X_train.shape[1])
         if n_components > 1:
@@ -4199,29 +4297,54 @@ def build_parser():
                                 "gradient_boosting", "knn", "ridge", "lasso", "elasticnet"],
                         default="linear")
 
-    # ---- NEW: bounded/ordinal regression modes ----
+    # ---- Bounded/ordinal regression modes (regression only) ----
     parser.add_argument(
         "--regression-mode",
         choices=["none", "ordinal", "bounded_integer", "qpm"],
         default="none",
-        help="Bounded/ordinal regression strategy for regression task only. "
+        help="Bounded/ordinal regression for --task regression only. "
              "'none' (default) = standard regressor. "
              "'ordinal' = cumulative-logit ordinal regression. "
-             "'bounded_integer' = probit-binned Bounded Integer model. "
-             "'qpm' = quantized-prediction model over quantile centres. "
+             "    -> requires --ordinal-max-classes for wide integer targets. "
+             "'bounded_integer' = probit-binned BI model (default alpha=10.0). "
+             "'qpm' = quantized-prediction model (default alpha=0.1, 5 quantiles). "
              "Overrides --use-ensemble when set.",
     )
-    parser.add_argument("--ordinal-alpha", type=float, default=1.0,
-                        help="Regularization strength for ordinal/BI/QPM models")
-    parser.add_argument("--qpm-n-quantiles", type=int, default=20,
-                        help="Number of quantile bins for QPM")
-    parser.add_argument("--bounded-min", type=float, default=None,
-                        help="Min target value for BoundedIntegerModel (default: from training)")
-    parser.add_argument("--bounded-max", type=float, default=None,
-                        help="Max target value for BoundedIntegerModel (default: from training)")
-    parser.add_argument("--no-round", action="store_false", dest="round_output",
-                        default=True,
-                        help="Disable rounding of outputs for bounded regression models")
+    parser.add_argument(
+        "--ordinal-alpha", type=float, default=None,
+        help="Regularization alpha for ordinal/BI/QPM. "
+             "If unset, per-mode defaults are used: "
+             "ordinal=1.0, bounded_integer=10.0, qpm=0.1. "
+             "QPM's intra-class logistic regression is very sensitive "
+             "to this: alpha=10 (C=0.1) collapses to mean(y) on n~50.",
+    )
+    parser.add_argument(
+        "--ordinal-max-classes", type=int, default=None,
+        help="Bin the ordinal target into at most K coarse classes. "
+             "STRONGLY RECOMMENDED for --regression-mode ordinal on wide "
+             "integer scales (e.g. ECAS 0-136): use 5. "
+             "Without this, ordinal with >100 classes is unusable at n~50. "
+             "Ignored by other modes.",
+    )
+    parser.add_argument(
+        "--qpm-n-quantiles", type=int, default=5,
+        help="Quantile bins for QPM (capped internally at n/2). "
+             "Default 5 is appropriate for n~50; 10-20 collapses to "
+             "a constant predictor on small samples.",
+    )
+    parser.add_argument(
+        "--bounded-min", type=float, default=None,
+        help="Min target value for BoundedIntegerModel (default: inferred from data).",
+    )
+    parser.add_argument(
+        "--bounded-max", type=float, default=None,
+        help="Max target value for BoundedIntegerModel (default: inferred from data).",
+    )
+    parser.add_argument(
+        "--no-round", action="store_false", dest="round_output", default=True,
+        help="Disable rounding for BI/QPM/ordinal. Use for fair RMSE "
+             "comparison against Ridge (rounding costs ~0.3-0.5 RMSE).",
+    )
 
     parser.add_argument("--use-ensemble", action="store_true")
     parser.add_argument("--ensemble-models", nargs="+",
@@ -4297,6 +4420,20 @@ def main():
             text_mode="question", min_text_chars=args.min_text_chars,
             filter_questions=questions, delimiter=args.delimiter
         )
+
+        # ---- regression: normalise target so the LM head can learn ----
+        if args.task == "regression":
+            y_raw = df["label"].to_numpy(dtype=float)
+            y_mean = float(np.nanmean(y_raw))
+            y_std = float(np.nanstd(y_raw))
+            if y_std < 1e-9:
+                y_std = 1.0
+            set_y_stats(y_mean, y_std)
+            df["label"] = (y_raw - y_mean) / y_std
+            if isinstance(metadata, dict):
+                metadata["y_mean"] = y_mean
+                metadata["y_std"] = y_std
+
         (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
 
         split_mgr = SplitManager(
