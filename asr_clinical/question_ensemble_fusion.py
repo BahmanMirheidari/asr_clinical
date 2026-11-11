@@ -1535,6 +1535,8 @@ def objective_function_all_questions(
                         focal_gamma=(0.0 if args.task == "regression" else params["focal_gamma"]),
                         filter_questions=[question],
                         min_text_chars=args.min_text_chars,
+                        y_mean=float(_Y_STATS["mean"]),
+                        y_std=float(_Y_STATS["std"]),
                     )
                     metrics = _train_and_evaluate_fast(q_fold_train, q_fold_val, temp_cfg, metadata)
 
@@ -1850,6 +1852,8 @@ def make_question_cfg(args, question: str, question_dir: Path, best_hparams: dic
         focal_gamma=(0.0 if args.task == "regression" else args.focal_gamma),
         filter_questions=[question],
         min_text_chars=args.min_text_chars,
+        y_mean=float(_Y_STATS["mean"]),
+        y_std=float(_Y_STATS["std"]),
     )
 
 
