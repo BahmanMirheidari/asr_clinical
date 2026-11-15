@@ -162,7 +162,6 @@ def strip_predictions_suffix(stem: str) -> str:
 
 
 def canonical_ensemble_key(method_part: str) -> Optional[str]:
-    """Map a meta_fusion prediction stem to the canonical ensemble_* key."""
     if not isinstance(method_part, str):
         return None
     mp = method_part.strip()
@@ -170,10 +169,19 @@ def canonical_ensemble_key(method_part: str) -> Optional[str]:
         return 'meta_fusion'
     if mp.startswith('ensemble_'):
         return mp
-    known_strategies = {'average', 'voting', 'stacking', 'weighted',
-                        'confidence_selection', 'best'}
+    known_strategies = {
+        'average':              'average',
+        'voting':               'voting',
+        'stacking':             'stacking',
+        'stacked':              'stacking',          # ← NEW
+        'weighted':             'weighted',
+        'confidence_selection': 'confidence_selection',
+        'best':                 'best',
+        'stacking_ensemble':    'stacking',          # optional
+        'meta_stacking':        'stacking',          # optional
+    }
     if mp in known_strategies:
-        return f'ensemble_{mp}'
+        return f'ensemble_{known_strategies[mp]}'
     return None
 
 
@@ -1075,19 +1083,31 @@ def discover_experiments(base_dir: Path, task_type: str = 'all',
                     print(f"  [meta_fusion] reading {meta_fusion_file.name}")
                     print(f"    top-level keys: {list(meta_metrics.keys())}")
 
-                    for strategy in ['average', 'voting', 'stacking',
-                                     'weighted', 'confidence_selection', 'best']:
-                        if strategy in meta_metrics and \
-                                isinstance(meta_metrics[strategy], dict):
-                            exp_key = f'ensemble_{strategy}'
+                    # JSON key  →  canonical strategy name
+                    STRATEGY_ALIASES = {
+                        'average':              'average',
+                        'voting':               'voting',
+                        'stacking':             'stacking',
+                        'stacked':              'stacking',           # ← NEW
+                        'weighted':             'weighted',
+                        'confidence_selection': 'confidence_selection',
+                        'best':                 'best',
+                        'stacking_ensemble':    'stacking',           # optional
+                        'meta_stacking':        'stacking',           # optional
+                    }
+
+                    for raw_key, canonical in STRATEGY_ALIASES.items():
+                        if raw_key in meta_metrics and \
+                                isinstance(meta_metrics[raw_key], dict):
+                            exp_key = f'ensemble_{canonical}'
                             experiments[model_name][exp_key] = {
                                 'task': task, 'model': model_name, 'size': size,
                                 'family': family,
                                 'metrics_file': meta_fusion_file,
                                 'dir': folder_path, 'source': 'meta_fusion',
-                                'ensemble_method': strategy
+                                'ensemble_method': raw_key,           # ← MUST be raw_key
                             }
-                            print(f"    ✓ ensemble metric: {strategy}  "
+                            print(f"    ✓ ensemble metric: {raw_key}  "
                                   f"(key='{exp_key}')")
 
                     experiments[model_name]['meta_fusion'] = {
@@ -2422,15 +2442,15 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path,
     ax1.set_yticks([])
 
     from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     legend1 = [
         Patch(facecolor='#2ECC71', alpha=0.88, edgecolor='black',
               linewidth=0.4, label='Significant (p < 0.05)'),
         Patch(facecolor='#E74C3C', alpha=0.88, edgecolor='black',
-              linewidth=0.4, label='Not Significant'),
+              linewidth=0.4, label='Not significant'),
+        Line2D([0], [0], color='red', linestyle='--', linewidth=1.0,
+               alpha=0.8, label='p = 0.05'),
     ]
-    ax1.legend(handles=legend1, loc='lower right', fontsize=5.6,
-               framealpha=0.95, handletextpad=0.35, borderpad=0.30,
-               labelspacing=0.20, handlelength=1.2)
 
     # =========================================================
     #  Panel (b) — Statistical significance
@@ -2460,9 +2480,7 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path,
                   fontsize=7.2, fontweight='bold', pad=3)
     ax2.grid(True, alpha=0.30, axis='x', linewidth=0.4)
     ax2.tick_params(axis='x', labelsize=6.0, pad=2, length=2.0)
-    ax2.legend(loc='lower right', fontsize=5.6, framealpha=0.95,
-               handletextpad=0.35, borderpad=0.30, labelspacing=0.20,
-               handlelength=1.2)
+    
     ax2.set_ylim(n_bars - 0.5, -0.5)   # same inversion, panel-local
     ax2.set_yticks([])
     ax2.set_ylabel('')
@@ -2470,6 +2488,16 @@ def plot_ablation_results_all_patients(ablation_data: Dict, output_dir: Path,
     # ---- Save ----
     out_png = output_dir / f'ablation_analysis_all_patients_{task_type}.png'
     out_pdf = output_dir / f'ablation_analysis_all_patients_{task_type}.pdf'
+    fig.legend(handles=legend1,
+           loc='lower center',
+           bbox_to_anchor=(0.5, -0.02),
+           ncol=3, frameon=True, fontsize=5.8,
+           handletextpad=0.4, columnspacing=1.1,
+           borderpad=0.35, labelspacing=0.25)
+    fig.subplots_adjust(
+        left=0.52, right=0.96, top=0.93, bottom=0.16,   # ← was 0.10
+    )
+
     plt.savefig(out_png, dpi=300, bbox_inches='tight')
     plt.savefig(out_pdf, bbox_inches='tight')
     plt.close()
@@ -3371,7 +3399,7 @@ for t in classification regression;do rm -rf outputs-ensemble-aggregate-$t;mkdir
 for t in classification regression;do rm -rf outputs-ensemble-egemaps-aggregate-$t;mkdir outputs-ensemble-egemaps-aggregate-$t;python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir outputs-ensemble-egemaps --output-dir outputs-ensemble-egemaps-aggregate-$t --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee outputs-ensemble-egemaps-aggregate-$t/log.txt;done
 
 
-n=outputs-ensemble-leslies-automaoes-all-tasks-no-pho-no-ac;for t in classification;do rm -rf ${n}-${t};mkdir ${n}-${t};python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir ${n} --output-dir ${n}-${t} --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee ${n}-${t}/log.txt;done
+n=outputs-ens-classification-top40-top3;for t in classification;do rm -rf ${n}-${t};mkdir ${n}-${t};python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir ${n} --output-dir ${n}-${t} --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee ${n}-${t}/log.txt;done
 
 
 
