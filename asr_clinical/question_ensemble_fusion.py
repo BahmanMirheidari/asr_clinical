@@ -120,6 +120,49 @@ os.environ['TRANSFORMERS_CACHE'] = '/home/bahman/.cache/huggingface/transformers
 # Force Python hash randomization to a fixed value for reproducibility
 os.environ['PYTHONHASHSEED'] = '42'   # will be overridden by set_seed()
 
+# ---------------------------------------------------------------------------
+#  Regression output clipping (applies to fusion and meta-fusion)
+# ---------------------------------------------------------------------------
+_CLIP_BOUNDS: Dict[str, Optional[float]] = {"min": None, "max": None}
+
+
+def set_clip_bounds(min_score: Optional[float] = None,
+                    max_score: Optional[float] = None) -> None:
+    """Record the clipping bounds in the ORIGINAL (denormalised) scale."""
+    global _CLIP_BOUNDS
+    _CLIP_BOUNDS = {"min": min_score, "max": max_score}
+    if min_score is None and max_score is None:
+        return
+    lo = "-inf" if min_score is None else f"{min_score:g}"
+    hi = "+inf" if max_score is None else f"{max_score:g}"
+    print(f"  [clip] Regression predictions clipped to [{lo}, {hi}] "
+          f"(original scale)")
+
+
+def _clip_regression(arr):
+    """Clip an array of predictions to [min_score, max_score] in ORIGINAL scale."""
+    arr = np.asarray(arr, dtype=float)
+    lo, hi = _CLIP_BOUNDS["min"], _CLIP_BOUNDS["max"]
+    if lo is None and hi is None:
+        return arr
+    return np.clip(arr,
+                   -np.inf if lo is None else float(lo),
+                   np.inf if hi is None else float(hi))
+
+
+def _clip_regression_normalized(arr):
+    """Clip an array of NORMALISED predictions using equivalent bounds."""
+    arr = np.asarray(arr, dtype=float)
+    lo, hi = _CLIP_BOUNDS["min"], _CLIP_BOUNDS["max"]
+    if lo is None and hi is None:
+        return arr
+    if not _Y_STATS["normalized"]:
+        return _clip_regression(arr)
+    mu, sd = _Y_STATS["mean"], _Y_STATS["std"]
+    lo_n = -np.inf if lo is None else (float(lo) - mu) / sd
+    hi_n = np.inf if hi is None else (float(hi) - mu) / sd
+    return np.clip(arr, lo_n, hi_n)
+
 # =======================================================================
 #  CONFIGURATION
 # =======================================================================
@@ -258,13 +301,21 @@ def _maybe_denorm(arr):
 
 
 def _denorm_df(df, cols=("y_true", "y_pred")):
-    """Return a copy of df with y_true/y_pred on the original ECAS scale."""
+    """Return a copy of df with y_true/y_pred on the original ECAS scale.
+
+    y_pred is additionally clipped to the (--min_score, --max_score) bounds
+    **after** denormalisation, so every CSV written through this function
+    contains in-bounds predictions. y_true is never clipped.
+    """
     if df is None or len(df) == 0:
         return df
     out = df.copy()
     for c in cols:
-        if c in out.columns:
-            out[c] = _maybe_denorm(out[c])
+        if c not in out.columns:
+            continue
+        out[c] = _maybe_denorm(out[c])
+        if c == "y_pred":
+            out[c] = _clip_regression(out[c])
     return out
 
 
@@ -1126,6 +1177,7 @@ def score_meta_model(model, x, y, task, threshold=0.5):
     else:
         y_eval = _maybe_denorm(np.asarray(y, dtype=float))
         p_eval = _maybe_denorm(np.asarray(pred, dtype=float))
+        p_eval = _clip_regression(p_eval)                      # ← NEW
         return {
             "rmse": float(np.sqrt(mean_squared_error(y_eval, p_eval))),
             "mae": float(mean_absolute_error(y_eval, p_eval)),
@@ -2712,6 +2764,10 @@ def apply_fusion_method(
             pred = np.round(pred).astype(int)
         proba = None
 
+    # ---- regression: clip in normalised space --------------------------
+    if not is_classification and pred is not None:
+        pred = _clip_regression_normalized(pred)
+
     return pred, proba, best_th
 
 
@@ -3071,6 +3127,12 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict, args, y_true
     except Exception as e:
         print(f"    ⚠️ Stacked meta-learner failed: {e}")
         traceback.print_exc()
+
+    # ---- regression: clip every meta-fusion output before metrics / save --
+    if not is_classification:
+        for m_name, m_data in results.items():
+            if "predictions" in m_data and m_data["predictions"] is not None:
+                m_data["predictions"] = _clip_regression(m_data["predictions"])
 
     print("\n" + "=" * 60)
     print(f"✅ META-FUSION COMPLETE - {len(results)} strategies")
@@ -4418,6 +4480,13 @@ def build_parser():
     parser.add_argument("--force-recompute", action="store_true",
                         help="Force recomputation of all CV steps even if outputs exist")
 
+    parser.add_argument('--max_score', type=float, default=136,
+                    help='Regression only: clip final predictions to <= max_score '
+                         '(in original ECAS scale). Also applies to fusion & meta-fusion.')
+    parser.add_argument('--min_score', type=float, default=0,
+                    help='Regression only: clip final predictions to >= min_score '
+                         '(in original ECAS scale).')
+
     return parser
 
 
@@ -4463,7 +4532,10 @@ def main():
             y_std = float(np.nanstd(y_raw))
             if y_std < 1e-9:
                 y_std = 1.0
-            set_y_stats(y_mean, y_std)
+            set_y_stats(y_mean, y_std) 
+            set_clip_bounds(getattr(args, "min_score", None),
+                            getattr(args, "max_score", None))
+
             df["label"] = (y_raw - y_mean) / y_std
             if isinstance(metadata, dict):
                 metadata["y_mean"] = y_mean
