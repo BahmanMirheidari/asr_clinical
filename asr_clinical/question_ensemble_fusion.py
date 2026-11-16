@@ -4019,7 +4019,7 @@ def run_leakage_safe_fusion(args):
     print("\n[6/6] Running outer folds and fusion...")
     subgroup_ids = None
     if getattr(args, 'subgroup_file', None):
-        try:
+        try: 
             subgroup_ids = load_subgroup_ids(Path(args.subgroup_file))
             print(f"  Loaded {len(subgroup_ids)} subgroup speakers")
         except Exception as e:
