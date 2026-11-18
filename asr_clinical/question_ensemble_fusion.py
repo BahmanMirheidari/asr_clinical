@@ -79,6 +79,12 @@ FIXES (see # FIX markers in code):
   #32 safe_question_train_and_embed skips if model cached
   #33 run_leakage_safe_fusion: STEP 0 copy, HPO cache, skip-when-complete
   #34 --force-hpo flag
+  #35 verify_embeddings_changed: pretrained vs fine-tuned embedding diagnostics
+  #36 --embedding-layer / --embedding-pooling
+  #37 EmbeddingReducer: PCA/SVD/SelectKBest/VarianceThreshold/L1
+  #38 --embedding-reduction-per-question
+  #39 reducer fit on outer-fold train speakers only
+  #40 reducer inserted after build_feature_table and before fusion
 """
 
 import os
@@ -1823,14 +1829,216 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig,
         return None
 
 
+
+# =======================================================================
+#  EMBEDDING REDUCTION (FIXES #37-#39)
+# =======================================================================
+
+class EmbeddingReducer:
+    """Train-fold-fitted reducer for text embeddings.
+
+    Supported methods: none, pca, svd, selectkbest, variancethreshold, l1.
+    The instance is fitted only on the training fold and reused unchanged
+    for validation/test data.
+    """
+
+    def __init__(self, method="none", n_components=64, k=64,
+                 variance_threshold=0.0, l1_alpha=0.01,
+                 task="classification", random_state=42):
+        self.method = str(method).lower()
+        self.n_components = int(n_components)
+        self.k = int(k)
+        self.variance_threshold = float(variance_threshold)
+        self.l1_alpha = float(l1_alpha)
+        self.task = task
+        self.random_state = int(random_state)
+        self.reducer_ = None
+        self.scaler_ = None
+        self.n_features_in_ = None
+
+    def fit(self, X, y):
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.feature_selection import VarianceThreshold, SelectFromModel
+        from sklearn.preprocessing import StandardScaler
+
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y).ravel()
+        if X.ndim != 2 or X.shape[1] == 0:
+            raise ValueError("EmbeddingReducer received an empty feature matrix")
+        self.n_features_in_ = X.shape[1]
+
+        if self.method in ("none", "", "off"):
+            self.reducer_ = None
+        elif self.method == "pca":
+            n = max(1, min(self.n_components, X.shape[1], X.shape[0]))
+            self.reducer_ = PCA(n_components=n, random_state=self.random_state)
+            self.reducer_.fit(X)
+        elif self.method == "svd":
+            n = max(1, min(self.n_components, X.shape[1],
+                           max(1, X.shape[0] - 1)))
+            self.reducer_ = TruncatedSVD(n_components=n,
+                                         random_state=self.random_state)
+            self.reducer_.fit(X)
+        elif self.method == "selectkbest":
+            score_func = f_classif if self.task == "classification" else f_regression
+            k = min(max(1, self.k), X.shape[1])
+            self.reducer_ = SelectKBest(score_func=score_func, k=k)
+            self.reducer_.fit(X, y)
+        elif self.method == "variancethreshold":
+            self.reducer_ = VarianceThreshold(threshold=self.variance_threshold)
+            try:
+                self.reducer_.fit(X)
+            except ValueError:
+                warnings.warn("VarianceThreshold removed every feature; retaining all.")
+                self.reducer_ = None
+        elif self.method == "l1":
+            self.scaler_ = StandardScaler()
+            Xs = self.scaler_.fit_transform(X)
+            if self.task == "classification":
+                estimator = LogisticRegression(
+                    penalty="l1", solver="liblinear", C=1.0 / max(self.l1_alpha, 1e-9),
+                    class_weight="balanced", max_iter=3000,
+                    random_state=self.random_state)
+            else:
+                estimator = Lasso(alpha=self.l1_alpha, max_iter=5000,
+                                  random_state=self.random_state)
+            estimator.fit(Xs, y)
+            self.reducer_ = SelectFromModel(estimator, prefit=True, threshold="mean")
+            if not np.any(self.reducer_.get_support()):
+                warnings.warn("L1 selected no features; retaining all.")
+                self.reducer_ = None
+                self.scaler_ = None
+        else:
+            raise ValueError(
+                f"Unknown embedding reduction '{self.method}'. Choose none, pca, "
+                "svd, selectkbest, variancethreshold, or l1.")
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        if self.n_features_in_ is None:
+            raise RuntimeError("EmbeddingReducer must be fitted before transform")
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"Embedding feature mismatch: expected {self.n_features_in_}, "
+                f"received {X.shape[1] if X.ndim == 2 else 'non-matrix'}")
+        if self.reducer_ is None:
+            return X
+        X_input = self.scaler_.transform(X) if self.scaler_ is not None else X
+        return self.reducer_.transform(X_input)
+
+    def fit_transform(self, X, y):
+        return self.fit(X, y).transform(X)
+
+
+def apply_embedding_reduction(train_ft, val_ft, text_cols, args):
+    """FIX #40: reduce text embeddings after feature-table construction.
+
+    All reducer fitting is performed on train_ft only (FIX #39). Audio
+    features are deliberately excluded from this embedding reduction.
+    """
+    method = getattr(args, "embedding_reduction", "none")
+    if method in (None, "none", "off", ""):
+        return train_ft, val_ft, list(text_cols), {}
+
+    per_question = bool(getattr(args, "embedding_reduction_per_question", False))
+    groups = question_groups(text_cols) if per_question else {"all": list(text_cols)}
+    train_out = train_ft.copy()
+    val_out = val_ft.copy()
+    new_cols, fitted = [], {}
+
+    for group_name, cols in groups.items():
+        cols = [c for c in cols if c in train_out.columns]
+        if not cols:
+            continue
+        reducer = EmbeddingReducer(
+            method=method,
+            n_components=getattr(args, "embedding_n_components", 64),
+            k=getattr(args, "embedding_select_k", 64),
+            variance_threshold=getattr(args, "embedding_variance_threshold", 0.0),
+            l1_alpha=getattr(args, "embedding_l1_alpha", 0.01),
+            task=args.task,
+            random_state=args.seed,
+        )
+        Xtr = train_out[cols].to_numpy(dtype=float)
+        Xva = val_out.reindex(columns=cols, fill_value=0.0).to_numpy(dtype=float)
+        ytr = train_out["y_true"].to_numpy()
+        Xtr_r = reducer.fit_transform(Xtr, ytr)
+        Xva_r = reducer.transform(Xva)
+
+        prefix = "embred" if group_name == "all" else f"{group_name}__embred"
+        out_names = [f"{prefix}_{i}" for i in range(Xtr_r.shape[1])]
+        train_out = train_out.drop(columns=cols)
+        val_out = val_out.drop(columns=cols)
+        for i, name in enumerate(out_names):
+            train_out[name] = Xtr_r[:, i]
+            val_out[name] = Xva_r[:, i]
+        new_cols.extend(out_names)
+        fitted[group_name] = reducer
+        print(f"  [embedding-reduction] {group_name}: {len(cols)} -> "
+              f"{len(out_names)} features ({method}; fit on train only)")
+
+    # Keep the label last and preserve the speaker index.
+    train_out = train_out[[c for c in train_out.columns if c != "y_true"] + ["y_true"]]
+    val_out = val_out[[c for c in val_out.columns if c != "y_true"] + ["y_true"]]
+    return train_out, val_out, new_cols, fitted
+
+
 # =======================================================================
 #  EMBEDDING EXTRACTION
 # =======================================================================
 
+def _resolve_embedding_layer(layer, n_layers):
+    """Resolve 'last', negative, or non-negative hidden-state layer index."""
+    if isinstance(layer, str) and layer.lower() == "last":
+        return n_layers - 1
+    idx = int(layer)
+    if idx < 0:
+        idx += n_layers
+    if idx < 0 or idx >= n_layers:
+        raise ValueError(f"embedding layer {layer!r} outside hidden-state range")
+    return idx
+
+
+def _pool_hidden_state(hidden, attention_mask, pooling):
+    pooling = str(pooling).lower()
+    if pooling == "cls":
+        return hidden[:, 0, :]
+    mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+    if pooling == "mean":
+        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+    if pooling == "max":
+        masked = hidden.masked_fill(mask == 0, torch.finfo(hidden.dtype).min)
+        return masked.max(dim=1).values
+    raise ValueError(f"Unknown embedding pooling '{pooling}'")
+
+
+@torch.no_grad()
+def _embed_texts_with_model(model, tokenizer, texts, args, max_length, device):
+    layer_arg = getattr(args, "embedding_layer", "-1")
+    pooling = getattr(args, "embedding_pooling", "cls")
+    all_embeddings = []
+    batch_size = max(1, int(args.embedding_batch_size))
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        enc = tokenizer(batch, truncation=True, padding=True,
+                        max_length=max_length, return_tensors="pt")
+        enc = {k: v.to(device) for k, v in enc.items()}
+        outputs = model(**enc, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+        layer_idx = _resolve_embedding_layer(layer_arg, len(hidden_states))
+        pooled = _pool_hidden_state(
+            hidden_states[layer_idx], enc["attention_mask"], pooling)
+        all_embeddings.append(pooled.cpu().numpy())
+    if not all_embeddings:
+        return np.empty((0, 0), dtype=float)
+    return np.concatenate(all_embeddings, axis=0)
+
+
 @torch.no_grad()
 def extract_embeddings(model_dir: Path, df: pd.DataFrame, args,
                        output_csv: Path, max_length: int):
-    """Extract embeddings from a trained model."""
+    """Extract configurable hidden-layer embeddings with CLS/mean/max pooling."""
     if output_csv.exists() and not args.force_embeddings:
         return pd.read_csv(output_csv)
     try:
@@ -1839,28 +2047,21 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args,
         model = AutoModelForSequenceClassification.from_pretrained(
             model_dir).to(device)
         model.eval()
+        embeddings = _embed_texts_with_model(
+            model, tokenizer, df["text"].tolist(), args, max_length, device)
         rows = []
-        texts = df["text"].tolist()
-        for start in range(0, len(texts), args.embedding_batch_size):
-            batch_df = df.iloc[start:start + args.embedding_batch_size].reset_index(drop=True)
-            enc = tokenizer(batch_df["text"].tolist(), truncation=True,
-                            padding=True, max_length=max_length,
-                            return_tensors="pt")
-            enc = {k: v.to(device) for k, v in enc.items()}
-            outputs = model(**enc, output_hidden_states=True)
-            embeddings = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
-            for row_idx, embedding in enumerate(embeddings):
-                meta = batch_df.iloc[row_idx]
-                row = {
-                    "speaker_id": meta["speaker_id"],
-                    "session_id": meta["session_id"],
-                    "utterance_id": meta["utterance_id"],
-                    "question_id": meta["question_id"],
-                    "y_true": meta["label"],
-                }
-                row.update({f"emb_{i}": float(v)
-                            for i, v in enumerate(embedding)})
-                rows.append(row)
+        for row_idx, embedding in enumerate(embeddings):
+            meta = df.iloc[row_idx]
+            row = {
+                "speaker_id": meta["speaker_id"],
+                "session_id": meta["session_id"],
+                "utterance_id": meta["utterance_id"],
+                "question_id": meta["question_id"],
+                "y_true": meta["label"],
+            }
+            row.update({f"emb_{i}": float(v)
+                        for i, v in enumerate(embedding)})
+            rows.append(row)
         emb_df = pd.DataFrame(rows)
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         emb_df.to_csv(output_csv, index=False)
@@ -1869,6 +2070,53 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args,
         print(f"❌ Failed to extract embeddings: {e}")
         traceback.print_exc()
         raise
+
+
+@torch.no_grad()
+def verify_embeddings_changed(model_dir: Path, df: pd.DataFrame, args,
+                               max_length: int, max_samples: int = 64):
+    """FIX #35: compare the base checkpoint and fine-tuned embeddings.
+
+    Uses the same texts, hidden layer, and pooling for both checkpoints.
+    Returns numeric diagnostics; it does not alter model weights.
+    """
+    if df.empty:
+        raise ValueError("Cannot verify embeddings on an empty dataframe")
+    sample = df.head(max(1, int(max_samples)))
+    device = choose_device()
+    tokenizer = load_tokenizer(str(model_dir))
+    tuned = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+    tuned.eval()
+    base = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name, ignore_mismatched_sizes=True).to(device)
+    base.eval()
+    texts = sample["text"].tolist()
+    tuned_emb = _embed_texts_with_model(tuned, tokenizer, texts, args,
+                                       max_length, device)
+    base_emb = _embed_texts_with_model(base, tokenizer, texts, args,
+                                      max_length, device)
+    if base_emb.shape != tuned_emb.shape:
+        raise RuntimeError(
+            f"Pre/post embedding shape mismatch: {base_emb.shape} vs {tuned_emb.shape}")
+    delta = tuned_emb - base_emb
+    cosine = np.sum(base_emb * tuned_emb, axis=1) / (
+        np.linalg.norm(base_emb, axis=1) * np.linalg.norm(tuned_emb, axis=1) + 1e-12)
+    result = {
+        "n_samples": int(len(sample)),
+        "embedding_dim": int(tuned_emb.shape[1]),
+        "mean_absolute_difference": float(np.mean(np.abs(delta))),
+        "mean_squared_difference": float(np.mean(delta ** 2)),
+        "mean_cosine_similarity": float(np.mean(cosine)),
+        "changed": bool(not np.allclose(base_emb, tuned_emb, rtol=1e-5, atol=1e-7)),
+    }
+    del base, tuned
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("  [embedding-verification] "
+          f"changed={result['changed']}, "
+          f"mean_abs_diff={result['mean_absolute_difference']:.6g}, "
+          f"mean_cosine={result['mean_cosine_similarity']:.6f}")
+    return result
 
 
 # =======================================================================
@@ -2052,13 +2300,23 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
     if not saved_model_exists(model_dir):
         raise FileNotFoundError(f"Model not found after training: {model_dir}")
 
-    train_emb = q_dir / "embeddings_train.csv"
-    val_emb = q_dir / "embeddings_val.csv"
-    extract_embeddings(model_dir, q_train, args, train_emb,
-                       best_hparams.get("max_length", args.max_length))
+    layer_tag = str(getattr(args, "embedding_layer", "-1")).replace("-", "m")
+    pooling_tag = str(getattr(args, "embedding_pooling", "cls"))
+    cache_tag = f"layer-{layer_tag}_pool-{pooling_tag}"
+    train_emb = q_dir / f"embeddings_train_{cache_tag}.csv"
+    val_emb = q_dir / f"embeddings_val_{cache_tag}.csv"
+
+    max_length = best_hparams.get("max_length", args.max_length)
+    if getattr(args, "verify_embeddings_changed", False):
+        verification_path = q_dir / f"embedding_verification_{cache_tag}.json"
+        if not verification_path.exists() or getattr(args, "force_embeddings", False):
+            verification = verify_embeddings_changed(
+                model_dir, q_train, args, max_length=max_length)
+            with open(verification_path, "w") as f:
+                json.dump(convert_to_serializable(verification), f, indent=2)
+    extract_embeddings(model_dir, q_train, args, train_emb, max_length)
     if include_val:
-        extract_embeddings(model_dir, q_val, args, val_emb,
-                           best_hparams.get("max_length", args.max_length))
+        extract_embeddings(model_dir, q_val, args, val_emb, max_length)
     else:
         val_emb = None
     return model_dir, train_emb, val_emb
@@ -3934,6 +4192,41 @@ def run_leakage_safe_fusion(args):
         else:
             print(f"  ⚠️ {method}: no pre-computed folder — will compute fresh")
 
+    reduction_config = {
+        "embedding_layer": str(getattr(args, "embedding_layer", "-1")),
+        "embedding_pooling": str(getattr(args, "embedding_pooling", "cls")),
+        "embedding_reduction": str(getattr(args, "embedding_reduction", "none")),
+        "embedding_reduction_per_question": bool(getattr(
+            args, "embedding_reduction_per_question", False)),
+        "embedding_n_components": int(getattr(args, "embedding_n_components", 64)),
+        "embedding_select_k": int(getattr(args, "embedding_select_k", 64)),
+        "embedding_variance_threshold": float(getattr(
+            args, "embedding_variance_threshold", 0.0)),
+        "embedding_l1_alpha": float(getattr(args, "embedding_l1_alpha", 0.01)),
+        "verify_embeddings_changed": bool(getattr(
+            args, "verify_embeddings_changed", False)),
+    }
+    config_path = fusion_dir / "embedding_pipeline_config.json"
+    if config_path.exists():
+        try:
+            previous_config = json.loads(config_path.read_text())
+        except Exception:
+            previous_config = None
+        if previous_config != reduction_config:
+            print("  ⚠️ Embedding configuration changed; invalidating fusion cache.")
+            force_recompute = True
+    elif (reduction_config["embedding_layer"] != "-1"
+          or reduction_config["embedding_pooling"] != "cls"
+          or reduction_config["embedding_reduction"] != "none"
+          or reduction_config["embedding_reduction_per_question"]
+          or reduction_config["embedding_n_components"] != 64
+          or reduction_config["embedding_select_k"] != 64
+          or reduction_config["embedding_variance_threshold"] != 0.0
+          or reduction_config["embedding_l1_alpha"] != 0.01
+          or reduction_config["verify_embeddings_changed"]):
+        force_recompute = True
+    config_path.write_text(json.dumps(reduction_config, indent=2))
+
     if not force_recompute and _fusion_results_complete(fusion_dir, all_methods):
         print(f"\n✅ Fusion results already complete at {fusion_dir}")
         print("   Skipping HPO, LM training, and fusion recomputation.")
@@ -4072,6 +4365,30 @@ def run_leakage_safe_fusion(args):
         train_ft, val_ft, _ = align_feature_tables(
             train_ft, val_ft, pd.DataFrame(), text_cols)
         val_ft = val_ft.reindex(columns=text_cols + ["y_true"], fill_value=0.0)
+
+        # FIX #40: reduction is fitted here on outer-fold training speakers
+        # only; the fitted reducer transforms validation speakers unchanged.
+        try:
+            train_ft, val_ft, text_cols, fold_reducers = apply_embedding_reduction(
+                train_ft, val_ft, text_cols, args)
+            reducer_dir = fold_dir / "embedding_reducers"
+            if fold_reducers:
+                reducer_dir.mkdir(parents=True, exist_ok=True)
+                for group_name, reducer in fold_reducers.items():
+                    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", group_name)
+                    joblib.dump(reducer, reducer_dir / f"{safe_name}.joblib")
+                with open(reducer_dir / "config.json", "w") as f:
+                    json.dump({
+                        "method": getattr(args, "embedding_reduction", "none"),
+                        "per_question": bool(getattr(
+                            args, "embedding_reduction_per_question", False)),
+                        "fit_scope": "outer_fold_train_only",
+                        "groups": list(fold_reducers.keys()),
+                    }, f, indent=2)
+        except Exception as e:
+            print(f"  ❌ Embedding reduction failed: {e}")
+            traceback.print_exc()
+            continue
 
         if audio_df is not None and audio_cols:
             audio_idx = audio_df.set_index("speaker_id")
@@ -4259,6 +4576,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add(p, 'loss', type=str, default='ce')
     _add(p, 'focal_gamma', type=float, default=0.0)
     _add(p, 'embedding_batch_size', type=int, default=32)
+    # FIX #36: hidden-state selection and token pooling.
+    _add(p, 'embedding_layer', type=str, default='-1',
+         help="Hidden-state index (e.g. -1, -2, 0) or 'last'")
+    _add(p, 'embedding_pooling', type=str, default='cls',
+         choices=['cls', 'mean', 'max'])
+    # FIXES #37-#39: fold-local embedding reduction.
+    _add(p, 'embedding_reduction', type=str, default='none',
+         choices=['none', 'pca', 'svd', 'selectkbest',
+                  'variancethreshold', 'l1'])
+    _add(p, 'embedding_reduction_per_question', action='store_true',
+         help="Fit a separate reducer for each question's text embeddings")
+    _add(p, 'embedding_n_components', type=int, default=64)
+    _add(p, 'embedding_select_k', type=int, default=64)
+    _add(p, 'embedding_variance_threshold', type=float, default=0.0)
+    _add(p, 'embedding_l1_alpha', type=float, default=0.01)
+    _add(p, 'verify_embeddings_changed', action='store_true',
+         help="Compare pretrained and fine-tuned embeddings on identical texts")
     _add(p, 'meta_model', type=str, default='linear',
          choices=['linear', 'ridge', 'lasso', 'elasticnet',
                   'random_forest', 'svm', 'hist_gradient_boosting',
@@ -4334,14 +4668,165 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# END OF FILE — complete (~4350 lines)
-# ═══════════════════════════════════════════════════════════════════════
+    sys.exit(main()) 
 
 '''
+
+1. Classification baseline — no embedding reduction
+This is your baseline experiment:
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_baseline \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction none \
+    --verify-embeddings-changed
+
+
+What happens:
+1. The language model is fine-tuned using your existing training procedure.
+2. The pipeline compares the pretrained and fine-tuned embeddings.
+3. It extracts embeddings from the fine-tuned model.
+4. It keeps all original embedding dimensions.
+5. It proceeds to multimodal fusion with the audio features.
+This gives you the unreduced reference result.
+
+Important: In this version, verification is optional and is cached. Include --verify-embeddings-changed in every experiment where you want the diagnostic enabled. If you reuse an output directory, an existing verification JSON is reused unless you also specify --force-embeddings.
+2. Run each reduction method with 40 features
+Use a separate output directory for every experiment so that results and cached embeddings do not get mixed.
+A. PCA — 40 components
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_pca40 \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction pca \
+    --embedding-n-components 40 \
+    --verify-embeddings-changed
+
+
+Reduces all text embedding dimensions to 40 components (global PCA).
+B. SVD — 40 components
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_svd40 \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction svd \
+    --embedding-n-components 40 \
+    --verify-embeddings-changed
+
+
+Similar objective to PCA, but uses truncated SVD.
+C. SelectKBest — 40 features
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_selectkbest40 \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction selectkbest \
+    --embedding-select-k 40 \
+    --verify-embeddings-changed
+
+
+Selects 40 original embedding dimensions based on their relationship with the classification labels, using the ANOVA F-test.
+D. VarianceThreshold
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_variance \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction variancethreshold \
+    --embedding-variance-threshold 0.01 \
+    --verify-embeddings-changed
+
+
+This removes dimensions whose variance is below the threshold.
+
+Important: VarianceThreshold cannot guarantee exactly 40 output features. The number retained depends on your data and the threshold. You would need to experiment with the threshold to obtain approximately 40.
+E. L1 feature selection
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_l1 \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction l1 \
+    --embedding-l1-alpha 0.01 \
+    --verify-embeddings-changed
+
+
+L1 selects dimensions using Logistic Regression with L1 regularisation.
+
+Important: L1 also does not guarantee exactly 40 features. The number selected depends on the regularisation strength (alpha). You would need to experiment with alpha to control the number retained.
+
+3. Global versus per-question reduction
+There is one additional option worth considering for your speech-question experiments.
+
+Suppose you have five questions, each producing 768-dimensional embeddings.
+Approach    Output dimensions
+Global PCA, 40 components   40 total
+Per-question PCA, 40 components 200 total
+Global SelectKBest, 40 features 40 total
+Per-question SelectKBest, 40 features   200 total
+
+To run PCA with 40 components for each question, add:
+--embedding-reduction-per-question
+
+
+For example:
+python leakage_safe_fusion_v2_fixes35_40.py \
+    --task classification \
+    --output-dir results/classification_pca40_per_question \
+    --asr-file YOUR_ASR.csv \
+    --embedding-layer -1 \
+    --embedding-pooling cls \
+    --embedding-reduction pca \
+    --embedding-n-components 40 \
+    --embedding-reduction-per-question \
+    --verify-embeddings-changed
+
+
+This gives each question its own PCA transformation.
+
+4. Suggested experiment directory structure
+I would organise the experiments like this:
+results/
+  classification_baseline/
+  classification_pca40/
+  classification_svd40/
+  classification_selectkbest40/
+  classification_variance/
+  classification_l1/
+  classification_pca40_per_question/
+
+
+Each experiment should use the same:
+- Participant-level CV folds.
+- Fine-tuning configuration.
+- Random seed.
+- Audio features.
+- Fusion models and evaluation metrics.
+This is important for a fair comparison.
+5. My recommended initial experiment
+I would start with these five:
+Experiment  Reduction   Number of text features
+1   None    Original
+2   PCA 40
+3   SVD 40
+4   SelectKBest 40
+5   PCA per question    40 per question
+
+Keep the extraction configuration at layer=-1 and pooling=cls initially. Later, repeat the best experiments with mean pooling.
+
+One final distinction: all five experiments extract embeddings from the fine-tuned model. The verification flag checks whether those embeddings differ from the pretrained model. It does not mean that the pipeline switches between pretrained and fine-tuned embeddings.
+
+
 
 Key Changes Summary
 Fix Location    What Changed
