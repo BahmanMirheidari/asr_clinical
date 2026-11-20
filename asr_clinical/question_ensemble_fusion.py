@@ -3952,7 +3952,7 @@ def _load_data_robustly(args, metadata: dict) -> Tuple[pd.DataFrame, dict]:
         result = load_examples(
             asr_file=args.asr_file, demo_file=args.demo_file,
             target_column=args.target_column, task=args.task,
-            text_mode="question",
+            text_mode="question",text_index=args.text_index
         )
 
     if isinstance(result, tuple):
@@ -4636,6 +4636,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add(p, 'subgroup_file', type=str, default=None)
     _add(p, 'fusion_methods', type=str, nargs='+', default=['all'])
     _add(p, 'fusion_novel', type=str, nargs='+', default=['all'])
+    _add(p, 'text_index', type=int, default=-1)
     return p
 
 
