@@ -46,7 +46,7 @@ def parse_utterance_id(utterance_id: str) -> tuple[str, str, str]:
 
     return speaker_id, session_id, question_id    
 
-def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = True, verbose: bool = False) -> pd.DataFrame:
+def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = True, verbose: bool = False, text_index = -1) -> pd.DataFrame:
     """
     Read ASR transcript file with flexible delimiter support.
     
@@ -91,7 +91,7 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Tru
                     continue
                 
                 utt_id = row[0].strip()
-                text = row[-1].strip()
+                text = row[text_index].strip()
                 
                 # Skip header-like IDs
                 if utt_id.lower() in {"utt_id", "utterance_id", "id"}:
@@ -154,7 +154,7 @@ def read_asr_file(path: str | Path, delimiter: str = ";", has_header: bool = Tru
                     continue
                 
                 utt_id = parts[0].strip()
-                text = parts[1].strip()
+                text = parts[text_index].strip()
                 
                 # Skip header-like IDs
                 if utt_id.lower() in {"utt_id", "utterance_id", "id"}:
