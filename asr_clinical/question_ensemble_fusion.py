@@ -2278,49 +2278,151 @@ def make_question_cfg(args, question: str, question_dir: Path,
 
 
 def safe_question_train_and_embed(train_df, val_df, metadata, args,
-                                   best_hparams, question, fold_dir,
-                                   include_val=True):
-    """FIX #32: Skip LM training if the model already exists on disk."""
+                                  best_hparams, question, fold_dir,
+                                  include_val=True):
+    """Train/load the per-question LM and extract train/val embeddings.
+
+    Two modes, selected by ``args.frozen_text`` (add ``--frozen-text`` to
+    the CLI; the argument is read via ``getattr`` so the function remains
+    backwards-compatible even before the flag is wired up):
+
+    * Fine-tuned (default)
+        Fine-tune a fresh copy of ``args.model_name`` on this question's
+        outer-train speakers, cache the checkpoint under
+        ``<q_dir>/model/``, then extract embeddings from that checkpoint.
+
+    * Frozen (``--frozen-text``)
+        Skip per-question fine-tuning entirely. Extract embeddings from
+        the *base* ``args.model_name`` checkpoint (HF hub id or local
+        path). Recommended when the per-question outer-train set is
+        small (~tens of speakers): at that scale per-question
+        fine-tuning overfits catastrophically (the verification JSON
+        typically reports ``n_samples`` in the 30–60 range and
+        ``mean_cosine_similarity`` ≈ 0.87 to base, i.e. a real but
+        fold-specific rotation), and the resulting embeddings carry
+        almost no transferable signal. Frozen base-model embeddings +
+        PCA + Ridge routinely beat fine-tuned embeddings in this
+        regime.
+
+        In frozen mode:
+          * The return value ``model_dir`` is ``Path(args.model_name)``
+            — it exists only if ``args.model_name`` is a local path.
+          * Embedding cache filenames get a ``_frozen`` suffix so they
+            never collide with fine-tuned embeddings produced earlier.
+          * ``--verify-embeddings-changed`` is skipped, because
+            comparing the base checkpoint to itself trivially yields
+            ``changed=False``.
+          * A small ``frozen_config.json`` is written for traceability.
+
+    FIX #32: If the fine-tuned checkpoint exists on disk and
+    ``--force-embeddings`` is not set, the checkpoint is reused and
+    only missing embeddings are re-extracted.
+    """
     set_seed(args.seed, deterministic=True)
+
     q_train = train_df[train_df["question_id"] == question].reset_index(drop=True)
     q_val = val_df[val_df["question_id"] == question].reset_index(drop=True)
     if q_train.empty:
         raise ValueError(f"No training data for question {question}")
+
     q_dir = Path(fold_dir) / "question_models" / question
-    model_dir = q_dir / "model"
     q_dir.mkdir(parents=True, exist_ok=True)
 
-    if not (model_dir.exists() and saved_model_exists(model_dir)):
-        print(f"    Training LM for {question}...")
-        cfg = make_question_cfg(args, question, q_dir, best_hparams)
-        train_one_fold(q_train, q_val, cfg, metadata, q_dir)
+    frozen = bool(getattr(args, "frozen_text", False))
+
+    # ------------------------------------------------------------------
+    #  Decide which checkpoint will produce the embeddings
+    # ------------------------------------------------------------------
+    if frozen:
+        model_dir = Path(args.model_name)  # base checkpoint reference
+        n_speakers = int(q_train["speaker_id"].nunique())
+        print(f"    [frozen] {question}: using base checkpoint "
+              f"'{args.model_name}' (n_speakers={n_speakers}, "
+              f"no per-question fine-tune)")
+
+        # Best-effort trace file — never let this block the run.
+        try:
+            frozen_meta = {
+                "base_model": str(args.model_name),
+                "question": str(question),
+                "embedding_layer": str(
+                    getattr(args, "embedding_layer", "-1")),
+                "embedding_pooling": str(
+                    getattr(args, "embedding_pooling", "cls")),
+                "n_train_speakers": n_speakers,
+                "mode": "frozen",
+            }
+            with open(q_dir / "frozen_config.json", "w") as f:
+                json.dump(convert_to_serializable(frozen_meta), f, indent=2)
+        except Exception:
+            pass
     else:
-        print(f"    Reusing cached LM for {question}")
+        model_dir = q_dir / "model"
+        if not (model_dir.exists() and saved_model_exists(model_dir)):
+            print(f"    Training LM for {question}...")
+            cfg = make_question_cfg(args, question, q_dir, best_hparams)
+            train_one_fold(q_train, q_val, cfg, metadata, q_dir)
+        else:
+            print(f"    Reusing cached LM for {question}")
 
-    if not saved_model_exists(model_dir):
-        raise FileNotFoundError(f"Model not found after training: {model_dir}")
+        if not saved_model_exists(model_dir):
+            raise FileNotFoundError(
+                f"Model not found after training: {model_dir}")
 
+    # ------------------------------------------------------------------
+    #  Cache-tag: layer + pooling (+ _frozen so caches never collide)
+    # ------------------------------------------------------------------
     layer_tag = str(getattr(args, "embedding_layer", "-1")).replace("-", "m")
     pooling_tag = str(getattr(args, "embedding_pooling", "cls"))
-    cache_tag = f"layer-{layer_tag}_pool-{pooling_tag}"
+    frozen_tag = "_frozen" if frozen else ""
+    cache_tag = f"layer-{layer_tag}_pool-{pooling_tag}{frozen_tag}"
+
     train_emb = q_dir / f"embeddings_train_{cache_tag}.csv"
     val_emb = q_dir / f"embeddings_val_{cache_tag}.csv"
 
     max_length = best_hparams.get("max_length", args.max_length)
-    if getattr(args, "verify_embeddings_changed", False):
+
+    # ------------------------------------------------------------------
+    #  Fine-tune sanity check (only meaningful when not frozen)
+    # ------------------------------------------------------------------
+    if not frozen and getattr(args, "verify_embeddings_changed", False):
         verification_path = q_dir / f"embedding_verification_{cache_tag}.json"
-        if not verification_path.exists() or getattr(args, "force_embeddings", False):
-            verification = verify_embeddings_changed(
-                model_dir, q_train, args, max_length=max_length)
-            with open(verification_path, "w") as f:
-                json.dump(convert_to_serializable(verification), f, indent=2)
+        need_check = (not verification_path.exists()
+                      or getattr(args, "force_embeddings", False))
+        if need_check:
+            try:
+                verification = verify_embeddings_changed(
+                    model_dir, q_train, args, max_length=max_length)
+                with open(verification_path, "w") as f:
+                    json.dump(convert_to_serializable(verification),
+                              f, indent=2)
+            except Exception as e:
+                print(f"    ⚠️ embedding verification failed for "
+                      f"{question}: {e}")
+    elif frozen and getattr(args, "verify_embeddings_changed", False):
+        print(f"    [frozen] {question}: skipping "
+              f"--verify-embeddings-changed (tuned == base is trivial)")
+
+    # ------------------------------------------------------------------
+    #  Extract embeddings
+    # ------------------------------------------------------------------
     extract_embeddings(model_dir, q_train, args, train_emb, max_length)
+
     if include_val:
-        extract_embeddings(model_dir, q_val, args, val_emb, max_length)
+        if q_val.empty:
+            # Keep downstream feature builders happy: emit a header-only
+            # CSV so ``pd.read_csv`` does not error on an empty file.
+            empty_cols = ["speaker_id", "session_id", "utterance_id",
+                          "question_id", "y_true"]
+            pd.DataFrame(columns=empty_cols).to_csv(val_emb, index=False)
+            print(f"    ⚠️ {question}: empty val set — wrote header-only "
+                  f"embedding file {val_emb.name}")
+        else:
+            extract_embeddings(model_dir, q_val, args, val_emb, max_length)
     else:
         val_emb = None
-    return model_dir, train_emb, val_emb
 
+    return model_dir, train_emb, val_emb
 
 def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                              questions, fold_dir):
@@ -4637,6 +4739,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add(p, 'fusion_methods', type=str, nargs='+', default=['all'])
     _add(p, 'fusion_novel', type=str, nargs='+', default=['all'])
     _add(p, 'text_index', type=int, default=-1)
+    _add(p, 'frozen_text', action='store_true',
+         help="Skip per-question LM fine-tuning; extract embeddings from the "
+         "base --model-name checkpoint. Recommended when per-question "
+         "train size is small (~tens of speakers).")
     return p
 
 
