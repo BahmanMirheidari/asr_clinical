@@ -2571,16 +2571,38 @@ def apply_fusion_method(
 ):
     """Apply a specific fusion method.
 
-    FIX #13:
-      - All 14 branches preserved verbatim.
-      - The final clip at the tail is REMOVED — predictions leave this
-        function on the NORMALISED scale (or, for classification, as
-        predicted labels).
-      - `ytr`/`yva` are auto-normalised at entry if they arrive on the
-        original scale, so arithmetic like `pred_text + pred_audio`
-        (which is normalised) is well-defined against y labels.
-      - Denormalisation + clipping happens exactly once downstream, in
-        `score_meta_model` / `_denorm_df`.
+    FIX #13: predictions leave this function on the NORMALISED scale
+    (or, for classification, as predicted labels). Denormalisation and
+    clipping happen exactly once downstream, in `score_meta_model` /
+    `_denorm_df`.
+
+    FIX-SCALER (this revision):
+      * StandardScaler is now fitted **per modality** and applied
+        **before** weighting. The old code did
+            Xtr_fused = hstack([w_t*Xtr_t, w_a*Xtr_a])
+            scaler.fit_transform(Xtr_fused)
+        which mathematically cancelled the weights:
+            (w·x - mean(w·x)) / std(w·x) = (x - mean(x)) / std(x).
+        The weights were a no-op for `early`, `mlp`, `interaction`,
+        and the fallback path of `cca`.
+      * `cross_attention` and `bilinear` no longer reuse a single
+        `StandardScaler` across text and audio. The original reused
+        `scaler` for both `fit_transform(text)` and `fit_transform(audio)`,
+        so validation text features were being standardised with audio
+        statistics (silent garbage input).
+      * `interaction`: PCs are computed on **unweighted** standardised
+        features (clean directions); the weight product
+        `text_weight * audio_weight` is applied to the Hadamard term,
+        and per-modality weights to the linear blocks.
+      * `cca`: standardise per modality first, run CCA on the standardised
+        features (CCA is scale-invariant in its own objective), then
+        apply per-modality weights **after** CCA so the downstream
+        Ridge/Logistic sees weighted components.
+
+    The prediction-level branches (`late`, `confidence`, `dynamic`,
+    `adaptive_weighted`, `moe`, `stacking`) are unchanged — they were
+    never affected by the scaler bug, and their weights already had
+    the intended effect.
     """
     from sklearn.neural_network import MLPClassifier, MLPRegressor
     from sklearn.linear_model import LogisticRegression
@@ -2600,6 +2622,20 @@ def apply_fusion_method(
             ytr = _normalize(ytr)
             yva = _normalize(yva)
 
+    # ------------------------------------------------------------------
+    #  Helper: standardise per modality, then weight, then concat.
+    #  Returns (Xtr_scaled, Xva_scaled) with weights baked in.
+    # ------------------------------------------------------------------
+    def _scale_weight_concat(Xtr_t, Xtr_a, Xva_t, Xva_a,
+                             w_t, w_a):
+        st = StandardScaler().fit(Xtr_t)
+        sa = StandardScaler().fit(Xtr_a)
+        Xtr = np.hstack([w_t * st.transform(Xtr_t),
+                         w_a * sa.transform(Xtr_a)])
+        Xva = np.hstack([w_t * st.transform(Xva_t),
+                         w_a * sa.transform(Xva_a)])
+        return Xtr, Xva
+
     # ---- Branch 1: audio_only ----
     if method == "audio_only":
         pred = pred_audio
@@ -2618,12 +2654,10 @@ def apply_fusion_method(
 
     # ---- Branch 3: early ----
     elif method == "early":
-        Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
-        Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
-
-        scaler = StandardScaler()
-        Xtr_scaled = scaler.fit_transform(Xtr_fused)
-        Xva_scaled = scaler.transform(Xva_fused)
+        # FIX-SCALER: standardise per modality BEFORE weighting so the
+        # weights are not cancelled by a subsequent StandardScaler.
+        Xtr_scaled, Xva_scaled = _scale_weight_concat(
+            Xtr_t, Xtr_a, Xva_t, Xva_a, text_weight, audio_weight)
 
         if is_classification:
             mlp = MLPClassifier(
@@ -2711,27 +2745,48 @@ def apply_fusion_method(
 
     # ---- Branch 6: interaction ----
     elif method == "interaction":
-        n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0] - 1)
+        # FIX-SCALER:
+        #   * Standardise per modality first.
+        #   * Compute PCs on the *unweighted* standardised features so the
+        #     PCs are clean directions of text / audio variance.
+        #   * Apply `text_weight * audio_weight` to the Hadamard term so
+        #     the interaction contribution scales with both modality weights.
+        st = StandardScaler().fit(Xtr_t)
+        sa = StandardScaler().fit(Xtr_a)
+        Xtr_t_n = st.transform(Xtr_t)
+        Xva_t_n = st.transform(Xva_t)
+        Xtr_a_n = sa.transform(Xtr_a)
+        Xva_a_n = sa.transform(Xva_a)
+
+        n_comp = min(10, Xtr_t_n.shape[1], Xtr_a_n.shape[1],
+                     Xtr_t_n.shape[0] - 1)
         if n_comp > 1:
             pca_t = PCA(n_components=n_comp, random_state=args.seed)
             pca_a = PCA(n_components=n_comp, random_state=args.seed)
-            Xtr_t_pca = pca_t.fit_transform(text_weight * Xtr_t)
-            Xtr_a_pca = pca_a.fit_transform(audio_weight * Xtr_a)
-            Xva_t_pca = pca_t.transform(text_weight * Xva_t)
-            Xva_a_pca = pca_a.transform(audio_weight * Xva_a)
+            Xtr_t_pca = pca_t.fit_transform(Xtr_t_n)
+            Xtr_a_pca = pca_a.fit_transform(Xtr_a_n)
+            Xva_t_pca = pca_t.transform(Xva_t_n)
+            Xva_a_pca = pca_a.transform(Xva_a_n)
+
             Xtr_inter = Xtr_t_pca * Xtr_a_pca
             Xva_inter = Xva_t_pca * Xva_a_pca
-            Xtr_fused = np.hstack([text_weight * Xtr_t,
-                                    audio_weight * Xtr_a, Xtr_inter])
-            Xva_fused = np.hstack([text_weight * Xva_t,
-                                    audio_weight * Xva_a, Xva_inter])
-        else:
-            Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
-            Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
 
-        scaler = StandardScaler()
-        Xtr_scaled = scaler.fit_transform(Xtr_fused)
-        Xva_scaled = scaler.transform(Xva_fused)
+            w_inter = text_weight * audio_weight
+            Xtr_scaled = np.hstack([
+                text_weight * Xtr_t_n,
+                audio_weight * Xtr_a_n,
+                w_inter * Xtr_inter,
+            ])
+            Xva_scaled = np.hstack([
+                text_weight * Xva_t_n,
+                audio_weight * Xva_a_n,
+                w_inter * Xva_inter,
+            ])
+        else:
+            Xtr_scaled = np.hstack([text_weight * Xtr_t_n,
+                                    audio_weight * Xtr_a_n])
+            Xva_scaled = np.hstack([text_weight * Xva_t_n,
+                                    audio_weight * Xva_a_n])
 
         if is_classification:
             mlp = MLPClassifier(
@@ -2827,12 +2882,9 @@ def apply_fusion_method(
 
     # ---- Branch 8: mlp ----
     elif method == "mlp":
-        Xtr_fused = np.hstack([text_weight * Xtr_t, audio_weight * Xtr_a])
-        Xva_fused = np.hstack([text_weight * Xva_t, audio_weight * Xva_a])
-
-        scaler = StandardScaler()
-        Xtr_scaled = scaler.fit_transform(Xtr_fused)
-        Xva_scaled = scaler.transform(Xva_fused)
+        # FIX-SCALER: standardise per modality BEFORE weighting.
+        Xtr_scaled, Xva_scaled = _scale_weight_concat(
+            Xtr_t, Xtr_a, Xva_t, Xva_a, text_weight, audio_weight)
 
         if is_classification:
             mlp = MLPClassifier(
@@ -2921,27 +2973,36 @@ def apply_fusion_method(
     # ---- Branch 10: cca ----
     elif method == "cca":
         try:
-            n_comp = min(10, Xtr_t.shape[1], Xtr_a.shape[1], Xtr_t.shape[0] - 1)
+            # FIX-SCALER: standardise per modality first (CCA is invariant
+            # to per-column scaling in its objective, so weights applied
+            # before CCA would be absorbed). Apply per-modality weights
+            # AFTER CCA so the downstream Ridge/Logistic sees weighted
+            # components — the weights then have a real effect.
+            st = StandardScaler().fit(Xtr_t)
+            sa = StandardScaler().fit(Xtr_a)
+            Xtr_t_n = st.transform(Xtr_t)
+            Xva_t_n = st.transform(Xva_t)
+            Xtr_a_n = sa.transform(Xtr_a)
+            Xva_a_n = sa.transform(Xva_a)
+
+            n_comp = min(10, Xtr_t_n.shape[1], Xtr_a_n.shape[1],
+                         Xtr_t_n.shape[0] - 1)
             if n_comp > 1:
                 try:
                     cca = CCA(n_components=n_comp, random_state=args.seed)
                 except TypeError:
                     cca = CCA(n_components=n_comp)
-                Xtr_t_cca, Xtr_a_cca = cca.fit_transform(
-                    text_weight * Xtr_t, audio_weight * Xtr_a)
-                Xva_t_cca, Xva_a_cca = cca.transform(
-                    text_weight * Xva_t, audio_weight * Xva_a)
-                Xtr_fused = np.hstack([Xtr_t_cca, Xtr_a_cca])
-                Xva_fused = np.hstack([Xva_t_cca, Xva_a_cca])
+                Xtr_t_cca, Xtr_a_cca = cca.fit_transform(Xtr_t_n, Xtr_a_n)
+                Xva_t_cca, Xva_a_cca = cca.transform(Xva_t_n, Xva_a_n)
+                Xtr_scaled = np.hstack([text_weight * Xtr_t_cca,
+                                        audio_weight * Xtr_a_cca])
+                Xva_scaled = np.hstack([text_weight * Xva_t_cca,
+                                        audio_weight * Xva_a_cca])
             else:
-                Xtr_fused = np.hstack([text_weight * Xtr_t,
-                                        audio_weight * Xtr_a])
-                Xva_fused = np.hstack([text_weight * Xva_t,
-                                        audio_weight * Xva_a])
-
-            scaler = StandardScaler()
-            Xtr_scaled = scaler.fit_transform(Xtr_fused)
-            Xva_scaled = scaler.transform(Xva_fused)
+                Xtr_scaled = np.hstack([text_weight * Xtr_t_n,
+                                        audio_weight * Xtr_a_n])
+                Xva_scaled = np.hstack([text_weight * Xva_t_n,
+                                        audio_weight * Xva_a_n])
 
             if is_classification:
                 clf = LogisticRegression(random_state=args.seed, max_iter=1000)
@@ -3044,21 +3105,31 @@ def apply_fusion_method(
                     output = self.output(fused)
                     return output.squeeze(1)
 
-            scaler = StandardScaler()
-            Xtr_t_scaled = scaler.fit_transform(text_weight * Xtr_t_pca)
-            Xtr_a_scaled = scaler.fit_transform(audio_weight * Xtr_a_pca)
-            Xva_t_scaled = scaler.transform(text_weight * Xva_t_pca)
-            Xva_a_scaled = scaler.transform(audio_weight * Xva_a_pca)
+            # FIX-SCALER: separate scalers per modality. The original
+            # reused one `scaler` for both modalities and then applied
+            # audio statistics to validation text (silent garbage input).
+            scaler_t = StandardScaler()
+            scaler_a = StandardScaler()
+            Xtr_t_s = scaler_t.fit_transform(Xtr_t_pca)
+            Xva_t_s = scaler_t.transform(Xva_t_pca)
+            Xtr_a_s = scaler_a.fit_transform(Xtr_a_pca)
+            Xva_a_s = scaler_a.transform(Xva_a_pca)
 
-            Xtr_t_torch = torch.FloatTensor(Xtr_t_scaled)
-            Xtr_a_torch = torch.FloatTensor(Xtr_a_scaled)
-            Xva_t_torch = torch.FloatTensor(Xva_t_scaled)
-            Xva_a_torch = torch.FloatTensor(Xva_a_scaled)
+            # Apply weights AFTER scaling so they survive into the net.
+            Xtr_t_s = text_weight * Xtr_t_s
+            Xva_t_s = text_weight * Xva_t_s
+            Xtr_a_s = audio_weight * Xtr_a_s
+            Xva_a_s = audio_weight * Xva_a_s
+
+            Xtr_t_torch = torch.FloatTensor(Xtr_t_s)
+            Xtr_a_torch = torch.FloatTensor(Xtr_a_s)
+            Xva_t_torch = torch.FloatTensor(Xva_t_s)
+            Xva_a_torch = torch.FloatTensor(Xva_a_s)
             ytr_torch = (torch.FloatTensor(ytr) if not is_classification
                          else torch.LongTensor(ytr))
 
             model = CrossAttention(
-                Xtr_t_scaled.shape[1], Xtr_a_scaled.shape[1], 128, 4)
+                Xtr_t_s.shape[1], Xtr_a_s.shape[1], 128, 4)
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
             criterion = (nn.CrossEntropyLoss() if is_classification
                          else nn.MSELoss())
@@ -3148,21 +3219,29 @@ def apply_fusion_method(
                     z = F.relu(self.fusion(b))
                     return self.output(z).squeeze(1)
 
-            scaler = StandardScaler()
-            Xtr_t_scaled = scaler.fit_transform(text_weight * Xtr_t_pca)
-            Xtr_a_scaled = scaler.fit_transform(audio_weight * Xtr_a_pca)
-            Xva_t_scaled = scaler.transform(text_weight * Xva_t_pca)
-            Xva_a_scaled = scaler.transform(audio_weight * Xva_a_pca)
+            # FIX-SCALER: separate scalers per modality (same bug as
+            # cross_attention in the original code).
+            scaler_t = StandardScaler()
+            scaler_a = StandardScaler()
+            Xtr_t_s = scaler_t.fit_transform(Xtr_t_pca)
+            Xva_t_s = scaler_t.transform(Xva_t_pca)
+            Xtr_a_s = scaler_a.fit_transform(Xtr_a_pca)
+            Xva_a_s = scaler_a.transform(Xva_a_pca)
 
-            Xtr_t_torch = torch.FloatTensor(Xtr_t_scaled)
-            Xtr_a_torch = torch.FloatTensor(Xtr_a_scaled)
-            Xva_t_torch = torch.FloatTensor(Xva_t_scaled)
-            Xva_a_torch = torch.FloatTensor(Xva_a_scaled)
+            Xtr_t_s = text_weight * Xtr_t_s
+            Xva_t_s = text_weight * Xva_t_s
+            Xtr_a_s = audio_weight * Xtr_a_s
+            Xva_a_s = audio_weight * Xva_a_s
+
+            Xtr_t_torch = torch.FloatTensor(Xtr_t_s)
+            Xtr_a_torch = torch.FloatTensor(Xtr_a_s)
+            Xva_t_torch = torch.FloatTensor(Xva_t_s)
+            Xva_a_torch = torch.FloatTensor(Xva_a_s)
             ytr_torch = (torch.FloatTensor(ytr) if not is_classification
                          else torch.LongTensor(ytr))
 
-            model = BilinearFusion(Xtr_t_scaled.shape[1],
-                                    Xtr_a_scaled.shape[1], 128)
+            model = BilinearFusion(Xtr_t_s.shape[1],
+                                    Xtr_a_s.shape[1], 128)
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
             criterion = (nn.CrossEntropyLoss() if is_classification
                          else nn.MSELoss())
@@ -3204,10 +3283,9 @@ def apply_fusion_method(
             pred = np.round(pred).astype(int)
         proba = None
 
-    # FIX #13: no clip here.  Predictions stay in NORMALISED space
+    # FIX #13: no clip here. Predictions stay in NORMALISED space
     # (or are integer labels for classification).
     return pred, proba, best_th
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # END OF BLOCK 4 / 5
