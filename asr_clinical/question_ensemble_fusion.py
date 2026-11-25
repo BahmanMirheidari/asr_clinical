@@ -137,8 +137,14 @@ from sklearn.model_selection import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.svm import SVC, SVR
+from sklearn.svm import LinearSVC, LinearSVR
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.linear_model import (
+    LogisticRegression, Ridge, Lasso, ElasticNet
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.decomposition import PCA
@@ -889,44 +895,55 @@ def create_linear_model(task, args):
 
 
 def create_svm(task, args):
-    """Create an SVM model."""
+    """Create a linear SVM model."""
+
     if task == "classification":
-        base_model = SVC(
-            kernel=getattr(args, 'svm_kernel', 'rbf'),
-            C=getattr(args, 'svm_C', 1.0),
-            gamma=getattr(args, 'svm_gamma', 'scale'),
-            probability=True, class_weight="balanced",
+        base_model = LinearSVC(
+            C=getattr(args, "svm_C", 0.5),
+            class_weight="balanced",
+            max_iter=10000,
             random_state=args.seed,
         )
         return create_balanced_pipeline(base_model, args)
-    else:
-        return Pipeline([
-            ("to_float", FunctionTransformer(to_float, validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", SVR(
-                kernel=getattr(args, 'svm_kernel', 'rbf'),
-                C=getattr(args, 'svm_C', 1.0),
-                epsilon=getattr(args, 'svm_epsilon', 0.1),
-            )),
-        ])
+
+    return Pipeline([
+        ("to_float", FunctionTransformer(to_float, validate=False)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", LinearSVR(
+            C=getattr(args, "svm_C", 0.5),
+            epsilon=getattr(args, "svm_epsilon", 0.1),
+            max_iter=10000,
+            random_state=args.seed,
+        )),
+    ])
 
 
 def create_knn(task, args):
     """Create a KNN model."""
+
+    n_neighbors = getattr(args, "knn_neighbors", 5)
+
     if task == "classification":
         base_model = KNeighborsClassifier(
-            n_neighbors=getattr(args, 'knn_neighbors', 5), weights='distance')
+            n_neighbors=n_neighbors,
+            weights="distance",
+            metric="minkowski",
+            p=2,
+        )
         return create_balanced_pipeline(base_model, args)
-    else:
-        return Pipeline([
-            ("to_float", FunctionTransformer(to_float, validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", KNeighborsRegressor(
-                n_neighbors=getattr(args, 'knn_neighbors', 5),
-                weights='distance')),
-        ])
+
+    return Pipeline([
+        ("to_float", FunctionTransformer(to_float, validate=False)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", KNeighborsRegressor(
+            n_neighbors=n_neighbors,
+            weights="distance",
+            metric="minkowski",
+            p=2,
+        )),
+    ])
 
 
 def create_random_forest(task, args):
@@ -1009,20 +1026,31 @@ def create_lasso(task, args):
 
 
 def create_elasticnet(task, args):
-    """Create an ElasticNet model."""
-    if task == "regression":
-        return Pipeline([
-            ("to_float", FunctionTransformer(to_float, validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", ElasticNet(
-                alpha=getattr(args, 'elasticnet_alpha', 1.0),
-                l1_ratio=getattr(args, 'elasticnet_l1_ratio', 0.5),
-                random_state=args.seed, max_iter=5000,
-            )),
-        ])
-    else:
-        return create_linear_model(task, args)
+    """Create ElasticNet models for classification and regression."""
+
+    if task == "classification":
+        base_model = LogisticRegression(
+            penalty="elasticnet",
+            solver="saga",
+            l1_ratio=getattr(args, "elasticnet_l1_ratio", 0.5),
+            C=getattr(args, "elasticnet_C", 1.0),
+            max_iter=10000,
+            class_weight="balanced",
+            random_state=args.seed,
+        )
+        return create_balanced_pipeline(base_model, args)
+
+    return Pipeline([
+        ("to_float", FunctionTransformer(to_float, validate=False)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", ElasticNet(
+            alpha=getattr(args, "elasticnet_alpha", 0.1),
+            l1_ratio=getattr(args, "elasticnet_l1_ratio", 0.5),
+            random_state=args.seed,
+            max_iter=10000,
+        )),
+    ])
 
 
 def create_ensemble_model(task, args):
@@ -1043,12 +1071,15 @@ def create_ensemble_model(task, args):
         print("Error: No valid models for ensemble. Falling back to linear model.")
         return create_linear_model(task, args)
     model_creators = {
-        'linear': create_linear_model, 'ridge': create_ridge,
-        'lasso': create_lasso, 'elasticnet': create_elasticnet,
-        'random_forest': create_random_forest, 'svm': create_svm,
-        'gradient_boosting': create_gradient_boosting,
-        'hist_gradient_boosting': create_hist_gradient_boosting,
-        'knn': create_knn,
+        "linear": create_linear_model,
+        "ridge": create_ridge,
+        "lasso": create_lasso,
+        "elasticnet": create_elasticnet,
+        "random_forest": create_random_forest,
+        "svm": create_svm,
+        "gradient_boosting": create_gradient_boosting,
+        "hist_gradient_boosting": create_hist_gradient_boosting,
+        "knn": create_knn,
     }
     estimators = []
     print(f"\nCreating ensemble for {task} task with models: {ensemble_models}")
