@@ -40,6 +40,8 @@ class TrainConfig:
     dropout_rate: float = 0.1
     y_mean: float = 0.0
     y_std:  float = 1.0
+    normalize_regression_targets: bool = False
+    force_retrain: bool = False
     text_index: int = -1
 
 
