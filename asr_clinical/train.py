@@ -120,8 +120,11 @@ def train_one_fold(
     if cfg.task == "regression":
         _ymean = float(getattr(cfg, "y_mean", 0.0))
         _ystd  = float(getattr(cfg, "y_std", 1.0))
-        # Heuristic: raw-scale ECAS has |mean| ≈ 110; normalised has |mean| ≈ 0
-        if _ystd > 0 and abs(float(train_df["label"].mean())) > 5.0:
+        normalize_targets = getattr(cfg, "normalize_regression_targets", False)
+        # Preserve the legacy heuristic for callers that do not provide an
+        # explicit target-scaling policy.
+        if (normalize_targets or
+                (_ystd > 0 and abs(float(train_df["label"].mean())) > 5.0)):
             train_df = train_df.copy()
             val_df = val_df.copy()
             train_df["label"] = (train_df["label"] - _ymean) / _ystd
@@ -137,7 +140,8 @@ def train_one_fold(
                   f"std={train_df['label'].std():.3f})")
     # ────────────────────────────────────────────────────────────────────
 
-    cached = maybe_load_trained_fold(fold_dir, val_df, cfg, metadata)
+    cached = (None if getattr(cfg, "force_retrain", False) else
+              maybe_load_trained_fold(fold_dir, val_df, cfg, metadata))
     if cached is not None:
         return cached
 

@@ -24,7 +24,7 @@ ADVANCED METHODS (10):
 
 META-FUSION (5 strategies):
   15. Average        - Simple average of all methods
-  16. Weighted       - Weighted by validation performance
+  16. Weighted       - Weighted by cross-fitted validation performance
   17. Voting         - Majority voting across methods
   18. Confidence Selection - Select most confident prediction
   19. Stacked        - Meta-learner on all predictions
@@ -114,6 +114,7 @@ from sklearn.ensemble import (
     StackingClassifier, StackingRegressor
 )
 from sklearn.impute import SimpleImputer
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import (
     LogisticRegression, Ridge, Lasso, ElasticNet
 )
@@ -137,8 +138,14 @@ from sklearn.model_selection import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.svm import SVC, SVR
+from sklearn.svm import LinearSVC, LinearSVR
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.linear_model import (
+    LogisticRegression, Ridge, Lasso, ElasticNet
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.decomposition import PCA
@@ -217,6 +224,23 @@ def set_y_stats(mean: float, std: float) -> None:
                 "normalized": True}
     print(f"  [y-scale] normalised target: mean={_Y_STATS['mean']:.4f}, "
           f"std={_Y_STATS['std']:.4f}")
+
+
+def _target_stats(y) -> Tuple[float, float]:
+    values = np.asarray(y, dtype=float).ravel()
+    mean = float(np.mean(values))
+    std = float(np.std(values))
+    return mean, std if std > 1e-9 else 1.0
+
+
+def _denorm_with_stats(arr, mean: float, std: float):
+    return np.asarray(arr, dtype=float) * float(std) + float(mean)
+
+
+def _configure_regression_train_options(cfg, args):
+    cfg.normalize_regression_targets = args.task == "regression"
+    cfg.force_retrain = bool(getattr(args, "force_embeddings", False))
+    return cfg
 
 
 def _clip_regression(arr):
@@ -730,17 +754,16 @@ class QuantizedPredictionModel(BaseEstimator, RegressorMixin):
         unique, counts = np.unique(y_idx, return_counts=True)
         keep = unique[counts >= 2]
         if len(keep) < 2:
-            self.single_value_ = float(centres[unique[0]])
+            self.single_value_ = float(np.mean(y))
             self.centres_ = centres
             self.kept_centres_ = centres
             self.clf_ = None
             return self
 
-        mask = np.isin(y_idx, keep)
-        X_f = Xs[mask]
-        y_f = y_idx[mask]
+        y_f = keep[np.argmin(np.abs(y_idx[:, None] - keep[None, :]), axis=1)]
         self.class_map_ = {int(old): int(new) for new, old in enumerate(keep)}
-        y_remapped = np.array([self.class_map_[int(v)] for v in y_f], dtype=int)
+        y_remapped = np.array(
+            [self.class_map_[int(v)] for v in y_f], dtype=int)
         self.centres_ = centres
         self.kept_centres_ = centres[keep]
 
@@ -755,7 +778,7 @@ class QuantizedPredictionModel(BaseEstimator, RegressorMixin):
             _lr_kwargs["multi_class"] = "multinomial"
         self.clf_ = LogisticRegression(**_lr_kwargs)
 
-        self.clf_.fit(X_f, y_remapped)
+        self.clf_.fit(Xs, y_remapped)
         return self
 
     def predict_proba(self, X):
@@ -889,44 +912,58 @@ def create_linear_model(task, args):
 
 
 def create_svm(task, args):
-    """Create an SVM model."""
+    """Create a linear SVM model with calibrated classification probabilities."""
+
     if task == "classification":
-        base_model = SVC(
-            kernel=getattr(args, 'svm_kernel', 'rbf'),
-            C=getattr(args, 'svm_C', 1.0),
-            gamma=getattr(args, 'svm_gamma', 'scale'),
-            probability=True, class_weight="balanced",
+        base_model = LinearSVC(
+            C=getattr(args, "svm_C", 0.5),
+            class_weight="balanced",
+            max_iter=10000,
             random_state=args.seed,
         )
-        return create_balanced_pipeline(base_model, args)
-    else:
-        return Pipeline([
-            ("to_float", FunctionTransformer(to_float, validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", SVR(
-                kernel=getattr(args, 'svm_kernel', 'rbf'),
-                C=getattr(args, 'svm_C', 1.0),
-                epsilon=getattr(args, 'svm_epsilon', 0.1),
-            )),
-        ])
+        balanced_model = create_balanced_pipeline(base_model, args)
+        return CalibratedClassifierCV(
+            estimator=balanced_model, method="sigmoid", cv=3,
+        )
+
+    return Pipeline([
+        ("to_float", FunctionTransformer(to_float, validate=False)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", LinearSVR(
+            C=getattr(args, "svm_C", 0.5),
+            epsilon=getattr(args, "svm_epsilon", 0.1),
+            max_iter=10000,
+            random_state=args.seed,
+        )),
+    ])
 
 
 def create_knn(task, args):
     """Create a KNN model."""
+
+    n_neighbors = getattr(args, "knn_neighbors", 5)
+
     if task == "classification":
         base_model = KNeighborsClassifier(
-            n_neighbors=getattr(args, 'knn_neighbors', 5), weights='distance')
+            n_neighbors=n_neighbors,
+            weights="distance",
+            metric="minkowski",
+            p=2,
+        )
         return create_balanced_pipeline(base_model, args)
-    else:
-        return Pipeline([
-            ("to_float", FunctionTransformer(to_float, validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", KNeighborsRegressor(
-                n_neighbors=getattr(args, 'knn_neighbors', 5),
-                weights='distance')),
-        ])
+
+    return Pipeline([
+        ("to_float", FunctionTransformer(to_float, validate=False)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", KNeighborsRegressor(
+            n_neighbors=n_neighbors,
+            weights="distance",
+            metric="minkowski",
+            p=2,
+        )),
+    ])
 
 
 def create_random_forest(task, args):
@@ -1009,20 +1046,31 @@ def create_lasso(task, args):
 
 
 def create_elasticnet(task, args):
-    """Create an ElasticNet model."""
-    if task == "regression":
-        return Pipeline([
-            ("to_float", FunctionTransformer(to_float, validate=False)),
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scaler", StandardScaler()),
-            ("model", ElasticNet(
-                alpha=getattr(args, 'elasticnet_alpha', 1.0),
-                l1_ratio=getattr(args, 'elasticnet_l1_ratio', 0.5),
-                random_state=args.seed, max_iter=5000,
-            )),
-        ])
-    else:
-        return create_linear_model(task, args)
+    """Create ElasticNet models for classification and regression."""
+
+    if task == "classification":
+        base_model = LogisticRegression(
+            penalty="elasticnet",
+            solver="saga",
+            l1_ratio=getattr(args, "elasticnet_l1_ratio", 0.5),
+            C=getattr(args, "elasticnet_C", 1.0),
+            max_iter=10000,
+            class_weight="balanced",
+            random_state=args.seed,
+        )
+        return create_balanced_pipeline(base_model, args)
+
+    return Pipeline([
+        ("to_float", FunctionTransformer(to_float, validate=False)),
+        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("scaler", StandardScaler()),
+        ("model", ElasticNet(
+            alpha=getattr(args, "elasticnet_alpha", 0.1),
+            l1_ratio=getattr(args, "elasticnet_l1_ratio", 0.5),
+            random_state=args.seed,
+            max_iter=10000,
+        )),
+    ])
 
 
 def create_ensemble_model(task, args):
@@ -1043,12 +1091,15 @@ def create_ensemble_model(task, args):
         print("Error: No valid models for ensemble. Falling back to linear model.")
         return create_linear_model(task, args)
     model_creators = {
-        'linear': create_linear_model, 'ridge': create_ridge,
-        'lasso': create_lasso, 'elasticnet': create_elasticnet,
-        'random_forest': create_random_forest, 'svm': create_svm,
-        'gradient_boosting': create_gradient_boosting,
-        'hist_gradient_boosting': create_hist_gradient_boosting,
-        'knn': create_knn,
+        "linear": create_linear_model,
+        "ridge": create_ridge,
+        "lasso": create_lasso,
+        "elasticnet": create_elasticnet,
+        "random_forest": create_random_forest,
+        "svm": create_svm,
+        "gradient_boosting": create_gradient_boosting,
+        "hist_gradient_boosting": create_hist_gradient_boosting,
+        "knn": create_knn,
     }
     estimators = []
     print(f"\nCreating ensemble for {task} task with models: {ensemble_models}")
@@ -1690,6 +1741,10 @@ def objective_function_all_questions(
                 temp_out = (Path(args.output_dir) / "temp_hpo_optuna" /
                             f"trial{trial.number}_fold{fold_idx}_{question}")
                 try:
+                    if args.task == "regression":
+                        y_mean, y_std = _target_stats(q_train["label"].values)
+                    else:
+                        y_mean, y_std = _Y_STATS["mean"], _Y_STATS["std"]
                     temp_cfg = TrainConfig(
                         asr_file=args.asr_file, demo_file=args.demo_file,
                         target_column=args.target_column, task=args.task,
@@ -1715,9 +1770,10 @@ def objective_function_all_questions(
                                       else params["focal_gamma"]),
                         filter_questions=[question],
                         min_text_chars=args.min_text_chars,
-                        y_mean=float(_Y_STATS["mean"]),
-                        y_std=float(_Y_STATS["std"]),
+                        y_mean=y_mean,
+                        y_std=y_std,
                     )
+                    _configure_regression_train_options(temp_cfg, args)
                     metrics = _train_and_evaluate_fast(
                         q_train, q_val, temp_cfg, metadata)
                     if metrics is not None:
@@ -1813,7 +1869,8 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig,
                     "accuracy": accuracy_score(labels, preds),
                 }
             else:
-                preds_d = _denorm(preds)   # FIX #11
+                preds_d = _denorm_with_stats(
+                    preds, cfg.y_mean, cfg.y_std)
                 return {
                     "rmse": float(np.sqrt(mean_squared_error(labels, preds_d))),
                     "mae": float(mean_absolute_error(labels, preds_d)),
@@ -2239,7 +2296,7 @@ def make_outer_folds(df: pd.DataFrame, args):
 # =======================================================================
 
 def make_question_cfg(args, question: str, question_dir: Path,
-                      best_hparams: dict) -> TrainConfig:
+                      best_hparams: dict, train_data=None) -> TrainConfig:
     """Create TrainConfig for a specific question."""
     if best_hparams is None:
         raise ValueError("best_hparams is None in make_question_cfg")
@@ -2252,7 +2309,12 @@ def make_question_cfg(args, question: str, question_dir: Path,
     epochs_value = int(user_epochs) if user_epochs is not None \
                    else int(best_hparams["epochs"])
 
-    return TrainConfig(
+    if args.task == "regression" and train_data is not None:
+        y_mean, y_std = _target_stats(train_data["label"].values)
+    else:
+        y_mean, y_std = _Y_STATS["mean"], _Y_STATS["std"]
+
+    cfg = TrainConfig(
         asr_file=args.asr_file, demo_file=args.demo_file,
         target_column=args.target_column, task=args.task,
         output_dir=str(question_dir), model_name=args.model_name,
@@ -2272,9 +2334,10 @@ def make_question_cfg(args, question: str, question_dir: Path,
         focal_gamma=(0.0 if args.task == "regression" else args.focal_gamma),
         filter_questions=[question],
         min_text_chars=args.min_text_chars,
-        y_mean=float(_Y_STATS["mean"]),
-        y_std=float(_Y_STATS["std"]),
+        y_mean=y_mean,
+        y_std=y_std,
     )
+    return _configure_regression_train_options(cfg, args)
 
 
 def safe_question_train_and_embed(train_df, val_df, metadata, args,
@@ -2358,9 +2421,11 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
             pass
     else:
         model_dir = q_dir / "model"
-        if not (model_dir.exists() and saved_model_exists(model_dir)):
+        if (getattr(args, "force_embeddings", False)
+                or not (model_dir.exists() and saved_model_exists(model_dir))):
             print(f"    Training LM for {question}...")
-            cfg = make_question_cfg(args, question, q_dir, best_hparams)
+            cfg = make_question_cfg(
+                args, question, q_dir, best_hparams, train_data=q_train)
             train_one_fold(q_train, q_val, cfg, metadata, q_dir)
         else:
             print(f"    Reusing cached LM for {question}")
@@ -2478,7 +2543,8 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
         qdir = score_dir / q
         qdir.mkdir(parents=True, exist_ok=True)
         try:
-            cfg = make_question_cfg(args, q, qdir, best_hparams)
+            cfg = make_question_cfg(
+                args, q, qdir, best_hparams, train_data=qtr)
             train_one_fold(qtr, qva, cfg, metadata, qdir)
             model_dir = qdir / "model"
             if not saved_model_exists(model_dir):
@@ -2511,7 +2577,8 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
             y_pred = np.array(preds, dtype=float)
 
             if args.task == "regression":
-                y_pred_d = _denorm(y_pred)   # FIX #12
+                y_pred_d = _denorm_with_stats(
+                    y_pred, cfg.y_mean, cfg.y_std)
                 score = -float(np.sqrt(mean_squared_error(y_true, y_pred_d)))
                 scores[q] = score if np.isfinite(score) else -np.inf
                 print(f"  Question {q}: RMSE={-score:.4f}")
@@ -3320,6 +3387,8 @@ def load_fusion_predictions(fusion_dir: Path, method_names: List[str]) -> Dict:
                 'predictions': df['y_pred'].values,
                 'speaker_ids': (df['speaker_id'].values
                                 if 'speaker_id' in df.columns else None),
+                'fold_ids': (df['fold'].values
+                             if 'fold' in df.columns else None),
                 'y_true': (df['y_true'].values
                            if 'y_true' in df.columns else None),
                 'dataframe': df,
@@ -3611,6 +3680,19 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict,
         y_true = predictions_dict[method_names[0]]['y_true']
     y_true = np.asarray(y_true)
 
+    fold_ids = None
+    for method in method_names:
+        candidate = predictions_dict[method].get("fold_ids")
+        if candidate is None or len(candidate) != ref_len:
+            fold_ids = None
+            break
+        candidate = np.asarray(candidate)
+        if fold_ids is None:
+            fold_ids = candidate
+        elif not np.array_equal(fold_ids, candidate):
+            fold_ids = None
+            break
+
     results = {}
 
     # ---- 1) Average ----
@@ -3641,51 +3723,83 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict,
     # ---- 2) Weighted ----
     print("\n  Computing Weighted Ensemble...")
     try:
-        weights, total = {}, 0.0
-        for m in method_names:
-            if m not in metrics_dict:
-                continue
-            mm = metrics_dict[m]
-            if is_cls:
-                w = (mm.get('roc_auc') if 'roc_auc' in mm else
-                     mm.get('macro_f1') if 'macro_f1' in mm else
-                     mm.get('f1', mm.get('accuracy', 0.5)))
-            else:
-                w = (mm.get('r2') if 'r2' in mm else
-                     1.0 / (mm.get('rmse', 1.0) + 1e-10))
-            w = max(0.0, float(w) if w is not None else 0.0)
-            weights[m] = w
-            total += w
-        if total > 0:
-            for m in weights:
-                weights[m] /= total
-            if all_probas and all_probas[0] is not None:
-                wp = np.zeros_like(all_probas[0])
-                for m, p in zip(method_names, all_probas):
-                    if p is not None and m in weights:
-                        wp += weights[m] * p
-                if is_cls and wp.ndim == 1:
-                    wpred = (wp >= 0.5).astype(int)
-                else:
-                    wpred = (np.argmax(wp, axis=1) if wp.ndim == 2
-                             else (wp >= 0.5).astype(int))
-                results['weighted'] = {'predictions': wpred,
-                                        'probabilities': wp,
-                                        'weights': weights, 'y_true': y_true}
-            else:
-                wpred = np.zeros(ref_len, dtype=float)
-                for m, p in zip(method_names, all_preds):
-                    if m in weights:
-                        wpred += weights[m] * p
-                if is_cls:
-                    wpred = np.round(wpred).astype(int)
-                results['weighted'] = {'predictions': wpred,
-                                        'weights': weights, 'y_true': y_true}
-            print(f"    ✓ Weighted ensemble complete with {len(weights)} methods")
+        use_probas = is_cls and all(p is not None for p in all_probas)
+        values = all_probas if use_probas else all_preds
+
+        def _fold_weights(train_mask):
+            scores = {}
+            y_fit = y_true[train_mask]
+            for idx, method in enumerate(method_names):
+                try:
+                    if is_cls:
+                        probabilities = all_probas[idx] if use_probas else None
+                        if probabilities is not None:
+                            p_fit = probabilities[train_mask]
+                            if p_fit.ndim == 1 and len(np.unique(y_fit)) == 2:
+                                score = roc_auc_score(y_fit, p_fit)
+                            elif p_fit.ndim == 2 and len(np.unique(y_fit)) > 2:
+                                score = roc_auc_score(
+                                    y_fit, p_fit, multi_class="ovr",
+                                    average="macro")
+                            else:
+                                score = f1_score(
+                                    y_fit, all_preds[idx][train_mask],
+                                    average="macro", zero_division=0)
+                        else:
+                            score = f1_score(
+                                y_fit, all_preds[idx][train_mask],
+                                average="macro", zero_division=0)
+                    else:
+                        score = r2_score(y_fit, all_preds[idx][train_mask])
+                    scores[method] = max(
+                        0.0, float(score)) if np.isfinite(score) else 0.0
+                except (ValueError, IndexError):
+                    scores[method] = 0.0
+
+            total = sum(scores.values())
+            if total <= 0.0:
+                return {method: 1.0 / len(method_names)
+                        for method in method_names}
+            return {method: score / total
+                    for method, score in scores.items()}
+
+        unique_folds = np.unique(fold_ids) if fold_ids is not None else []
+        if len(unique_folds) > 1:
+            fold_weights = {
+                fold: _fold_weights(fold_ids != fold)
+                for fold in unique_folds
+            }
         else:
-            print("    ⚠️ No valid weights, falling back to average")
-            if 'average' in results:
-                results['weighted'] = {**results['average']}
+            fold_weights = {None: {
+                method: 1.0 / len(method_names) for method in method_names
+            }}
+
+        weighted_values = np.zeros_like(values[0], dtype=float)
+        for fold, weights in fold_weights.items():
+            row_mask = (np.ones(ref_len, dtype=bool) if fold is None
+                        else fold_ids == fold)
+            for idx, method in enumerate(method_names):
+                weighted_values[row_mask] += (
+                    weights[method] * values[idx][row_mask])
+
+        if is_cls and weighted_values.ndim == 1:
+            weighted_pred = (weighted_values >= 0.5).astype(int)
+        elif is_cls:
+            weighted_pred = np.argmax(weighted_values, axis=1)
+        else:
+            weighted_pred = weighted_values
+
+        displayed_weights = (fold_weights[None] if None in fold_weights
+                             else {str(k): v for k, v in fold_weights.items()})
+        results['weighted'] = {
+            'predictions': weighted_pred,
+            'weights': displayed_weights,
+            'y_true': y_true,
+        }
+        if use_probas:
+            results['weighted']['probabilities'] = weighted_values
+        print(f"    ✓ Weighted ensemble complete with "
+              f"{len(method_names)} methods")
     except Exception as e:
         print(f"    ⚠️ Weighted ensemble failed: {e}")
         traceback.print_exc()
@@ -3848,8 +3962,13 @@ def run_meta_fusion(out_dir: Path, args):
     fusion_dir = out_dir / 'fusion_results' / 'leakage_safe_5fold'
     meta_dir = out_dir / 'fusion_results' / 'meta_fusion'
     meta_file = meta_dir / 'meta_fusion_metrics.json'
+    meta_version_file = meta_dir / 'meta_fusion_version.txt'
+    meta_version = "cross_fitted_weights_v1"
 
     force = getattr(args, 'force_recompute', False)
+    if (not meta_version_file.exists()
+            or meta_version_file.read_text().strip() != meta_version):
+        force = True
     if meta_file.exists() and not force:
         meta_mtime = meta_file.stat().st_mtime
         newest_input = 0.0
@@ -3931,6 +4050,7 @@ def run_meta_fusion(out_dir: Path, args):
 
     with open(meta_file, 'w') as f:
         json.dump(convert_to_serializable(meta_metrics), f, indent=2)
+    meta_version_file.write_text(meta_version)
     print(f"\n✓ Combined metrics saved to {meta_file}")
 
     visualize_meta_fusion_metrics(meta_dir)
@@ -4033,13 +4153,20 @@ def _hpo_cache_path(out_dir: Path) -> Path:
     return out_dir / 'best_hparams.json'
 
 
-def _load_hpo_params_from_cache(out_dir: Path) -> Optional[dict]:
+def _load_hpo_params_from_cache(
+    out_dir: Path, cache_version: Optional[str] = None,
+) -> Optional[dict]:
     p = _hpo_cache_path(out_dir)
     if not p.exists():
         return None
     try:
         with open(p) as f:
             data = json.load(f)
+        if (cache_version is not None
+                and data.get("_cache_version") != cache_version):
+            print("  ⚠️ Cached HPO parameters use an outdated target scale.")
+            return None
+        data.pop("_cache_version", None)
         print(f"  ✓ Loaded cached HPO params from {p}")
         return data
     except Exception as e:
@@ -4047,10 +4174,16 @@ def _load_hpo_params_from_cache(out_dir: Path) -> Optional[dict]:
         return None
 
 
-def _save_hpo_params_to_cache(out_dir: Path, best_params: dict) -> None:
+def _save_hpo_params_to_cache(
+    out_dir: Path, best_params: dict,
+    cache_version: Optional[str] = None,
+) -> None:
     try:
         with open(_hpo_cache_path(out_dir), 'w') as f:
-            json.dump(convert_to_serializable(best_params), f, indent=2)
+            data = dict(best_params)
+            if cache_version is not None:
+                data["_cache_version"] = cache_version
+            json.dump(convert_to_serializable(data), f, indent=2)
         print(f"  ✓ Cached HPO params")
     except Exception as e:
         print(f"  ⚠️ Could not save HPO params: {e}")
@@ -4278,7 +4411,11 @@ def _aggregate_and_save(method, fold_records, out_dir, args,
 
     parts = []
     for rec in fold_records:
-        d = {"speaker_id": rec["speaker_ids"], "y_true": rec["y_true"]}
+        d = {
+            "speaker_id": rec["speaker_ids"],
+            "y_true": rec["y_true"],
+            "fold": rec["fold"],
+        }
         if args.task == "classification":
             d["y_pred"] = np.asarray(rec["y_pred_raw"]).astype(int)
             p = rec.get("y_proba")
@@ -4297,8 +4434,6 @@ def _aggregate_and_save(method, fold_records, out_dir, args,
 
     combined = pd.concat(parts, ignore_index=True)
 
-    if args.task == "regression":
-        combined = _denorm_df(combined, cols=("y_pred",))   # FIX #25
     combined.attrs["denormalized"] = True
 
     combined.to_csv(out_dir / f"{method}_oof_predictions.csv", index=False)
@@ -4386,6 +4521,8 @@ def run_leakage_safe_fusion(args):
         "verify_embeddings_changed": bool(getattr(
             args, "verify_embeddings_changed", False)),
     }
+    if args.task == "regression":
+        reduction_config["target_scaling"] = "fold_train_only_v1"
     config_path = fusion_dir / "embedding_pipeline_config.json"
     if config_path.exists():
         try:
@@ -4395,6 +4532,16 @@ def run_leakage_safe_fusion(args):
         if previous_config != reduction_config:
             print("  ⚠️ Embedding configuration changed; invalidating fusion cache.")
             force_recompute = True
+            if (args.task == "regression"
+                    and (previous_config or {}).get("target_scaling")
+                    != reduction_config["target_scaling"]):
+                args.force_embeddings = True
+    elif args.task == "regression":
+        if _fusion_results_complete(fusion_dir, all_methods):
+            print("  ⚠️ Regression target-scaling version is missing; "
+                  "invalidating cached models and fusion results.")
+            force_recompute = True
+        args.force_embeddings = True
     elif (reduction_config["embedding_layer"] != "-1"
           or reduction_config["embedding_pooling"] != "cls"
           or reduction_config["embedding_reduction"] != "none"
@@ -4451,7 +4598,11 @@ def run_leakage_safe_fusion(args):
     # ---- STEP 4: HPO (cached) ----
     print("\n[4/6] Checking hyperparameters...")
     force_hpo = getattr(args, 'force_hpo', False)
-    best_hparams = None if force_hpo else _load_hpo_params_from_cache(out_dir)
+    hpo_cache_version = (
+        "fold_train_target_scaling_v1"
+        if args.task == "regression" else None)
+    best_hparams = (None if force_hpo else
+                    _load_hpo_params_from_cache(out_dir, hpo_cache_version))
     if best_hparams is None:
         print("  Running Optuna HPO...")
         all_speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
@@ -4473,7 +4624,8 @@ def run_leakage_safe_fusion(args):
             ))
         best_hparams = hyperparameter_search_optuna_all_questions(
             train_df, hpo_folds, args, metadata)
-        _save_hpo_params_to_cache(out_dir, best_hparams)
+        _save_hpo_params_to_cache(
+            out_dir, best_hparams, hpo_cache_version)
     else:
         print("  ✅ Using cached HPO params (add --force-hpo to rerun)")
 
@@ -4587,6 +4739,8 @@ def run_leakage_safe_fusion(args):
         Xva_a = val_ft[audio_cols].values.astype(float)
         y_train = train_ft["y_true"].values.astype(float)
         y_val = val_ft["y_true"].values.astype(float)
+        if args.task == "regression":
+            set_y_stats(*_target_stats(y_train))
 
         # ---- TEXT predictions (pre-computed preferred) ----
         pred_text_train = pred_text_val = None
@@ -4646,12 +4800,14 @@ def run_leakage_safe_fusion(args):
                     metrics = score_meta_model(None, pred, y_val, args.task,
                                                 y_scale="original",
                                                 pred_scale="original")
+                    pred_to_save = pred
                 else:
                     metrics = score_meta_model(None, pred, y_val, args.task,
                                                 y_scale="original",
                                                 pred_scale="normalized")
+                    pred_to_save = _clip_regression(_denorm(pred))
                 rec = _save_fold_method_outputs(method, fold_idx, val_ft,
-                                                 y_val, pred, proba,
+                                                 y_val, pred_to_save, proba,
                                                  metrics, fusion_dir, args)
                 fold_records[method].append(rec)
                 if args.task == "regression":
@@ -5228,7 +5384,7 @@ Purpose: Define the primary metric for optimization and evaluation.
 
 Functions:
 
-primary_score(metrics, task): Returns macro F1 (classification) or negative RMSE (regression)
+primary_score(metrics, task): Returns macro F1 (classification) or RMSE (regression)
 
 score_meta_model(model, x, y, task): Comprehensive scoring with multiple metrics
 
@@ -5397,7 +5553,7 @@ ridge   (falls back to linear)  Ridge   Ridge regression only
 lasso   (falls back to linear)  Lasso   Lasso regression only
 elasticnet  (falls back to linear)  ElasticNet  ElasticNet regression
 random_forest   RandomForestClassifier  RandomForestRegressor   Ensemble of decision trees
-svm SVC SVR Support Vector Machine
+svm Calibrated LinearSVC LinearSVR Support Vector Machine
 hist_gradient_boosting  HistGradientBoostingClassifier  HistGradientBoostingRegressor   Fast gradient boosting
 gradient_boosting   GradientBoostingClassifier  GradientBoostingRegressor   Traditional gradient boosting
 knn KNeighborsClassifier    KNeighborsRegressor K-Nearest Neighbors
