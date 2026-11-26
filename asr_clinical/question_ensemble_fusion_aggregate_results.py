@@ -1422,6 +1422,333 @@ def diagnose_diverged_predictions(experiments: Dict, output_dir: Path,
 # =======================================================================
 #  SCATTER PLOT (DYS + NORM) — REGRESSION
 # =======================================================================
+def plot_dys_typ_scatter_clinical_vs_fusion_single(
+    df: pd.DataFrame, experiments: Dict, output_dir: Path,
+    config: ExperimentConfig, task_type: str = 'regression',
+    dys_ids: List[str] = None, prefer_ensemble: bool = True,
+):
+    """
+    Two-panel observed-vs-predicted scatter showing BOTH the Dys and the
+    Typ (non-Dys) subgroups in each panel.
+
+      Panel 1 : Clinical-Feature-Only  (best model by mean Dys RMSE)
+      Panel 2 : Voting Ensemble (default) OR best non-baseline fusion,
+                chosen by mean Dys RMSE.
+
+    Markers
+    -------
+      ● Dys   red circles   (#E74C3C)
+      ▲ Typ   blue triangles (#3498DB)
+
+    Per panel, two coloured metric boxes:
+      top-left     Dys   →  R², RMSE, MAE, n
+      bottom-right Typ   →  R², RMSE, MAE, n
+
+    R² is the squared Pearson correlation between observed and predicted
+    (the usual "coefficient of determination" for scatter diagnostics),
+    not the linear-regression R².  It is NaN when a subgroup has < 3
+    samples with non-degenerate variance.
+    """
+    # ---------------------------------------------------------------
+    #  Guards
+    # ---------------------------------------------------------------
+    if task_type != 'regression':
+        print("Scatter plots only available for regression tasks")
+        return
+    if not dys_ids:
+        print("⚠ No Dys speaker IDs provided — cannot build subgroup scatter.")
+        return
+
+    plot_df = df[df['Task'] == 'regression'].copy()
+    if plot_df.empty:
+        print("No regression data found")
+        return
+
+    if 'subgroup_rmse' not in plot_df.columns:
+        print("⚠ 'subgroup_rmse' column not present — cannot rank candidates.")
+        return
+
+    dys_set = {str(x) for x in dys_ids}
+    models = plot_df['Model'].unique()
+
+    # ---------------------------------------------------------------
+    #  Selection helper — mean Dys RMSE for a (model, method) pair
+    # ---------------------------------------------------------------
+    def _validated_dys_rmse(model_name: str, method_key: str):
+        sub = plot_df[(plot_df['Model'] == model_name)
+                      & (plot_df['Method'] == method_key)]
+        if sub.empty or 'subgroup_rmse' not in sub.columns:
+            return None
+        vals = pd.to_numeric(sub['subgroup_rmse'],
+                             errors='coerce').dropna().values
+        if len(vals) == 0:
+            return None
+        valid = vals[np.isfinite(vals) & (vals > 1e-6)]
+        if len(valid) == 0:
+            return None
+        return float(np.mean(valid))
+
+    # ---- Panel 1: Clinical-Only ----
+    clinical_candidates = []   # (rmse, model, method)
+    for model in models:
+        for m in plot_df[plot_df['Model'] == model]['Method'].unique():
+            if is_clinical_feature_only(m):
+                r = _validated_dys_rmse(model, m)
+                if r is not None:
+                    clinical_candidates.append((r, model, m))
+
+    if clinical_candidates:
+        clinical_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, clinical_model, clinical_method = clinical_candidates[0]
+    else:
+        clinical_model = clinical_method = None
+
+    # ---- Panel 2: Voting Ensemble (default) / Best Fusion ----
+    voting_candidates = []
+    fusion_candidates = []
+    for model in models:
+        for m in plot_df[plot_df['Model'] == model]['Method'].unique():
+            ml = str(m).lower()
+            r = _validated_dys_rmse(model, m)
+            if r is None:
+                continue
+            if ml == 'ensemble_voting' or (
+                ml.startswith('ensemble_') and 'voting' in ml
+            ):
+                voting_candidates.append((r, model, m))
+            if (not is_clinical_feature_only(m)
+                    and not is_text_embedding_only(m)
+                    and not is_ensemble_method(m)):
+                fusion_candidates.append((r, model, m))
+
+    if prefer_ensemble and voting_candidates:
+        voting_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, fusion_model, fusion_method = voting_candidates[0]
+        fusion_label = 'Voting Ensemble'
+    elif fusion_candidates:
+        fusion_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, fusion_model, fusion_method = fusion_candidates[0]
+        fusion_label = 'Best Fusion'
+    elif voting_candidates:
+        voting_candidates.sort(key=lambda t: (t[0], t[1]))
+        _, fusion_model, fusion_method = voting_candidates[0]
+        fusion_label = 'Voting Ensemble'
+    else:
+        fusion_model = fusion_method = None
+        fusion_label = 'Best Fusion'
+
+    print(f"\n{'='*100}")
+    print("SCATTER PLOT — METHOD SELECTION (Regression, Dys + Typ)")
+    print(f"{'='*100}")
+    print(f"  Panel 1 (Clinical-Only) : model={clinical_model}, "
+          f"method={clinical_method}")
+    print(f"  Panel 2 ({fusion_label})  : model={fusion_model}, "
+          f"method={fusion_method}")
+    print(f"  prefer_ensemble         : {prefer_ensemble}")
+    print(f"{'='*100}\n")
+
+    # ---------------------------------------------------------------
+    #  Extract Dys and Typ (obs, pred) from a prediction file
+    # ---------------------------------------------------------------
+    def _extract_subgroups(model_name: str, method_key: str):
+        empty = {'dys': (np.array([]), np.array([])),
+                 'typ': (np.array([]), np.array([]))}
+        if model_name is None or method_key is None:
+            return empty
+
+        pred_df = load_predictions_unfiltered(experiments, model_name,
+                                              method_key)
+        if pred_df is None or pred_df.empty:
+            return empty
+
+        obs_col, pred_col, id_col, _ = _detect_prediction_columns(pred_df)
+        if obs_col is None or pred_col is None:
+            return empty
+
+        # Inject speaker IDs if the file lacks them (typical for ensembles)
+        dir_hint = None
+        pk = f'predictions_{method_key}'
+        if model_name in experiments and pk in experiments[model_name]:
+            dir_hint = experiments[model_name][pk].get('dir')
+        if id_col is None and dir_hint is not None:
+            pred_df = _inject_speaker_ids(pred_df, dir_hint)
+            obs_col, pred_col, id_col, _ = _detect_prediction_columns(pred_df)
+
+        if id_col is None:
+            return empty
+
+        ids_str = pred_df[id_col].astype(str)
+
+        def _take(mask: pd.Series):
+            sub = pred_df[mask].drop_duplicates(subset=[id_col], keep='first')
+            if sub.empty:
+                return np.array([]), np.array([])
+            o = pd.to_numeric(sub[obs_col], errors='coerce').values.astype(float)
+            p = pd.to_numeric(sub[pred_col], errors='coerce').values.astype(float)
+            m = ~(np.isnan(o) | np.isnan(p))
+            return o[m], p[m]
+
+        dys_mask = ids_str.isin(list(dys_set))
+        return {'dys': _take(dys_mask), 'typ': _take(~dys_mask)}
+
+    # ---------------------------------------------------------------
+    #  Metrics for the per-subgroup legend boxes
+    # ---------------------------------------------------------------
+    def _metrics(o: np.ndarray, p: np.ndarray):
+        n = len(o)
+        if n < 2:
+            return {'n': n, 'rmse': np.nan, 'r2': np.nan, 'mae': np.nan}
+        rmse = float(np.sqrt(np.mean((o - p) ** 2)))
+        mae  = float(np.mean(np.abs(o - p)))
+        if n > 2 and np.std(o) > 0 and np.std(p) > 0:
+            r2 = float(pearsonr(o, p)[0] ** 2)
+        else:
+            r2 = np.nan
+        return {'n': n, 'rmse': rmse, 'r2': r2, 'mae': mae}
+
+    # ---------------------------------------------------------------
+    #  Figure
+    # ---------------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    plt.rcParams.update({
+        'font.size': 16, 'axes.titlesize': 20, 'axes.labelsize': 18,
+        'xtick.labelsize': 15, 'ytick.labelsize': 15, 'legend.fontsize': 14,
+    })
+
+    panels = [
+        ('Clinical-Only', axes[0], clinical_model, clinical_method),
+        (fusion_label,    axes[1], fusion_model,   fusion_method),
+    ]
+
+    summary_rows = []
+
+    for display_name, ax, model, method in panels:
+        groups = _extract_subgroups(model, method)
+        dys_o, dys_p = groups['dys']
+        typ_o, typ_p = groups['typ']
+
+        if len(dys_o) == 0 and len(typ_o) == 0:
+            ax.text(0.5, 0.5, f'No predictions\n{display_name}',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=18)
+            ax.set_xlabel('Observed', fontsize=18)
+            ax.set_ylabel('Predicted', fontsize=18)
+            ax.set_title(f'{display_name}\n(Dys + Typ)', fontsize=20,
+                         fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            continue
+
+        dys_m = _metrics(dys_o, dys_p) if len(dys_o) > 0 else None
+        typ_m = _metrics(typ_o, typ_p) if len(typ_o) > 0 else None
+
+        # ---- Scatter both subgroups ----
+        if len(dys_o) > 0:
+            ax.scatter(dys_o, dys_p, alpha=0.75, s=150, color='#E74C3C',
+                       marker='o', edgecolors='black', linewidths=1.4,
+                       label='Dys')
+        if len(typ_o) > 0:
+            ax.scatter(typ_o, typ_p, alpha=0.75, s=150, color='#3498DB',
+                       marker='^', edgecolors='black', linewidths=1.4,
+                       label='Typ (non-Dys)')
+
+        # ---- Diagonal y = x, symmetric limits ----
+        all_o = np.concatenate([a for a in (dys_o, typ_o) if len(a) > 0])
+        all_p = np.concatenate([a for a in (dys_p, typ_p) if len(a) > 0])
+        dmin = float(np.nanmin([all_o.min(), all_p.min()]))
+        dmax = float(np.nanmax([all_o.max(), all_p.max()]))
+        rng = dmax - dmin if dmax > dmin else 1.0
+        pad = 0.05 * rng
+        lo, hi = dmin - pad, dmax + pad
+        ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.6, linewidth=3)
+
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlabel('Observed', fontsize=18)
+        ax.set_ylabel('Predicted', fontsize=18)
+        ax.set_title(f'{display_name}\n(Dys + Typ)', fontsize=20,
+                     fontweight='bold')
+        ax.grid(True, alpha=0.3) 
+        ax.legend(
+            loc='upper right',
+            bbox_to_anchor=(0.98, 0.98),   # slight inset from the axes edge
+            fontsize=13,
+            frameon=True,
+            framealpha=0.9,
+            borderaxespad=0.6,
+            handletextpad=0.5,
+        )
+
+        # ---- Dys metric box: top-left, red border ----
+        if dys_m is not None:
+            ax.text(
+                0.04, 0.96,
+                f"Dys\n"
+                f"$R^2$ = {dys_m['r2']:.3f}\n"
+                f"RMSE = {dys_m['rmse']:.3f}\n"
+                f"MAE  = {dys_m['mae']:.3f}\n"
+                f"n    = {dys_m['n']}",
+                transform=ax.transAxes, ha='left', va='top',
+                fontsize=13, family='monospace',
+                bbox=dict(boxstyle='round,pad=0.5',
+                          facecolor='#FDEDEC',
+                          edgecolor='#E74C3C',
+                          alpha=0.9),
+            )
+
+        # ---- Typ metric box: bottom-right, blue border ----
+        if typ_m is not None:
+            ax.text(
+                0.96, 0.04,
+                f"Typ\n"
+                f"$R^2$ = {typ_m['r2']:.3f}\n"
+                f"RMSE = {typ_m['rmse']:.3f}\n"
+                f"MAE  = {typ_m['mae']:.3f}\n"
+                f"n    = {typ_m['n']}",
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=13, family='monospace',
+                bbox=dict(boxstyle='round,pad=0.5',
+                          facecolor='#EBF5FB',
+                          edgecolor='#3498DB',
+                          alpha=0.9),
+            )
+
+        # ---- Collect summary ----
+        for sg_name, sg_m in (('Dys', dys_m), ('Typ', typ_m)):
+            if sg_m is None:
+                continue
+            summary_rows.append({
+                'Panel':         display_name,
+                'Subgroup':      sg_name,
+                'Model':         get_ultra_short_model_name(model, config),
+                'Model_Full':    model,
+                'Method_Used':   get_method_display_name(method, config),
+                'Method_Key':    method,
+                'Is_Ensemble':   is_ensemble_method(method),
+                'R²':            sg_m['r2'],
+                'RMSE':          sg_m['rmse'],
+                'MAE':           sg_m['mae'],
+                'N':             sg_m['n'],
+            })
+
+    plt.tight_layout()
+    out_png = output_dir / 'dys_typ_scatter_clinical_vs_fusion.png'
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"\n✓ Dys+Typ scatter plot saved to: {out_png}")
+
+    plt.rcParams.update({
+        'font.size': 11, 'axes.titlesize': 12, 'axes.labelsize': 11,
+        'xtick.labelsize': 10, 'ytick.labelsize': 10, 'legend.fontsize': 10,
+    })
+
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        out_csv = output_dir / 'dys_typ_scatter_clinical_vs_fusion_summary.csv'
+        summary_df.to_csv(out_csv, index=False)
+        print(f"✓ Dys+Typ scatter summary saved to: {out_csv}")
+
+    return summary_rows
 
 def plot_dys_scatter_audio_text_fusion_single(
     df: pd.DataFrame, experiments: Dict, output_dir: Path,
@@ -3317,6 +3644,12 @@ def main():
         plot_dys_scatter_audio_text_fusion_single(scatter_df, experiments,
                                                   output_dir, config,
                                                   'regression', dys_ids)
+        plot_dys_typ_scatter_clinical_vs_fusion_single(
+            df, experiments, output_dir, config,
+            task_type='regression',
+            dys_ids=dys_ids,
+            prefer_ensemble=True,   # False → force "best fusion" instead of voting
+        )
 
     if not args.no_plots:
         print(f"\n{'='*60}\nGENERATING FIGURES\n{'='*60}")
@@ -3402,6 +3735,11 @@ for t in classification regression;do rm -rf outputs-ensemble-egemaps-aggregate-
 n=outputs-ens-classification-top40-top3;for t in classification;do rm -rf ${n}-${t};mkdir ${n}-${t};python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir ${n} --output-dir ${n}-${t} --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee ${n}-${t}/log.txt;done
 
 
+n=/mnt/parscratch/users/ac1bm/MND-expr/outputs-ens-regression-top30_ordinal-top2/asr1_filtered_auto-p-mean-e--1-ed-none
+for t in regression;do rm -rf ${n}-${t};mkdir ${n}-${t};python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir ${n} --output-dir ${n}-${t} --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee ${n}-${t}/log.txt;done
+
+n=/mnt/parscratch/users/ac1bm/MND-expr/outputs-ens-regression-top30_ordinal-top4/asr1_filtered_auto-p-mean-e--1-ed-none
+for t in regression;do rm -rf ${n}-${t};mkdir ${n}-${t};python ~/asr_clinical/question_ensemble_fusion_aggregate_results.py --input-dir ${n} --output-dir ${n}-${t} --subgroup --top-k 5 --task $t --bootstrap-iterations 10000 --verbose  --dys-ids dysarthria-list.txt --ignore-methods mlp cca dynamic ensemble_average ensemble_weighted | tee ${n}-${t}/log.txt;done
 
 
 Fifty-one people with ALS have been recruited to date; *14->15* met ECAS criteria for
