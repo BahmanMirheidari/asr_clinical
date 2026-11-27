@@ -43,6 +43,17 @@ class TrainConfig:
     normalize_regression_targets: bool = False
     force_retrain: bool = False
     text_index: int = -1
+    use_raft: bool = False
+    y_grid_size: int = 101
+    y_grid_min: float | None = None
+    y_grid_max: float | None = None
+    raft_temperature: float = 1.0
+    raft_weight: float = 1.0
+    raft_y_grid: list[float] | None = None
+    use_tract: bool = False
+    rationale_file: str | None = None
+    rationale_column: str = "rationale_final"
+    tract_generation_tokens: int = 128
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +112,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--question-importance", action="store_true")
     parser.add_argument("--min-text-chars", type=int, default=1)
+    parser.add_argument("--use-raft", action="store_true",
+                        help="Use regression-aware expected-value loss on a target grid")
+    parser.add_argument("--y-grid-size", type=int, default=101)
+    parser.add_argument("--y-grid-min", type=float, default=None)
+    parser.add_argument("--y-grid-max", type=float, default=None)
+    parser.add_argument("--raft-temperature", type=float, default=1.0)
+    parser.add_argument("--raft-weight", type=float, default=1.0)
+    parser.add_argument("--use-tract", action="store_true",
+                        help="Use two-stage causal-LM CoT + RAFT regression")
+    parser.add_argument("--rationale-file", default=None,
+                        help="Reviewed rationale CSV keyed by utterance_id")
+    parser.add_argument("--rationale-column", default="rationale_final")
+    parser.add_argument("--tract-generation-tokens", type=int, default=128)
     return parser
 
 

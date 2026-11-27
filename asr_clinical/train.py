@@ -23,7 +23,7 @@ from .data import (
     read_splits_folder,
 )
 from .importance import question_ablation_importance
-from .losses import make_loss
+from .losses import build_y_grid, decode_expected_value, make_loss, raft_expected_value_loss
 from .metrics import score_predictions
 from .model import TextDataset, load_model, load_tokenizer
 
@@ -75,6 +75,9 @@ def saved_model_exists(model_dir: Path) -> bool:
 
 
 def load_saved_model(model_dir: Path, device):
+    if (model_dir / "tract_config.json").exists():
+        from .tract import load_tract_model
+        return load_tract_model(model_dir, device)
     tokenizer = load_tokenizer(str(model_dir))
     model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
     model.eval()
@@ -92,10 +95,27 @@ def maybe_load_trained_fold(
     metrics_path = fold_dir / "metrics.json"
     if not saved_model_exists(model_dir):
         return None
+    if cfg.use_tract and not (model_dir / "tract_config.json").exists():
+        return None
+    if cfg.task == "regression" and cfg.use_raft and not (model_dir / "raft_config.json").exists():
+        # A scalar-head checkpoint cannot satisfy a requested RAFT run.
+        return None
 
     print(f"skipping existing model in {fold_dir}")
     device = choose_device()
-    model, tokenizer = load_saved_model(model_dir, device)
+    if cfg.use_tract:
+        from .tract import load_tract_model
+        model, tokenizer = load_tract_model(model_dir, device)
+        cfg.raft_y_grid = model.tract_y_grid
+        cfg.raft_temperature = model.tract_temperature
+    else:
+        model, tokenizer = load_saved_model(model_dir, device)
+    raft_path = model_dir / "raft_config.json"
+    if cfg.task == "regression" and raft_path.exists():
+        raft_cfg = json.loads(raft_path.read_text(encoding="utf-8"))
+        cfg.use_raft = True
+        cfg.raft_y_grid = raft_cfg["y_grid"]
+        cfg.raft_temperature = float(raft_cfg.get("temperature", cfg.raft_temperature))
     if pred_path.exists() and metrics_path.exists():
         pred_df = pd.read_csv(pred_path)
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -145,10 +165,26 @@ def train_one_fold(
     if cached is not None:
         return cached
 
+    if cfg.use_tract:
+        if cfg.task != "regression":
+            raise ValueError("--use-tract is regression-only")
+        if "rationale" not in train_df.columns:
+            raise ValueError("--use-tract requires --rationale-file with reviewed rationales")
+        return train_one_tract_fold(train_df, val_df, cfg, metadata, fold_dir)
+
     device = choose_device()
     tokenizer = load_tokenizer(cfg.model_name)
     num_labels = len(metadata["labels"]) if cfg.task == "classification" else 1
-    model = load_model(cfg.model_name, cfg.task, cfg.dropout_rate, num_labels, metadata).to(device)
+    if cfg.task == "regression" and cfg.use_raft:
+        cfg.raft_y_grid = build_y_grid(
+            train_df["label"].to_numpy(), cfg.y_grid_size,
+            cfg.y_grid_min, cfg.y_grid_max).tolist()
+        num_labels = len(cfg.raft_y_grid)
+    model = load_model(cfg.model_name, cfg.task, cfg.dropout_rate, num_labels,
+                       metadata, use_raft=(cfg.task == "regression" and cfg.use_raft)).to(device)
+    if cfg.task == "regression" and cfg.use_raft:
+        model.config.raft_y_grid = cfg.raft_y_grid
+        model.config.raft_temperature = cfg.raft_temperature
 
     train_loader = make_loader(train_df, tokenizer, cfg, shuffle=True)
     val_loader = make_loader(val_df, tokenizer, cfg, shuffle=False)
@@ -182,8 +218,14 @@ def train_one_fold(
             labels = batch.pop("labels")
             optimizer.zero_grad(set_to_none=True)
             outputs = model(**batch)
-            logits = outputs.logits.squeeze(-1) if cfg.task == "regression" else outputs.logits
-            loss = loss_fn(logits, labels)
+            logits = outputs.logits if (cfg.task == "regression" and cfg.use_raft) else (
+                outputs.logits.squeeze(-1) if cfg.task == "regression" else outputs.logits)
+            if cfg.task == "regression" and cfg.use_raft:
+                loss = cfg.raft_weight * raft_expected_value_loss(
+                    logits, labels, torch.tensor(cfg.raft_y_grid, device=device),
+                    cfg.raft_temperature)
+            else:
+                loss = loss_fn(logits, labels)
             loss.backward()
             # NEW: Use cfg.gradient_clip_val instead of hardcoded 1.0
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip_val)
@@ -225,15 +267,81 @@ def train_one_fold(
     fold_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(fold_dir / "model")
     tokenizer.save_pretrained(fold_dir / "model")
+    if cfg.task == "regression" and cfg.use_raft:
+        (fold_dir / "model" / "raft_config.json").write_text(json.dumps({
+            "y_grid": cfg.raft_y_grid,
+            "temperature": cfg.raft_temperature,
+            "weight": cfg.raft_weight,
+        }, indent=2), encoding="utf-8")
     pred_df = predict(model, tokenizer, val_df, cfg, metadata, device)
     pred_df.to_csv(fold_dir / "predictions.csv", index=False)
     metrics = score_predictions(pred_df, cfg.task, cfg.aggregate_level, metadata.get("labels"))
     (fold_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics, pred_df, model, tokenizer, device
 
+
+def train_one_tract_fold(train_df, val_df, cfg, metadata, fold_dir):
+    from .tract import fit_two_stage_tract
+
+    device = choose_device()
+    model, tokenizer, grid = fit_two_stage_tract(
+        train_df, cfg, fold_dir, device)
+    cfg.raft_y_grid = grid
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    head_state = model.tract_score_head.state_dict()
+    delattr(model, "tract_score_head")
+    model.save_pretrained(fold_dir / "model")
+    tokenizer.save_pretrained(fold_dir / "model")
+    torch.save(head_state, fold_dir / "model" / "tract_score_head.pt")
+    (fold_dir / "model" / "tract_config.json").write_text(json.dumps({
+        "y_grid": grid,
+        "temperature": cfg.raft_temperature,
+        "generation_tokens": cfg.tract_generation_tokens,
+    }, indent=2), encoding="utf-8")
+    from .tract import ExpectedScoreHead, _hidden_size
+    model.tract_score_head = ExpectedScoreHead(
+        _hidden_size(model.config), len(grid)).to(device)
+    model.tract_score_head.load_state_dict(head_state)
+    pred_df = predict(model, tokenizer, val_df, cfg, metadata, device)
+    pred_df.to_csv(fold_dir / "predictions.csv", index=False)
+    metrics = score_predictions(pred_df, cfg.task, cfg.aggregate_level,
+                                metadata.get("labels"))
+    (fold_dir / "metrics.json").write_text(json.dumps(metrics, indent=2),
+                                           encoding="utf-8")
+    return metrics, pred_df, model, tokenizer, device
+
 @torch.no_grad()
 def predict(model, tokenizer, df: pd.DataFrame, cfg: TrainConfig, metadata: dict, device):
     model.eval()
+    if cfg.use_tract:
+        from .tract import predict_tract
+        values, rationales = predict_tract(
+            model, tokenizer, df["text"].astype(str).tolist(),
+            cfg.eval_batch_size, cfg.max_length, device,
+            y_grid=cfg.raft_y_grid, temperature=cfg.raft_temperature,
+            generation_tokens=cfg.tract_generation_tokens,
+        )
+        return pd.DataFrame({
+            "utterance_id": df["utterance_id"].values,
+            "speaker_id": df["speaker_id"].values,
+            "session_id": df["session_id"].values,
+            "question_id": df["question_id"].values,
+            "y_true": df["label"].astype(float).values,
+            "y_pred": values,
+            "rationale_pred": rationales,
+        })
+    if cfg.task == "regression" and cfg.use_raft and cfg.raft_y_grid is None:
+        saved_grid = getattr(model.config, "raft_y_grid", None)
+        if saved_grid is not None:
+            cfg.raft_y_grid = saved_grid
+            cfg.raft_temperature = float(getattr(
+                model.config, "raft_temperature", cfg.raft_temperature))
+    if cfg.task == "regression" and cfg.use_raft and cfg.raft_y_grid is None:
+        raft_path = Path(getattr(model.config, "_name_or_path", "")) / "raft_config.json"
+        if raft_path.exists():
+            raft_cfg = json.loads(raft_path.read_text(encoding="utf-8"))
+            cfg.raft_y_grid = raft_cfg["y_grid"]
+            cfg.raft_temperature = float(raft_cfg.get("temperature", cfg.raft_temperature))
     loader = make_loader(df, tokenizer, cfg, shuffle=False)
     rows = []
     offset = 0
@@ -261,7 +369,14 @@ def predict(model, tokenizer, df: pd.DataFrame, cfg: TrainConfig, metadata: dict
                     row[f"prob_{label_name}"] = float(probs[i, label_idx])
                 rows.append(row)
         else:
-            values = logits.squeeze(-1).numpy()
+            if cfg.use_raft:
+                grid = cfg.raft_y_grid
+                if grid is None:
+                    raise ValueError("RAFT predictions require the saved y_grid")
+                values = decode_expected_value(
+                    logits, torch.tensor(grid), cfg.raft_temperature).numpy()
+            else:
+                values = logits.squeeze(-1).numpy()
             for i in range(batch_size):
                 rows.append(
                     {
@@ -430,6 +545,10 @@ def run_external_splits(df, cfg: TrainConfig, metadata: dict, out_dir: Path):
 
 def main():
     cfg = parse_args()
+    if cfg.use_tract and cfg.task != "regression":
+        raise ValueError("--use-tract is regression-only")
+    if cfg.use_tract and not cfg.rationale_file:
+        raise ValueError("--use-tract requires --rationale-file with reviewed rationales")
     set_seed(cfg.seed)
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -445,6 +564,8 @@ def main():
         cfg.text_mode,
         cfg.min_text_chars,
         cfg.filter_questions,
+        rationale_file=cfg.rationale_file if cfg.use_tract else None,
+        rationale_column=cfg.rationale_column,
     )
     metadata["n_examples"] = len(df)
     metadata["n_speakers"] = int(df["speaker_id"].nunique())

@@ -243,6 +243,8 @@ def load_examples(
     delimiter: str = ";",
     min_text_chars: int = 1,
     filter_questions: list[str] | None = None,
+    rationale_file: str | None = None,
+    rationale_column: str = "rationale_final",
 ) -> tuple[pd.DataFrame, dict]:
     asr = read_asr_file(asr_file,delimiter=delimiter) 
     asr["speaker_id"] = asr["speaker_id"].astype(str).str.strip()
@@ -269,6 +271,35 @@ def load_examples(
     target_speakers = _target_available_speakers(demo, target_column, task)
 
     merged = asr.merge(demo[["speaker_id", target_column]], on="speaker_id", how="left")
+    if rationale_file:
+        if text_mode != "question":
+            raise ValueError("Reviewed TRACT rationales currently require --text-mode question")
+        rationale_df = pd.read_csv(rationale_file)
+        required_rationale = {"utterance_id", rationale_column}
+        if not required_rationale.issubset(rationale_df.columns):
+            raise ValueError(
+                f"Rationale CSV must contain columns {sorted(required_rationale)}"
+            )
+        rationale_df["_utterance_key"] = (
+            rationale_df["utterance_id"].astype(str).str.strip().str.casefold()
+        )
+        if rationale_df["_utterance_key"].duplicated().any():
+            raise ValueError("Rationale CSV utterance_id values must be unique")
+        merged["_utterance_key"] = (
+            merged["utterance_id"].astype(str).str.strip().str.casefold()
+        )
+        rationale_df = rationale_df[["_utterance_key", rationale_column]].rename(
+            columns={rationale_column: "rationale"}
+        )
+        merged = merged.merge(rationale_df, on="_utterance_key", how="left",
+                              validate="one_to_one").drop(columns="_utterance_key")
+        missing_rationales = merged["rationale"].isna() | merged["rationale"].astype(str).str.strip().eq("")
+        if missing_rationales.any():
+            examples = merged.loc[missing_rationales, "utterance_id"].astype(str).head(8).tolist()
+            raise ValueError(
+                f"Missing reviewed rationales for {int(missing_rationales.sum())} rows; "
+                f"examples: {examples}"
+            )
     merged = merged[merged["text"].fillna("").str.len() >= min_text_chars].copy()
     asr_text_speakers = set(merged["speaker_id"].astype(str).unique())
     merged = merged[merged[target_column].notna()].copy()

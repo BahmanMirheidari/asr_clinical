@@ -85,6 +85,21 @@ FIXES (see # FIX markers in code):
   #38 --embedding-reduction-per-question
   #39 reducer fit on outer-fold train speakers only
   #40 reducer inserted after build_feature_table and before fusion
+
+REGRESSION-IMPROVEMENT MARKERS (this revision):
+  [R1] RAFT loss           - wired through train_one_fold and fusion CV/HPO;
+                             target grid is fit on each training fold and saved
+  [R2] Bayes-optimal decode - regression_aware_predict replaces the single
+                             forward pass in _train_and_evaluate_fast and
+                             safe_question_cv_scores (--bayes-n-samples, 1=off)
+  [R3] TRACT CoT            - two-stage causal-LM CoT + RAFT path; reviewed
+                             rationales generated locally by
+                             generate_tract_rationale_drafts.py
+  [R4] Embedding selector   - select_best_embedding_config, run on an INNER
+                             split of outer-train speakers (--select-embedding-config)
+  [R5] PLS reduction        - EmbeddingReducer(method="pls") (regression only)
+  [R6] BayesianRidge + residual gated fusion + post-hoc calibration
+                             (--calibrate-regression: leave-one-fold-out)
 """
 
 import os
@@ -150,13 +165,15 @@ from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostin
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import FunctionTransformer
-from sklearn.base import ClassifierMixin, RegressorMixin, BaseEstimator
+from sklearn.base import ClassifierMixin, RegressorMixin, BaseEstimator, clone
+import copy
+from sklearn.linear_model import BayesianRidge, LinearRegression
 from sklearn.cluster import KMeans
-from sklearn.cross_decomposition import CCA
+from sklearn.cross_decomposition import CCA, PLSRegression
 from sklearn.feature_selection import SelectKBest, f_classif, f_regression
 
 from xgboost import XGBClassifier, XGBRegressor
-from transformers import AutoModelForSequenceClassification
+from transformers import AutoModel, AutoModelForSequenceClassification
 
 from .config import TrainConfig
 from .data import load_examples
@@ -384,7 +401,7 @@ class FusionConfig:
         'confidence', 'interaction', 'moe', 'mlp',
         'stacking', 'cca', 'dynamic', 'cross_attention',
         'adaptive_weighted', 'bilinear'
-    ])
+    ])  # (residual_gated is regression-only; appended in advanced_methods)
 
     meta_fusion_methods: List[str] = field(default_factory=lambda: [
         'average', 'weighted', 'voting', 'confidence_selection', 'stacked'
@@ -397,7 +414,7 @@ class FusionConfig:
     advanced_methods: List[str] = field(default_factory=lambda: [
         'confidence', 'interaction', 'moe', 'mlp',
         'stacking', 'cca', 'dynamic', 'cross_attention',
-        'adaptive_weighted', 'bilinear'
+        'adaptive_weighted', 'bilinear', 'residual_gated'   # [R6] regression only
     ])
 
     method_descriptions: Dict[str, str] = field(default_factory=lambda: {
@@ -415,6 +432,7 @@ class FusionConfig:
         'cross_attention': 'Cross-modal attention',
         'adaptive_weighted': 'Adaptive weighted fusion',
         'bilinear': 'Bilinear fusion',
+        'residual_gated': '[R6] BayesianRidge modality gate + residual MLP (regression)',
         'average': 'Meta-fusion: simple average',
         'weighted': 'Meta-fusion: weighted by validation performance',
         'voting': 'Meta-fusion: majority voting',
@@ -424,6 +442,291 @@ class FusionConfig:
 
     default_audio_weight: float = 0.5
     default_text_weight: float = 0.5
+
+
+# =======================================================================
+#  REGRESSION IMPROVEMENTS [R1]-[R6]  (helpers; see module docstring)
+# =======================================================================
+
+# -----------------------------------------------------------------------
+#  [R1] RAFT helpers.  NOT wired into training: the LM loss lives in
+#  .train.train_one_fold, which this module only imports.  These are the
+#  pieces train.py needs for a bin-head (encoder-compatible) RAFT loss:
+#
+#      grid = build_y_grid(y_train_normalised, RegressionAwareConfig())
+#      loss = raft_expected_value_loss(bin_logits, y_norm_batch, grid)
+#
+#  and at inference `decode_expected_value(bin_logits, grid)`. The model
+#  head must then have `y_grid_size` outputs, and every reader of
+#  `model(**enc).logits[:, 0]` in this file must call decode_expected_value.
+# -----------------------------------------------------------------------
+@dataclass
+class RegressionAwareConfig:
+    use_raft: bool = False
+    y_grid_size: int = 101
+    y_grid_min: Optional[float] = None
+    y_grid_max: Optional[float] = None
+    temperature: float = 1.0
+    raft_weight: float = 1.0
+
+
+def build_y_grid(y_norm, cfg: RegressionAwareConfig) -> torch.Tensor:
+    """Uniform grid over the (NORMALISED) target range."""
+    y = np.asarray(y_norm, dtype=float).ravel()
+    lo = cfg.y_grid_min if cfg.y_grid_min is not None else float(np.min(y))
+    hi = cfg.y_grid_max if cfg.y_grid_max is not None else float(np.max(y))
+    if hi <= lo:
+        hi = lo + 1.0
+    return torch.linspace(lo, hi, int(cfg.y_grid_size))
+
+
+def decode_expected_value(bin_logits: torch.Tensor, y_grid: torch.Tensor,
+                          temperature: float = 1.0) -> torch.Tensor:
+    """E[y] under softmax(bin_logits) over the grid (same scale as grid)."""
+    probs = F.softmax(bin_logits / max(float(temperature), 1e-6), dim=-1)
+    return (probs * y_grid.to(bin_logits.device, bin_logits.dtype)).sum(-1)
+
+
+def raft_expected_value_loss(bin_logits: torch.Tensor, y_true: torch.Tensor,
+                             y_grid: torch.Tensor,
+                             temperature: float = 1.0) -> torch.Tensor:
+    """[R1] (y - E_p[y])^2 over a discretised grid; scalar-head compatible
+    in the sense that the decoded value is a single number per example."""
+    y_hat = decode_expected_value(bin_logits, y_grid, temperature)
+    return F.mse_loss(y_hat, y_true.to(y_hat.dtype))
+
+
+# -----------------------------------------------------------------------
+#  [R2] Bayes-optimal decoding of the scalar regression head (MC dropout).
+#  State is module-level (like _Y_STATS) so HPO / question scoring can use
+#  it without threading `args` through.  n_samples <= 1 -> original
+#  deterministic single pass.
+# -----------------------------------------------------------------------
+_BAYES_DECODE: Dict[str, Any] = {"n_samples": 1, "metric": "rmse"}
+
+
+def set_bayes_decode(n_samples: int = 1, metric: str = "rmse") -> None:
+    if metric not in ("rmse", "mae"):
+        raise ValueError(f"bayes metric must be 'rmse' or 'mae', got {metric}")
+    _BAYES_DECODE["n_samples"] = int(max(1, n_samples))
+    _BAYES_DECODE["metric"] = metric
+
+
+def bayes_optimal_aggregate(samples, metric: str = "rmse") -> float:
+    """Posterior mean for squared error, posterior median for absolute error."""
+    samples = np.asarray(samples, dtype=float)
+    if samples.size == 0:
+        return float("nan")
+    return float(np.mean(samples) if metric == "rmse" else np.median(samples))
+
+
+def regression_aware_predict(model, tokenizer, texts, batch_size: int,
+                             max_length: int, device,
+                             n_samples: Optional[int] = None,
+                             metric: Optional[str] = None,
+                             y_grid: Optional[List[float]] = None,
+                             temperature: float = 1.0) -> np.ndarray:
+    """[R2] N dropout-on forward passes -> per-example Bayes-optimal estimate.
+
+    Output is on the same (NORMALISED) scale as a plain forward pass; the
+    caller denormalises exactly as before. Restores eval() on exit.
+    """
+    n = int(n_samples if n_samples is not None else _BAYES_DECODE["n_samples"])
+    metric = metric or _BAYES_DECODE["metric"]
+    model.eval()
+    if n > 1:
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.train()
+    passes = []
+    try:
+        with torch.no_grad():
+            for _ in range(max(1, n)):
+                out = []
+                for i in range(0, len(texts), batch_size):
+                    enc = tokenizer(texts[i:i + batch_size], truncation=True,
+                                    padding=True, max_length=max_length,
+                                    return_tensors="pt")
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    logits = model(**enc).logits
+                    if y_grid is not None:
+                        values = decode_expected_value(
+                            logits, torch.as_tensor(y_grid, device=logits.device),
+                            temperature)
+                        out.append(values.detach().cpu().numpy())
+                    else:
+                        logits = logits.detach().cpu().numpy()
+                        out.append(logits[:, 0] if logits.ndim == 2
+                                   and logits.shape[1] == 1 else logits.flatten())
+                passes.append(np.concatenate(out))
+    finally:
+        model.eval()
+    stacked = np.stack(passes, axis=0)
+    if stacked.shape[0] == 1:
+        return stacked[0]
+    return np.array([bayes_optimal_aggregate(stacked[:, j], metric)
+                     for j in range(stacked.shape[1])])
+
+
+# -----------------------------------------------------------------------
+#  [R6] BayesianRidge meta-learner (fresh instance per call - a shared
+#  module-level object would be refit across folds).
+# -----------------------------------------------------------------------
+def make_regression_meta_learner() -> BayesianRidge:
+    return BayesianRidge()
+
+
+def _oof_predict(model, X, y, n_splits, seed):
+    """Out-of-fold predictions on the training rows (rows = speakers)."""
+    n = len(y)
+    n_splits = max(2, min(int(n_splits), n))
+    oof = np.zeros(n, dtype=float)
+    for tr, te in KFold(n_splits=n_splits, shuffle=True,
+                        random_state=seed).split(X):
+        oof[te] = clone(model).fit(X[tr], y[tr]).predict(X[te])
+    return oof
+
+
+def residual_gated_fusion(Xtr_t, Xtr_a, Xva_t, Xva_a, ytr, args,
+                          fold_idx: int = 0, shrink: float = 0.5,
+                          inner_folds: int = 5):
+    """[R6] base = BayesianRidge gate over per-modality predictions (OOF on
+    train); final = base + shrink * MLP(features) fitted to the base's OOF
+    residuals. `ytr` is NORMALISED (apply_fusion_method guarantees this);
+    output is NORMALISED and never clipped."""
+    seed = int(getattr(args, "seed", 42)) + int(fold_idx)
+    Xtr_t, Xtr_a = np.asarray(Xtr_t, float), np.asarray(Xtr_a, float)
+    Xva_t, Xva_a = np.asarray(Xva_t, float), np.asarray(Xva_a, float)
+    ytr = np.asarray(ytr, float).ravel()
+
+    st, sa = StandardScaler().fit(Xtr_t), StandardScaler().fit(Xtr_a)
+    Tt, Ta = st.transform(Xtr_t), sa.transform(Xtr_a)
+    Vt, Va = st.transform(Xva_t), sa.transform(Xva_a)
+
+    mt, ma = BayesianRidge(), BayesianRidge()
+    p_t_oof = _oof_predict(mt, Tt, ytr, inner_folds, seed)
+    p_a_oof = _oof_predict(ma, Ta, ytr, inner_folds, seed)
+    p_t_va = clone(mt).fit(Tt, ytr).predict(Vt)
+    p_a_va = clone(ma).fit(Ta, ytr).predict(Va)
+
+    gate = BayesianRidge().fit(np.column_stack([p_t_oof, p_a_oof]), ytr)
+    base_oof = gate.predict(np.column_stack([p_t_oof, p_a_oof]))
+    base_va = gate.predict(np.column_stack([p_t_va, p_a_va]))
+
+    if len(ytr) < 20:                       # too few speakers for an MLP
+        return base_va
+    mlp = MLPRegressor(hidden_layer_sizes=(64, 32), alpha=1e-2, max_iter=500,
+                       early_stopping=True, validation_fraction=0.15,
+                       random_state=seed)
+    mlp.fit(np.hstack([Tt, Ta]), ytr - base_oof)
+    return base_va + float(shrink) * mlp.predict(np.hstack([Vt, Va]))
+
+
+def fit_oof_calibrator(y_oof_true, y_oof_pred, min_n: int = 20):
+    """[R6] y = a*pred + b on pooled OUT-OF-FOLD predictions (ORIGINAL scale).
+    Returns None if too few points or degenerate (callers skip calibration)."""
+    y = np.asarray(y_oof_true, float).ravel()
+    p = np.asarray(y_oof_pred, float).ravel()
+    ok = np.isfinite(y) & np.isfinite(p)
+    y, p = y[ok], p[ok]
+    if len(y) < min_n or np.std(p) < 1e-9:
+        return None
+    return LinearRegression().fit(p.reshape(-1, 1), y)
+
+
+def _calibrate_fold_records(fold_records: List[Dict], min_n: int = 20):
+    """[R6] Leave-one-fold-out calibration: fold k's predictions are
+    corrected by a calibrator fitted ONLY on the other folds' predictions,
+    so a fold's own labels never touch its calibration. Operates on the
+    ORIGINAL scale (records hold denormalised, clipped predictions) and
+    applies the single final clip after calibration.
+
+    Returns (new_records, uncalibrated_predictions_dataframe_or_None)."""
+    if len(fold_records) < 2:
+        return fold_records, None
+    out, unc = [], []
+    for k, rec in enumerate(fold_records):
+        others = [r for j, r in enumerate(fold_records) if j != k]
+        cal = fit_oof_calibrator(
+            np.concatenate([np.asarray(r["y_true"], float) for r in others]),
+            np.concatenate([np.asarray(r["y_pred_raw"], float) for r in others]),
+            min_n=min_n)
+        if cal is None:
+            out.append(rec)
+            continue
+        raw = np.asarray(rec["y_pred_raw"], float)
+        new = dict(rec)
+        new["y_pred_raw"] = _clip_regression(
+            cal.predict(raw.reshape(-1, 1)).astype(float))
+        new["metrics"] = score_meta_model(
+            None, new["y_pred_raw"], rec["y_true"], "regression",
+            y_scale="original", pred_scale="original")
+        out.append(new)
+        unc.append(pd.DataFrame({"speaker_id": rec["speaker_ids"],
+                                 "y_true": rec["y_true"],
+                                 "fold": rec["fold"], "y_pred": raw}))
+    return out, (pd.concat(unc, ignore_index=True) if unc else None)
+
+
+# -----------------------------------------------------------------------
+#  [R4] embedding layer / pooling selection.  Probe is FIT on train_df
+#  embeddings and SCORED on val_df embeddings. Callers must pass a
+#  speaker-disjoint split of the OUTER-TRAIN speakers only: never the
+#  outer-validation fold, whose metrics are reported.
+# -----------------------------------------------------------------------
+def select_best_embedding_config(
+    model_dir, train_df: pd.DataFrame, val_df: pd.DataFrame, args,
+    max_length: int,
+    candidate_layers: Optional[List[int]] = None,
+    candidate_poolings: Optional[List[str]] = None,
+) -> Tuple[int, str]:
+    candidate_layers = candidate_layers or [-1, -2, -4, -8]
+    candidate_poolings = candidate_poolings or ["cls", "mean", "max"]
+    default = (getattr(args, "embedding_layer", "-1"),
+               str(getattr(args, "embedding_pooling", "cls")))
+    if train_df is None or val_df is None or train_df.empty or val_df.empty:
+        print("  [embedding-selection] need non-empty train and val; "
+              "keeping defaults")
+        return default
+    overlap = set(train_df["speaker_id"]) & set(val_df["speaker_id"])
+    if overlap:
+        raise RuntimeError(f"[embedding-selection] {len(overlap)} speakers "
+                           "appear in both train and val")
+
+    device = choose_device()
+    tokenizer = load_tokenizer(str(model_dir))
+    model = AutoModel.from_pretrained(
+        model_dir).to(device)
+    model.eval()
+    tr_texts, va_texts = train_df["text"].tolist(), val_df["text"].tolist()
+    y_tr = train_df["label"].values.astype(float)
+    y_va = val_df["label"].values.astype(float)
+
+    best_rmse, best_cfg = float("inf"), default
+    for layer in candidate_layers:
+        for pool in candidate_poolings:
+            a = copy.copy(args)             # never mutate the caller's args
+            a.embedding_layer, a.embedding_pooling = layer, pool
+            try:
+                e_tr = _embed_texts_with_model(model, tokenizer, tr_texts, a,
+                                               max_length, device)
+                e_va = _embed_texts_with_model(model, tokenizer, va_texts, a,
+                                               max_length, device)
+            except Exception as e:          # e.g. layer index out of range
+                print(f"  [embedding-selection] skip layer={layer} "
+                      f"pool={pool}: {e}")
+                continue
+            if e_tr.shape[0] != len(y_tr) or e_va.shape[0] != len(y_va):
+                continue
+            sc = StandardScaler().fit(e_tr)
+            probe = Ridge(alpha=10.0).fit(sc.transform(e_tr), y_tr)
+            rmse = float(np.sqrt(mean_squared_error(
+                y_va, probe.predict(sc.transform(e_va)))))
+            if rmse < best_rmse:
+                best_rmse, best_cfg = rmse, (layer, pool)
+    print(f"  [embedding-selection] best layer={best_cfg[0]}, "
+          f"pooling={best_cfg[1]} (held-out probe RMSE={best_rmse:.4f})")
+    return best_cfg
 
 
 # =======================================================================
@@ -1161,6 +1464,11 @@ def make_meta_model(args):
             print("  ℹ️ SMOTE is applied to individual models inside the ensemble")
         return ensemble
     else:
+        # [R6] regression default (meta_model 'linear') -> BayesianRidge
+        if (args.task == "regression"
+                and getattr(args, 'meta_model', None) in ("linear", "bayesian_ridge", None)):
+            print("\nCreating regression meta-model: BayesianRidge [R6]")
+            return make_regression_meta_learner()
         print(f"\nCreating single meta-model: {args.meta_model}")
         dispatch = {
             "linear": create_linear_model,
@@ -1440,8 +1748,31 @@ class SplitManager:
         val_path = self.splits_dir / "final_val.csv"
         test_path = self.splits_dir / "final_test.csv"
         if train_path.exists() and val_path.exists() and test_path.exists():
-            return (pd.read_csv(train_path), pd.read_csv(val_path),
-                    pd.read_csv(test_path))
+            cached = (pd.read_csv(train_path), pd.read_csv(val_path),
+                      pd.read_csv(test_path))
+            if "speaker_id" in df.columns:
+                current_speakers = set(
+                    df["speaker_id"].astype(str).str.strip().str.casefold()
+                )
+                cached_speakers = set()
+                for part in cached:
+                    if "speaker_id" in part.columns:
+                        cached_speakers.update(
+                            part["speaker_id"].astype(str).str.strip().str.casefold()
+                        )
+                if cached_speakers != current_speakers:
+                    removed = sorted(cached_speakers - current_speakers)
+                    added = sorted(current_speakers - cached_speakers)
+                    print(
+                        "  ⚠️ Cached final splits use a different speaker roster; "
+                        "rebuilding splits and outer folds. "
+                        f"Removed={removed[:8]}, added={added[:8]}"
+                    )
+                    self._delete_all_splits()
+                else:
+                    return cached
+            else:
+                return cached
         if self.test_frac == 0:
             rel_val_frac = self.val_frac / (self.train_frac + self.val_frac)
             train_idx, val_idx = self._speaker_split(df, rel_val_frac, self.seed)
@@ -1848,16 +2179,29 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig,
                                     padding=True, max_length=cfg.max_length,
                                     return_tensors="pt")
                     enc = {k: v.to(device) for k, v in enc.items()}
-                    logits = model(**enc).logits.cpu().numpy()
+                    logits_t = model(**enc).logits
+                    logits = logits_t.detach().cpu().numpy()
                     if cfg.task == "classification":
                         preds.extend(np.argmax(logits, axis=1).tolist())
                     else:
-                        if logits.ndim == 2 and logits.shape[1] == 1:
+                        if cfg.use_raft:
+                            preds.extend(decode_expected_value(
+                                logits_t, torch.as_tensor(cfg.raft_y_grid,
+                                    device=logits_t.device), cfg.raft_temperature
+                            ).detach().cpu().tolist())
+                        elif logits.ndim == 2 and logits.shape[1] == 1:
                             preds.extend(logits[:, 0].tolist())
                         else:
                             preds.extend(logits.flatten().tolist())
             preds = np.array(preds)
             labels = np.array(labels)
+            if cfg.task == "regression" and _BAYES_DECODE["n_samples"] > 1:
+                # [R2] Bayes-optimal aggregate of MC-dropout passes
+                preds = regression_aware_predict(
+                    model, tokenizer, texts, batch_size=batch_size,
+                    max_length=cfg.max_length, device=device,
+                    y_grid=cfg.raft_y_grid if cfg.use_raft else None,
+                    temperature=cfg.raft_temperature)
             if len(preds) != len(labels):
                 return None
             if cfg.task == "classification":
@@ -1894,7 +2238,9 @@ def _train_and_evaluate_fast(train_df, val_df, cfg: TrainConfig,
 class EmbeddingReducer:
     """Train-fold-fitted reducer for text embeddings.
 
-    Supported methods: none, pca, svd, selectkbest, variancethreshold, l1.
+    Supported methods: none, pca, svd, pls, selectkbest, variancethreshold, l1.
+    [R5] 'pls' is supervised (maximises Cov(X, y)); regression only - for
+    classification it falls back to PCA with a warning.
     The instance is fitted only on the training fold and reused unchanged
     for validation/test data.
     """
@@ -1924,6 +2270,10 @@ class EmbeddingReducer:
             raise ValueError("EmbeddingReducer received an empty feature matrix")
         self.n_features_in_ = X.shape[1]
 
+        if self.method == "pls" and self.task == "classification":
+            warnings.warn("[R5] PLS reduction is regression-only; using PCA.")
+            self.method = "pca"
+
         if self.method in ("none", "", "off"):
             self.reducer_ = None
         elif self.method == "pca":
@@ -1936,6 +2286,11 @@ class EmbeddingReducer:
             self.reducer_ = TruncatedSVD(n_components=n,
                                          random_state=self.random_state)
             self.reducer_.fit(X)
+        elif self.method == "pls":   # [R5] fit on train fold only (y given)
+            n = max(1, min(self.n_components, X.shape[1],
+                           max(1, X.shape[0] - 1)))
+            self.reducer_ = PLSRegression(n_components=n, scale=False)
+            self.reducer_.fit(X, y)
         elif self.method == "selectkbest":
             score_func = f_classif if self.task == "classification" else f_regression
             k = min(max(1, self.k), X.shape[1])
@@ -1968,7 +2323,7 @@ class EmbeddingReducer:
         else:
             raise ValueError(
                 f"Unknown embedding reduction '{self.method}'. Choose none, pca, "
-                "svd, selectkbest, variancethreshold, or l1.")
+                "svd, pls, selectkbest, variancethreshold, or l1.")
         return self
 
     def transform(self, X):
@@ -2041,6 +2396,120 @@ def apply_embedding_reduction(train_ft, val_ft, text_cols, args):
     return train_out, val_out, new_cols, fitted
 
 
+def rank_llm_embedding_features(X, y, feature_names, task, top_n, seed=42):
+    """Rank unreduced LLM dimensions using feature_selection.py approaches.
+
+    X and y must come from the outer-fold training speakers only.
+    """
+    from scipy.stats import rankdata, spearmanr
+    from sklearn.ensemble import (GradientBoostingClassifier,
+                                  GradientBoostingRegressor,
+                                  RandomForestClassifier,
+                                  RandomForestRegressor)
+    from sklearn.feature_selection import (RFE, f_classif, f_regression,
+                                           mutual_info_classif,
+                                           mutual_info_regression)
+    from sklearn.inspection import permutation_importance
+    from sklearn.linear_model import Lasso, LogisticRegression, Ridge
+    from sklearn.preprocessing import StandardScaler
+
+    X, y = np.asarray(X, dtype=float), np.asarray(y).ravel()
+    if X.ndim != 2 or X.shape[0] != len(y) or X.shape[1] != len(feature_names):
+        raise ValueError("Feature-selection inputs do not align")
+    if X.shape[0] < 2 or X.shape[1] == 0:
+        raise ValueError("Need at least two rows and one embedding dimension")
+    k = max(1, min(int(top_n), X.shape[1]))
+
+    def cliffs():
+        classes = np.unique(y)
+        if len(classes) != 2:
+            raise ValueError("Cliff's delta supports binary classification only")
+        out = np.zeros(X.shape[1])
+        for j in range(X.shape[1]):
+            a, b = X[y == classes[0], j], X[y == classes[1], j]
+            ranks = rankdata(np.concatenate([a, b]))
+            na, nb = len(a), len(b)
+            u = ranks[:na].sum() - na * (na + 1) / 2
+            out[j] = abs(2 * u / (na * nb) - 1) if na and nb else 0.0
+        return out
+
+    def lasso():
+        xs = StandardScaler().fit_transform(X)
+        est = (LogisticRegression(penalty="l1", solver="liblinear", C=0.1,
+                                  max_iter=5000, random_state=seed)
+               if task == "classification" else Lasso(alpha=0.1))
+        est.fit(xs, y)
+        coef = est.coef_
+        return np.linalg.norm(coef, axis=0) if coef.ndim > 1 else np.abs(coef)
+
+    def forest():
+        est = (RandomForestClassifier(n_estimators=200, random_state=seed, n_jobs=-1)
+               if task == "classification" else
+               RandomForestRegressor(n_estimators=200, random_state=seed, n_jobs=-1))
+        est.fit(X, y)
+        return est.feature_importances_
+
+    def gradient_boosting():
+        est = (GradientBoostingClassifier(n_estimators=100, random_state=seed)
+               if task == "classification" else
+               GradientBoostingRegressor(n_estimators=100, random_state=seed))
+        est.fit(X, y)
+        return est.feature_importances_
+
+    def rfe():
+        xs = StandardScaler().fit_transform(X)
+        est = (LogisticRegression(max_iter=5000, random_state=seed)
+               if task == "classification" else Ridge())
+        selector = RFE(est, n_features_to_select=k).fit(xs, y)
+        return (selector.ranking_.max() + 1 - selector.ranking_).astype(float)
+
+    def permutation():
+        est = (RandomForestClassifier(n_estimators=100, random_state=seed, n_jobs=-1)
+               if task == "classification" else
+               RandomForestRegressor(n_estimators=100, random_state=seed, n_jobs=-1))
+        est.fit(X, y)
+        return permutation_importance(est, X, y, n_repeats=10,
+                                      random_state=seed, n_jobs=-1).importances_mean
+
+    methods = {
+        "01_variance": lambda: np.var(X, axis=0),
+        "02_spearman": lambda: np.nan_to_num(np.array([
+            abs(spearmanr(X[:, j], y)[0]) for j in range(X.shape[1])
+        ]), nan=0.0),
+        "03_mutual_info": lambda: (mutual_info_classif(X, y, random_state=seed)
+                                    if task == "classification" else
+                                    mutual_info_regression(X, y, random_state=seed)),
+        "04_anova": lambda: np.nan_to_num(
+            (f_classif(X, y) if task == "classification" else
+             f_regression(X, y))[0], nan=0.0),
+        "06_lasso": lasso, "07_rf_importance": forest,
+        "08_gb_importance": gradient_boosting, "09_rfe": rfe,
+        "10_permutation": permutation,
+    }
+    if task == "classification" and len(np.unique(y)) == 2:
+        methods["05_cliffs_delta"] = cliffs
+
+    scores_by_method, errors = {}, {}
+    for name, fn in methods.items():
+        try:
+            scores = np.nan_to_num(np.asarray(fn(), dtype=float), nan=0.0,
+                                   posinf=0.0, neginf=0.0)
+            if scores.shape != (X.shape[1],):
+                raise ValueError("score count does not match feature count")
+            order = np.argsort(-scores, kind="stable")
+            ranks = np.empty(len(order), dtype=int)
+            ranks[order] = np.arange(1, len(order) + 1)
+            table = pd.DataFrame({"feature": feature_names, "score": scores,
+                                  "rank": ranks, "selected": ranks <= k})
+            scores_by_method[name] = table.sort_values(
+                ["rank", "feature"], kind="stable").reset_index(drop=True)
+        except Exception as exc:
+            errors[name] = str(exc)
+    if not scores_by_method:
+        raise ValueError(f"All feature-selection approaches failed: {errors}")
+    return scores_by_method, errors, k
+
+
 # =======================================================================
 #  EMBEDDING EXTRACTION
 # =======================================================================
@@ -2101,7 +2570,7 @@ def extract_embeddings(model_dir: Path, df: pd.DataFrame, args,
     try:
         device = choose_device()
         tokenizer = load_tokenizer(str(model_dir))
-        model = AutoModelForSequenceClassification.from_pretrained(
+        model = AutoModel.from_pretrained(
             model_dir).to(device)
         model.eval()
         embeddings = _embed_texts_with_model(
@@ -2142,9 +2611,9 @@ def verify_embeddings_changed(model_dir: Path, df: pd.DataFrame, args,
     sample = df.head(max(1, int(max_samples)))
     device = choose_device()
     tokenizer = load_tokenizer(str(model_dir))
-    tuned = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+    tuned = AutoModel.from_pretrained(model_dir).to(device)
     tuned.eval()
-    base = AutoModelForSequenceClassification.from_pretrained(
+    base = AutoModel.from_pretrained(
         args.model_name, ignore_mismatched_sizes=True).to(device)
     base.eval()
     texts = sample["text"].tolist()
@@ -2336,6 +2805,16 @@ def make_question_cfg(args, question: str, question_dir: Path,
         min_text_chars=args.min_text_chars,
         y_mean=y_mean,
         y_std=y_std,
+        use_raft=bool(getattr(args, "use_raft", False) and args.task == "regression"),
+        y_grid_size=int(getattr(args, "y_grid_size", 101)),
+        y_grid_min=getattr(args, "y_grid_min", None),
+        y_grid_max=getattr(args, "y_grid_max", None),
+        raft_temperature=float(getattr(args, "raft_temperature", 1.0)),
+        raft_weight=float(getattr(args, "raft_weight", 1.0)),
+        use_tract=bool(getattr(args, "use_tract", False)),
+        rationale_file=getattr(args, "rationale_file", None),
+        rationale_column=getattr(args, "rationale_column", "rationale_final"),
+        tract_generation_tokens=int(getattr(args, "tract_generation_tokens", 128)),
     )
     return _configure_regression_train_options(cfg, args)
 
@@ -2420,13 +2899,16 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
         except Exception:
             pass
     else:
-        model_dir = q_dir / "model"
+        training_dir = q_dir / ("tract_training" if getattr(args, "use_tract", False) else "")
+        model_dir = training_dir / "model"
         if (getattr(args, "force_embeddings", False)
-                or not (model_dir.exists() and saved_model_exists(model_dir))):
+                or not (model_dir.exists() and saved_model_exists(model_dir))
+                or (getattr(args, "use_tract", False)
+                    and not (model_dir / "tract_config.json").exists())):
             print(f"    Training LM for {question}...")
             cfg = make_question_cfg(
                 args, question, q_dir, best_hparams, train_data=q_train)
-            train_one_fold(q_train, q_val, cfg, metadata, q_dir)
+            train_one_fold(q_train, q_val, cfg, metadata, training_dir)
         else:
             print(f"    Reusing cached LM for {question}")
 
@@ -2435,12 +2917,51 @@ def safe_question_train_and_embed(train_df, val_df, metadata, args,
                 f"Model not found after training: {model_dir}")
 
     # ------------------------------------------------------------------
+    #  [R4] optional layer/pooling selection. Uses an INNER speaker split of
+    #  q_train only - q_val (the outer-validation fold) is never touched.
+    # ------------------------------------------------------------------
+    if getattr(args, "select_embedding_config", False):
+        args = copy.copy(args)          # selection stays local to this question
+        sel_path = q_dir / "embedding_selection.json"
+        sel = None
+        if sel_path.exists() and not getattr(args, "force_embeddings", False):
+            try:
+                sel = json.loads(sel_path.read_text())
+            except Exception:
+                sel = None
+        if sel is None:
+            spk = np.array(sorted(q_train["speaker_id"].unique()))
+            if len(spk) >= 10:
+                rng = np.random.RandomState(args.seed + 4242)
+                rng.shuffle(spk)
+                n_val = max(2, int(round(0.25 * len(spk))))
+                va_spk = set(spk[:n_val])
+                inner_tr = q_train[~q_train["speaker_id"].isin(va_spk)]
+                inner_va = q_train[q_train["speaker_id"].isin(va_spk)]
+                sel_layer, sel_pool = select_best_embedding_config(
+                    model_dir, inner_tr.reset_index(drop=True),
+                    inner_va.reset_index(drop=True), args,
+                    max_length=best_hparams.get("max_length", args.max_length))
+                sel = {"layer": str(sel_layer), "pooling": str(sel_pool)}
+                try:
+                    sel_path.write_text(json.dumps(sel))
+                except Exception:
+                    pass
+            else:
+                print(f"    [R4] {question}: only {len(spk)} train speakers; "
+                      "keeping configured layer/pooling")
+        if sel is not None:
+            args.embedding_layer = sel["layer"]
+            args.embedding_pooling = sel["pooling"]
+
+    # ------------------------------------------------------------------
     #  Cache-tag: layer + pooling (+ _frozen so caches never collide)
     # ------------------------------------------------------------------
     layer_tag = str(getattr(args, "embedding_layer", "-1")).replace("-", "m")
     pooling_tag = str(getattr(args, "embedding_pooling", "cls"))
     frozen_tag = "_frozen" if frozen else ""
-    cache_tag = f"layer-{layer_tag}_pool-{pooling_tag}{frozen_tag}"
+    tract_tag = "_tract" if getattr(args, "use_tract", False) else ""
+    cache_tag = f"layer-{layer_tag}_pool-{pooling_tag}{frozen_tag}{tract_tag}"
 
     train_emb = q_dir / f"embeddings_train_{cache_tag}.csv"
     val_emb = q_dir / f"embeddings_val_{cache_tag}.csv"
@@ -2565,16 +3086,35 @@ def safe_question_cv_scores(train_df, metadata, args, best_hparams,
                                         "max_length", args.max_length),
                                     return_tensors="pt")
                     enc = {k: v.to(device) for k, v in enc.items()}
-                    logits = model(**enc).logits.detach().cpu().numpy()
+                    logits_t = model(**enc).logits
+                    logits = logits_t.detach().cpu().numpy()
                     if args.task == "classification":
                         preds.extend(np.argmax(logits, axis=1).tolist())
                     else:
-                        if logits.ndim == 2 and logits.shape[1] == 1:
+                        if getattr(args, "use_raft", False):
+                            raft_cfg_path = model_dir / "raft_config.json"
+                            raft_cfg = json.loads(raft_cfg_path.read_text())
+                            preds.extend(decode_expected_value(
+                                logits_t, torch.as_tensor(raft_cfg["y_grid"],
+                                    device=logits_t.device),
+                                raft_cfg.get("temperature", 1.0)
+                            ).detach().cpu().tolist())
+                        elif logits.ndim == 2 and logits.shape[1] == 1:
                             preds.extend(logits[:, 0].tolist())
                         else:
                             preds.extend(logits.flatten().tolist())
             y_true = qva["label"].values.astype(float)
             y_pred = np.array(preds, dtype=float)
+            if args.task == "regression" and _BAYES_DECODE["n_samples"] > 1:
+                # [R2] Bayes-optimal aggregate of MC-dropout passes
+                y_pred = regression_aware_predict(
+                    model, tokenizer, qva["text"].tolist(),
+                    batch_size=batch_size,
+                    max_length=best_hparams.get("max_length", args.max_length),
+                    device=device,
+                    y_grid=(json.loads((model_dir / "raft_config.json").read_text())["y_grid"]
+                            if getattr(args, "use_raft", False) else None),
+                    temperature=float(getattr(args, "raft_temperature", 1.0))).astype(float)
 
             if args.task == "regression":
                 y_pred_d = _denorm_with_stats(
@@ -2935,10 +3475,13 @@ def apply_fusion_method(
                          * audio_weight)
                 wt = (np.exp(-res_t)
                       / (np.exp(-res_t) + np.exp(-res_a) + 1e-12))
-                wt = wt[:, None]
                 mv = min(len(pred_text), len(pred_audio))
-                pred = (wt[:mv] * pred_audio[:mv]
-                        + (1 - wt[:mv]) * pred_text[:mv])
+                # Regression predictions are 1D; keep the gate weights 1D as
+                # well. Expanding to (n, 1) broadcasts against (n,) into an
+                # accidental (n, n) prediction matrix.
+                pred = (wt[:mv] * np.asarray(pred_audio[:mv]).reshape(-1)
+                        + (1 - wt[:mv])
+                        * np.asarray(pred_text[:mv]).reshape(-1))
                 proba = None
         except Exception as e:
             print(f"    MoE failed: {e}, falling back to late fusion")
@@ -3026,7 +3569,7 @@ def apply_fusion_method(
                 else:
                     pred = meta_learner.predict(Xva_stack)
             else:
-                meta_learner = Ridge(alpha=1.0)
+                meta_learner = make_regression_meta_learner()   # [R6]
                 meta_learner.fit(Xtr_stack, ytr_trim)
                 pred = meta_learner.predict(Xva_stack)
                 proba = None
@@ -3085,7 +3628,7 @@ def apply_fusion_method(
                 else:
                     pred = clf.predict(Xva_scaled)
             else:
-                reg = Ridge(alpha=1.0)
+                reg = make_regression_meta_learner()   # [R6]
                 reg.fit(Xtr_scaled, ytr)
                 pred = reg.predict(Xva_scaled)
                 proba = None
@@ -3337,6 +3880,21 @@ def apply_fusion_method(
                     proba = None
         except Exception as e:
             print(f"    Bilinear failed: {e}, falling back to late fusion")
+            pred = text_weight * pred_text + audio_weight * pred_audio
+            if is_classification:
+                pred = np.round(pred).astype(int)
+            proba = None
+
+    # ---- Branch: residual_gated  [R6] (regression only) ----
+    elif method == "residual_gated":
+        try:
+            if is_classification:
+                raise ValueError("residual_gated is regression-only")
+            pred = residual_gated_fusion(Xtr_t, Xtr_a, Xva_t, Xva_a, ytr,
+                                         args, fold_idx=fold_idx)
+            proba = None
+        except Exception as e:
+            print(f"    residual_gated failed: {e}, falling back to late fusion")
             pred = text_weight * pred_text + audio_weight * pred_audio
             if is_classification:
                 pred = np.round(pred).astype(int)
@@ -3879,7 +4437,7 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict,
                 except Exception:
                     meta_proba = None
             else:
-                meta = Ridge(alpha=1.0)
+                meta = make_regression_meta_learner()   # [R6]
                 meta.fit(X_tr, y_tr)
                 meta_preds = meta.predict(X_stack)
                 meta_proba = None
@@ -3907,7 +4465,7 @@ def perform_meta_fusion(predictions_dict: Dict, metrics_dict: Dict,
                     meta = None
             else:
                 cv = GroupKFold(n_splits=n_splits)
-                meta = Ridge(alpha=1.0)
+                meta = make_regression_meta_learner()   # [R6]
                 try:
                     meta_preds = cross_val_predict(
                         meta, X_stack, y_true, groups=groups, cv=cv)
@@ -4216,6 +4774,8 @@ def _resolve_fusion_methods(args) -> List[str]:
 
     base = _resolve(getattr(args, 'fusion_methods', 'all'), fc.base_methods)
     novel = _resolve(getattr(args, 'fusion_novel', 'all'), fc.advanced_methods)
+    if args.task != "regression" and 'residual_gated' in novel:
+        novel = [m for m in novel if m != 'residual_gated']   # [R6]
     return base + novel
 
 
@@ -4236,6 +4796,9 @@ def _load_data_robustly(args, metadata: dict) -> Tuple[pd.DataFrame, dict]:
         "delimiter": getattr(args, "delimiter", ";"),
         "min_text_chars": getattr(args, "min_text_chars", 1),
         "filter_questions": questions_upper,
+        "rationale_file": (getattr(args, "rationale_file", None)
+                           if getattr(args, "use_tract", False) else None),
+        "rationale_column": getattr(args, "rationale_column", "rationale_final"),
     }
 
     try:
@@ -4265,7 +4828,10 @@ def _load_data_robustly(args, metadata: dict) -> Tuple[pd.DataFrame, dict]:
         result = load_examples(
             asr_file=args.asr_file, demo_file=args.demo_file,
             target_column=args.target_column, task=args.task,
-            text_mode="question",text_index=args.text_index
+            text_mode="question", text_index=args.text_index,
+            rationale_file=(getattr(args, "rationale_file", None)
+                            if getattr(args, "use_tract", False) else None),
+            rationale_column=getattr(args, "rationale_column", "rationale_final"),
         )
 
     if isinstance(result, tuple):
@@ -4335,7 +4901,30 @@ def _load_or_create_outer_folds(splits_dir, train_df, args):
                   f"val={len(fold_val)} ({len(va_sp)} spk)")
             folds.append((fold_train, fold_val))
         if folds:
-            return folds
+            expected_speakers = set(
+                train_df["speaker_id"].astype(str).str.strip().str.casefold()
+            )
+            cached_val_speakers = set()
+            cached_all_speakers = set()
+            for _, fold_val in folds:
+                cached_val_speakers.update(
+                    fold_val["speaker_id"].astype(str).str.strip().str.casefold()
+                )
+            for fold_train, fold_val in folds:
+                for part in (fold_train, fold_val):
+                    cached_all_speakers.update(
+                        part["speaker_id"].astype(str).str.strip().str.casefold()
+                    )
+            if (cached_val_speakers == expected_speakers
+                    and cached_all_speakers <= expected_speakers):
+                return folds
+            stale = sorted(cached_all_speakers - expected_speakers)
+            missing = sorted(expected_speakers - cached_val_speakers)
+            print(
+                "  ⚠️ Cached outer folds use a different training speaker roster; "
+                "recreating folds from current data. "
+                f"Stale={stale[:8]}, missing={missing[:8]}"
+            )
         print("  ⚠️ No complete fold pairs found — creating fresh folds")
 
     try:
@@ -4351,6 +4940,48 @@ def _load_or_create_outer_folds(splits_dir, train_df, args):
     print(f"  Creating fresh speaker-stratified folds "
           f"(n={getattr(args, 'n_cv_folds', 5)})")
     return make_outer_folds(train_df, args)
+
+
+def _restore_rationale_column(split_df: pd.DataFrame,
+                              source_df: pd.DataFrame) -> pd.DataFrame:
+    """Refresh cached split rows from current source data by speaker.
+
+    Cached split files may contain utterance IDs from an older dataset. The
+    speaker assignment is the leakage-safe part of the split, so use it to
+    select current rows (including current reviewed rationales) from source_df.
+    """
+    if "rationale" not in source_df.columns:
+        raise ValueError(
+            "TRACT was selected but data loading produced no rationale column. "
+            "Check --rationale-file and --rationale-column."
+        )
+    if "speaker_id" not in source_df.columns or "speaker_id" not in split_df.columns:
+        raise ValueError("Cannot refresh cached TRACT split: speaker_id is missing")
+    if split_df.empty:
+        return source_df.iloc[0:0].copy().reset_index(drop=True)
+
+    speaker_key = lambda values: values.astype(str).str.strip().str.casefold()
+    split_speakers = set(speaker_key(split_df["speaker_id"]))
+    source_speakers = speaker_key(source_df["speaker_id"])
+    current_speakers = set(source_speakers)
+    unknown_speakers = split_speakers - current_speakers
+    if unknown_speakers:
+        raise ValueError(
+            "Cached split references speaker(s) absent from the current data: "
+            f"{sorted(unknown_speakers)[:8]}"
+        )
+    result = source_df.loc[source_speakers.isin(split_speakers)].copy()
+    result.reset_index(drop=True, inplace=True)
+    if "question_id" in result.columns:
+        result["question_id"] = result["question_id"].astype(str).str.strip().str.upper()
+    missing = result["rationale"].isna() | result["rationale"].astype(str).str.strip().eq("")
+    if missing.any():
+        ids = result.loc[missing, "utterance_id"].astype(str).head(8).tolist()
+        raise ValueError(
+            f"Current data includes {int(missing.sum())} utterance(s) without "
+            f"a reviewed rationale for cached split speakers; examples: {ids}"
+        )
+    return result
 
 
 # FIX #20 — single-modality meta-model trainer
@@ -4409,6 +5040,13 @@ def _aggregate_and_save(method, fold_records, out_dir, args,
     if not fold_records:
         return
 
+    uncalibrated = None
+    if args.task == "regression" and getattr(args, "calibrate_regression", False):
+        # [R6] leave-one-fold-out linear calibration (original scale, then clip)
+        fold_records, uncalibrated = _calibrate_fold_records(fold_records)
+        if uncalibrated is not None:
+            print(f"  [R6] {method}: leave-one-fold-out calibration applied")
+
     parts = []
     for rec in fold_records:
         d = {
@@ -4436,6 +5074,9 @@ def _aggregate_and_save(method, fold_records, out_dir, args,
 
     combined.attrs["denormalized"] = True
 
+    if uncalibrated is not None:
+        uncalibrated.to_csv(
+            out_dir / f"{method}_oof_predictions_uncalibrated.csv", index=False)
     combined.to_csv(out_dir / f"{method}_oof_predictions.csv", index=False)
     combined.to_csv(out_dir / f"{method}_predictions.csv", index=False)
 
@@ -4481,6 +5122,9 @@ def run_leakage_safe_fusion(args):
     set_seed(args.seed, deterministic=True)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.task == "regression":    # [R2]
+        set_bayes_decode(getattr(args, "bayes_n_samples", 8),
+                         getattr(args, "bayes_metric", "rmse"))
 
     print("\n" + "=" * 60)
     print("LEAKAGE-SAFE MULTIMODAL FUSION PIPELINE")
@@ -4491,6 +5135,21 @@ def run_leakage_safe_fusion(args):
                 "model_name": args.model_name}
 
     all_methods = _resolve_fusion_methods(args)
+    run_feature_selection = bool(getattr(args, "run_llm_feature_selection", False))
+    if run_feature_selection and getattr(args, "embedding_reduction", "none") != "none":
+        raise ValueError(
+            "--run-llm-feature-selection requires --embedding-reduction none"
+        )
+    selection_top_n = getattr(args, "feature_selection_top_n", None)
+    if selection_top_n is None:
+        # Top-k controls selected dimensions, independently of how many
+        # ranking approaches are supported for this task. Match the pasted
+        # feature_selection.py default of top_k=10.
+        selection_top_n = 10
+    if int(selection_top_n) < 1:
+        raise ValueError("--feature-selection-top-n must be >= 1")
+    selection_root = (out_dir / "feature_selection" / f"top{int(selection_top_n)}"
+                      if run_feature_selection else None)
     fusion_dir = out_dir / "fusion_results" / "leakage_safe_5fold"
     fusion_dir.mkdir(parents=True, exist_ok=True)
     force_recompute = getattr(args, 'force_recompute', False)
@@ -4507,7 +5166,10 @@ def run_leakage_safe_fusion(args):
         else:
             print(f"  ⚠️ {method}: no pre-computed folder — will compute fresh")
 
+    rationale_path = Path(getattr(args, "rationale_file", "") or "")
+    rationale_stat = (rationale_path.stat() if rationale_path.is_file() else None)
     reduction_config = {
+        "model_name": str(args.model_name),
         "embedding_layer": str(getattr(args, "embedding_layer", "-1")),
         "embedding_pooling": str(getattr(args, "embedding_pooling", "cls")),
         "embedding_reduction": str(getattr(args, "embedding_reduction", "none")),
@@ -4523,6 +5185,32 @@ def run_leakage_safe_fusion(args):
     }
     if args.task == "regression":
         reduction_config["target_scaling"] = "fold_train_only_v1"
+        # [R2][R4][R6] settings that change outputs invalidate the cache
+        reduction_config["regression_improvements"] = {
+            "use_raft": bool(getattr(args, "use_raft", False)),
+            "y_grid_size": int(getattr(args, "y_grid_size", 101)),
+            "raft_temperature": float(getattr(args, "raft_temperature", 1.0)),
+            "raft_weight": float(getattr(args, "raft_weight", 1.0)),
+            "use_tract": bool(getattr(args, "use_tract", False)),
+            "rationale_file": str(getattr(args, "rationale_file", "") or ""),
+            "rationale_file_mtime_ns": (rationale_stat.st_mtime_ns
+                                        if rationale_stat else None),
+            "rationale_file_size": (rationale_stat.st_size
+                                    if rationale_stat else None),
+            "rationale_column": str(getattr(args, "rationale_column", "rationale_final")),
+            "tract_generation_tokens": int(getattr(args, "tract_generation_tokens", 128)),
+            "select_embedding_config": bool(getattr(
+                args, "select_embedding_config", False)),
+            "bayes_n_samples": int(getattr(args, "bayes_n_samples", 8)),
+            "bayes_metric": str(getattr(args, "bayes_metric", "rmse")),
+            "calibrate_regression": bool(getattr(
+                args, "calibrate_regression", False)),
+        }
+    if run_feature_selection:
+        reduction_config["llm_feature_selection"] = {
+            "top_n": int(selection_top_n),
+            "fit_scope": "outer_fold_train_only",
+        }
     config_path = fusion_dir / "embedding_pipeline_config.json"
     if config_path.exists():
         try:
@@ -4554,10 +5242,12 @@ def run_leakage_safe_fusion(args):
         force_recompute = True
     config_path.write_text(json.dumps(reduction_config, indent=2))
 
-    if not force_recompute and _fusion_results_complete(fusion_dir, all_methods):
+    if (not run_feature_selection and not force_recompute
+            and _fusion_results_complete(fusion_dir, all_methods)):
         print(f"\n✅ Fusion results already complete at {fusion_dir}")
         print("   Skipping HPO, LM training, and fusion recomputation.")
-        meta_metrics, _ = run_meta_fusion(out_dir, args)
+        meta_result = run_meta_fusion(out_dir, args)
+        meta_metrics = meta_result[0] if meta_result is not None else {}
         return fusion_dir, meta_metrics
 
     # ---- STEP 1: Load data ----
@@ -4568,6 +5258,11 @@ def run_leakage_safe_fusion(args):
         print(f"❌ Failed to load data: {e}")
         traceback.print_exc()
         raise
+    if getattr(args, "use_tract", False) and "rationale" not in df.columns:
+        raise ValueError(
+            "--use-tract was requested, but rationale data was not loaded. "
+            "Pass --rationale-file and the correct --rationale-column."
+        )
     print(f"  Loaded {len(df)} samples, {df['speaker_id'].nunique()} speakers")
 
     # ---- STEP 2: Splits ----
@@ -4581,6 +5276,10 @@ def run_leakage_safe_fusion(args):
                               args.val_frac, args.test_frac, args.seed,
                               n_folds=args.n_cv_folds)
     train_df, val_df, test_df = split_mgr.get_final_splits(df)
+    if getattr(args, "use_tract", False):
+        train_df = _restore_rationale_column(train_df, df)
+        val_df = _restore_rationale_column(val_df, df)
+        test_df = _restore_rationale_column(test_df, df)
     print(f"  final splits: train={len(train_df)}, val={len(val_df)}, "
           f"test={len(test_df)}")
 
@@ -4593,6 +5292,10 @@ def run_leakage_safe_fusion(args):
     # ---- STEP 3: Folds ----
     print("\n[3/6] Preparing outer folds...")
     outer_folds = _load_or_create_outer_folds(splits_dir, train_df, args)
+    if getattr(args, "use_tract", False):
+        outer_folds = [(_restore_rationale_column(fold_train, train_df),
+                        _restore_rationale_column(fold_val, train_df))
+                       for fold_train, fold_val in outer_folds]
     print(f"  Using {len(outer_folds)} outer fold(s)")
 
     # ---- STEP 4: HPO (cached) ----
@@ -4601,8 +5304,21 @@ def run_leakage_safe_fusion(args):
     hpo_cache_version = (
         "fold_train_target_scaling_v1"
         if args.task == "regression" else None)
-    best_hparams = (None if force_hpo else
-                    _load_hpo_params_from_cache(out_dir, hpo_cache_version))
+    if getattr(args, "use_tract", False):
+        # The scalar-head Optuna objective is not valid for a causal CoT model.
+        best_hparams = {
+            "max_length": int(args.max_length),
+            "batch_size": int(args.batch_size),
+            "epochs": int(args.epochs or 3),
+            "learning_rate": 2e-5,
+            "weight_decay": float(args.weight_decay),
+            "warmup_ratio": float(args.warmup_ratio),
+            "patience": int(args.patience),
+        }
+        print("  TRACT uses fixed CLI training settings; scalar-head HPO skipped")
+    else:
+        best_hparams = (None if force_hpo else
+                        _load_hpo_params_from_cache(out_dir, hpo_cache_version))
     if best_hparams is None:
         print("  Running Optuna HPO...")
         all_speakers = train_df.groupby("speaker_id")["label"].first().reset_index()
@@ -4655,6 +5371,8 @@ def run_leakage_safe_fusion(args):
     print(f"  Computing fresh:       {methods_to_compute}")
 
     fold_records: Dict[str, List[Dict]] = {m: [] for m in methods_to_compute}
+    feature_selection_records: Dict[str, List[Dict]] = {m: [] for m in all_methods}
+    feature_selection_frequency: Dict[str, int] = {}
 
     for fold_idx, (fold_train, fold_val) in enumerate(outer_folds):
         print("\n" + "-" * 60)
@@ -4665,10 +5383,14 @@ def run_leakage_safe_fusion(args):
         fold_dir = out_dir / f"fold_{fold_idx}"
         fold_dir.mkdir(parents=True, exist_ok=True)
 
-        q_scores = safe_question_cv_scores(
-            fold_train, metadata, args, best_hparams,
-            [q.upper() for q in args.questions], fold_dir)
-        selected_qs = select_questions_from_scores(q_scores, args)
+        if getattr(args, "use_tract", False):
+            q_scores = {q.upper(): 0.0 for q in args.questions}
+            selected_qs = [q.upper() for q in args.questions]
+        else:
+            q_scores = safe_question_cv_scores(
+                fold_train, metadata, args, best_hparams,
+                [q.upper() for q in args.questions], fold_dir)
+            selected_qs = select_questions_from_scores(q_scores, args)
 
         train_emb_paths, val_emb_paths = {}, {}
         for q in selected_qs:
@@ -4818,6 +5540,115 @@ def run_leakage_safe_fusion(args):
                 print(f"    ⚠️ {method} failed: {e}")
                 traceback.print_exc()
 
+        # Optional, leakage-safe feature-selection experiment. Each ranking
+        # approach selects its own top-k on outer-train; approach rankings are
+        # combined by votes, and fusion runs once on the final voted top-N set.
+        if run_feature_selection:
+            try:
+                selector_scores, selector_errors, selected_n = rank_llm_embedding_features(
+                    Xtr_t, y_train, text_cols, args.task, selection_top_n,
+                    seed=int(args.seed) + fold_idx)
+                report_base = selection_root / "_selection_reports" / f"fold_{fold_idx}"
+                approaches_dir = report_base / "approaches"
+                approaches_dir.mkdir(parents=True, exist_ok=True)
+                (report_base / "skipped_approaches.json").write_text(
+                    json.dumps(selector_errors, indent=2))
+                vote_counts: Dict[str, int] = {}
+                for selector_name, score_table in selector_scores.items():
+                    report_dir = approaches_dir / selector_name
+                    report_dir.mkdir(parents=True, exist_ok=True)
+                    score_table.to_csv(report_dir / "scores.csv", index=False)
+                    approach_features = score_table.loc[
+                        score_table["selected"], "feature"].astype(str).tolist()
+                    (report_dir / "selected_features.txt").write_text(
+                        "\n".join(approach_features))
+                    for feature in approach_features:
+                        vote_counts[feature] = vote_counts.get(feature, 0) + 1
+
+                n_approaches = len(selector_scores)
+                vote_threshold = max(1, n_approaches // 2)
+                ranked_votes = sorted(vote_counts.items(),
+                                      key=lambda item: (-item[1], item[0]))
+                consensus = [(feature, votes) for feature, votes in ranked_votes
+                             if votes >= vote_threshold]
+                # If no dimension reaches the majority threshold, retain the
+                # highest-voted dimensions so the requested top-N experiment
+                # can still run and the fallback is explicit in the report.
+                used_fallback = not consensus
+                candidates = consensus if consensus else ranked_votes
+                final_features = [feature for feature, _ in candidates[:selected_n]]
+                vote_table = pd.DataFrame([
+                    {"feature": feature, "votes": votes,
+                     "selected_by_threshold": votes >= vote_threshold,
+                     "selected_for_fusion": feature in final_features}
+                    for feature, votes in ranked_votes
+                ])
+                vote_table.to_csv(report_base / "approach_votes.csv", index=False)
+                (report_base / "final_selected_features.txt").write_text(
+                    "\n".join(final_features))
+                (report_base / "voting_config.json").write_text(json.dumps({
+                    "n_approaches_succeeded": n_approaches,
+                    "vote_threshold": vote_threshold,
+                    "final_top_n": selected_n,
+                    "used_top_vote_fallback": used_fallback,
+                    "selected_features": final_features,
+                }, indent=2))
+                for feature in final_features:
+                    feature_selection_frequency[feature] = (
+                        feature_selection_frequency.get(feature, 0) + 1)
+
+                variant_dir = selection_root / f"voted_top{int(selection_top_n)}"
+                variant_fusion_dir = (variant_dir / "fusion_results"
+                                      / "leakage_safe_5fold")
+                variant_fusion_dir.mkdir(parents=True, exist_ok=True)
+                selected_idx = [text_cols.index(name) for name in final_features
+                                if name in text_cols]
+                Xtr_t_fs, Xva_t_fs = Xtr_t[:, selected_idx], Xva_t[:, selected_idx]
+                (pred_t_train_fs, pred_t_val_fs,
+                 proba_t_train_fs, proba_t_val_fs) = _fit_single_modality_model(
+                    Xtr_t_fs, Xva_t_fs, y_train, args)
+
+                for fs_method in all_methods:
+                    try:
+                        if fs_method == "text_only":
+                            fs_pred, fs_proba = pred_t_val_fs, proba_t_val_fs
+                        elif fs_method == "audio_only":
+                            fs_pred, fs_proba = pred_audio_val, proba_audio_val
+                        else:
+                            fs_pred, fs_proba, _ = apply_fusion_method(
+                                fs_method, pred_t_val_fs, pred_audio_val,
+                                proba_t_val_fs, proba_audio_val,
+                                proba_t_train_fs, proba_audio_train,
+                                Xtr_t_fs, Xtr_a, Xva_t_fs, Xva_a,
+                                y_train, y_val, args,
+                                text_weight=args.text_weight,
+                                audio_weight=args.audio_weight,
+                                fold_idx=fold_idx)
+                        if fs_pred is None:
+                            continue
+                        if args.task == "classification":
+                            fs_metrics = score_meta_model(
+                                None, fs_pred, y_val, args.task,
+                                y_scale="original", pred_scale="original")
+                            fs_pred_save = fs_pred
+                        else:
+                            fs_metrics = score_meta_model(
+                                None, fs_pred, y_val, args.task,
+                                y_scale="original", pred_scale="normalized")
+                            fs_pred_save = _clip_regression(_denorm(fs_pred))
+                        rec = _save_fold_method_outputs(
+                            fs_method, fold_idx, val_ft, y_val, fs_pred_save,
+                            fs_proba, fs_metrics, variant_fusion_dir, args)
+                        feature_selection_records[fs_method].append(rec)
+                    except Exception as exc:
+                        print(f"    ⚠️ voted feature-selection/{fs_method} failed: {exc}")
+                        traceback.print_exc()
+                print(f"  [feature-selection] voted top-{len(final_features)} "
+                      f"from {n_approaches} approaches; threshold={vote_threshold}")
+            except Exception as exc:
+                print(f"  ⚠️ LLM feature-selection fold {fold_idx} failed: {exc}")
+                traceback.print_exc()
+
     # ---- Aggregate ONLY the computed methods ----
     print("\nAggregating fold results...")
     for method in methods_to_compute:
@@ -4829,11 +5660,59 @@ def run_leakage_safe_fusion(args):
                 print(f"  ⚠️ Aggregation failed for {method}: {e}")
                 traceback.print_exc()
 
+    if run_feature_selection:
+        print("\nAggregating voted feature-selection fusion experiment...")
+        variant_dir = selection_root / f"voted_top{int(selection_top_n)}"
+        variant_fusion_dir = (variant_dir / "fusion_results"
+                              / "leakage_safe_5fold")
+        for method in all_methods:
+            records = feature_selection_records.get(method, [])
+            if records:
+                try:
+                    _aggregate_and_save(method, records, variant_fusion_dir,
+                                         args, subgroup_ids)
+                except Exception as exc:
+                    print(f"  ⚠️ voted feature-selection/{method} aggregation failed: {exc}")
+                    traceback.print_exc()
+
+        summary = pd.DataFrame([
+            {"feature": feature, "selected_in_folds": count,
+             "n_outer_folds": len(outer_folds)}
+            for feature, count in sorted(
+                feature_selection_frequency.items(),
+                key=lambda item: (-item[1], item[0]))
+        ])
+        summary.to_csv(variant_dir / "feature_selection_summary.csv", index=False)
+        (variant_dir / "selection_config.json").write_text(json.dumps({
+            "task": args.task,
+            "top_n_per_approach": int(selection_top_n),
+            "final_top_n_after_voting": int(selection_top_n),
+            "vote_threshold": "floor(n_successful_approaches / 2), minimum 1",
+            "embedding_reduction": "none",
+            "fit_scope": "outer_fold_train_only",
+            "ranking_approaches": "see ../_selection_reports/fold_*/approaches",
+            "fusions": all_methods,
+        }, indent=2))
+
+        variant_args = argparse.Namespace(**vars(args))
+        variant_args.output_dir = str(variant_dir)
+        meta_result_fs = run_meta_fusion(variant_dir, variant_args)
+        if meta_result_fs is None:
+            print("  ⚠️ Voted feature selection: no meta-fusion results produced")
+        else:
+            print(f"  ✓ Voted feature selection: fusion and meta-fusion saved under "
+                  f"{variant_dir}")
+
     print("\n✓ text_only / audio_only aggregate_metrics are the COPIED "
           "source values (untouched).")
 
     print("\nRunning meta-fusion across all methods...")
-    meta_metrics, _ = run_meta_fusion(out_dir, args)
+    meta_result = run_meta_fusion(out_dir, args)
+    if meta_result is None:
+        print("  ⚠️ Meta-fusion skipped: no usable fold predictions were produced")
+        meta_metrics = {}
+    else:
+        meta_metrics = meta_result[0]
 
     print("\n" + "=" * 60)
     print("✅ PIPELINE COMPLETE")
@@ -4910,6 +5789,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add(p, 'patience', type=int, default=2)
     _add(p, 'class_weights', type=str, default='balanced')
     _add(p, 'loss', type=str, default='ce')
+    _add(p, 'use_raft', action='store_true', help="Train regression with RAFT target-grid loss")
+    _add(p, 'y_grid_size', type=int, default=101)
+    _add(p, 'y_grid_min', type=float, default=None)
+    _add(p, 'y_grid_max', type=float, default=None)
+    _add(p, 'raft_temperature', type=float, default=1.0)
+    _add(p, 'raft_weight', type=float, default=1.0)
+    _add(p, 'use_tract', action='store_true',
+         help="Use two-stage causal-LM CoT + RAFT regression")
+    _add(p, 'rationale_file', type=str, default=None,
+         help="Reviewed rationale CSV keyed by utterance_id")
+    _add(p, 'rationale_column', type=str, default='rationale_final')
+    _add(p, 'tract_generation_tokens', type=int, default=128)
     _add(p, 'focal_gamma', type=float, default=0.0)
     _add(p, 'embedding_batch_size', type=int, default=32)
     # FIX #36: hidden-state selection and token pooling.
@@ -4919,7 +5810,7 @@ def build_parser() -> argparse.ArgumentParser:
          choices=['cls', 'mean', 'max'])
     # FIXES #37-#39: fold-local embedding reduction.
     _add(p, 'embedding_reduction', type=str, default='none',
-         choices=['none', 'pca', 'svd', 'selectkbest',
+         choices=['none', 'pca', 'svd', 'pls', 'selectkbest',
                   'variancethreshold', 'l1'])
     _add(p, 'embedding_reduction_per_question', action='store_true',
          help="Fit a separate reducer for each question's text embeddings")
@@ -4927,12 +5818,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add(p, 'embedding_select_k', type=int, default=64)
     _add(p, 'embedding_variance_threshold', type=float, default=0.0)
     _add(p, 'embedding_l1_alpha', type=float, default=0.01)
+    _add(p, 'run_llm_feature_selection', action='store_true',
+         help="Run fold-local top-N selection experiments on unreduced LLM embeddings")
+    _add(p, 'feature_selection_top_n', type=int, default=None,
+         help="Top LLM embedding dimensions per selector (default: 10); classification uses up to 10 ranking approaches, regression 9")
     _add(p, 'verify_embeddings_changed', action='store_true',
          help="Compare pretrained and fine-tuned embeddings on identical texts")
     _add(p, 'meta_model', type=str, default='linear',
          choices=['linear', 'ridge', 'lasso', 'elasticnet',
                   'random_forest', 'svm', 'hist_gradient_boosting',
-                  'gradient_boosting', 'knn'])
+                  'gradient_boosting', 'knn', 'bayesian_ridge'])
     _add(p, 'use_ensemble', action='store_true')
     _add(p, 'ensemble_models', type=str, nargs='+',
          default=['linear', 'random_forest', 'hist_gradient_boosting'])
@@ -4977,6 +5872,18 @@ def build_parser() -> argparse.ArgumentParser:
          help="Skip per-question LM fine-tuning; extract embeddings from the "
          "base --model-name checkpoint. Recommended when per-question "
          "train size is small (~tens of speakers).")
+    # [R2][R4][R6] regression improvements
+    _add(p, 'bayes_n_samples', type=int, default=8,
+         help="[R2] MC-dropout passes for Bayes-optimal decoding of the "
+              "regression head (1 = original single deterministic pass)")
+    _add(p, 'bayes_metric', type=str, default='rmse', choices=['rmse', 'mae'],
+         help="[R2] rmse -> posterior mean, mae -> posterior median")
+    _add(p, 'select_embedding_config', action='store_true',
+         help="[R4] pick embedding layer/pooling per question with a Ridge "
+              "probe on an inner split of outer-train speakers")
+    _add(p, 'calibrate_regression', action='store_true',
+         help="[R6] leave-one-fold-out linear calibration of fusion "
+              "predictions (regression only)")
     return p
 
 
@@ -4987,6 +5894,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.asr_file is None and args.csv_file is not None:
         args.asr_file = args.csv_file
+
+    if getattr(args, "use_tract", False):
+        if args.task != "regression":
+            parser.error("--use-tract is regression-only")
+        if not getattr(args, "rationale_file", None):
+            parser.error("--use-tract requires --rationale-file with reviewed rationales")
+        if getattr(args, "frozen_text", False):
+            parser.error("--use-tract cannot be combined with --frozen-text")
+        print("[TRACT] --model-name may be a Hugging Face model ID or local folder; "
+              "the model runs on this node")
+
+    if getattr(args, "run_llm_feature_selection", False):
+        if args.embedding_reduction != "none":
+            parser.error("--run-llm-feature-selection requires --embedding-reduction none")
+        if args.feature_selection_top_n is not None and args.feature_selection_top_n < 1:
+            parser.error("--feature-selection-top-n must be >= 1")
 
     if args.stage in ('all', 'fusion') and not args.asr_file:
         print("❌ An input CSV is required: pass it positionally or via --asr-file")

@@ -66,7 +66,8 @@ def load_tokenizer(model_name):
             tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
             return tokenizer
 
-def load_model(model_name: str, task: str, dropout_rate: float, num_labels: int, metadata: dict):
+def load_model(model_name: str, task: str, dropout_rate: float, num_labels: int, metadata: dict,
+               use_raft: bool = False):
     # Load and modify config
     config = AutoConfig.from_pretrained(model_name)
 
@@ -83,8 +84,8 @@ def load_model(model_name: str, task: str, dropout_rate: float, num_labels: int,
         config.id2label = {int(k): v for k, v in metadata["id2label"].items()}
         config.label2id = metadata["label2id"]
     else:
-        config.num_labels = 1
-        config.problem_type = "regression"
+        config.num_labels = int(num_labels) if use_raft else 1
+        config.problem_type = None if use_raft else "regression"
 
     # Instantiate model with custom config
     return AutoModelForSequenceClassification.from_pretrained(
